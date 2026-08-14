@@ -27,13 +27,19 @@ to avoid the unlink-inode race).
 fencing invariant on this fleet's timeline. The measurement is done and
 recorded so the future decision starts from evidence.
 
-## Re-open triggers (any one)
+## Re-open triggers (any one), each watched by the seat that can see it
 
-- Lease directory physical size exceeds 1 GiB on any deployment
+- Lease directory physical size exceeds 1 GiB — WATCHED BY BROCA (wake armed
+  2026-08-14 on st_blocks*512 crossing 1 GiB; ~320 days at measured growth).
+  Broca holds the deployment; the crate cannot see its consumers' disks, so
+  this condition written only in this document would be one nobody is
+  positioned to check.
 - A consumer appears with high-frequency ephemeral identities (orders of
-  magnitude above ~750 sessions/day)
+  magnitude above ~750 sessions/day) — watched by SUBC (visible from commons
+  consumer reviews, invisible from broca's seat)
 - The lease crate takes a breaking rev for an unrelated reason (piggyback the
-  layout migration on an already-paid cross-repo window)
+  layout migration on an already-paid cross-repo window) — watched by SUBC
+  (crate owner)
 
 ## Migration sketch for whoever picks this up
 
