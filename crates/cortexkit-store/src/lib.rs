@@ -2,21 +2,15 @@
 //! [`StorageDescriptor`], guard it with the single-writer lease, and apply
 //! versioned migrations once.
 //!
-//! A module does NOT reinvent persistence. It receives a resolved descriptor
-//! (from subc), hands it here with its ordered migrations, and gets back a
-//! lease-guarded, migrated connection it runs its own domain queries against. The
-//! module owns only its domain: its store trait, its schema/seed (as migrations),
-//! and its queries.
-//!
-//! Backends are feature-gated and additive: `sqlite` today, a `postgres` feature
-//! next, a `cloud` feature later. The descriptor's backend set
-//! ([`cortexkit_store_types::StorageBackend`]) is open the same way, so adding a
-//! backend is additive and module code never branches on which backend it got.
+//! Modules pass a resolved descriptor and ordered migrations here, then run domain
+//! queries against the lease-guarded, migrated connection. Backends are
+//! feature-gated, so module code does not branch on the descriptor's backend. Each
+//! module owns its store trait, migrations, and queries.
 //!
 //! The single-writer lease ([`cortexkit_lease`]) is keyed by
-//! `(module_id, backend, storage_namespace)` so two modules sharing one lease root
-//! never collide, and the persisted epoch is available as the fence token a
-//! distributed/cloud backend's writes would compare-and-set on.
+//! `(module_id, backend, storage_namespace)`, preventing collisions between stores
+//! that share a lease root. The persisted epoch serves as the fence token for
+//! epoch-checked writes.
 
 pub use cortexkit_store_types::{
     postgres_database_name, sqlite_store_path, Isolation, StorageBackend, StorageDescriptor,
@@ -83,8 +77,8 @@ impl std::fmt::Display for StoreError {
 
 impl std::error::Error for StoreError {}
 
-/// The lease key for a descriptor's store: namespaced by module + backend so two
-/// modules sharing a lease root cannot collide on the same namespace.
+/// The lease key includes the module, backend, and storage namespace so stores
+/// sharing a lease root cannot collide.
 fn lease_key(descriptor: &StorageDescriptor) -> LeaseKey {
     LeaseKey::new(
         &descriptor.module_id,
@@ -117,18 +111,16 @@ mod sqlite_backend {
     }
 
     impl SqliteStore {
-        /// The fence epoch of the held lease (strictly greater than any superseded
-        /// writer's). A distributed backend would carry this on every write.
+        /// The fence epoch of the held lease, strictly greater than any superseded
+        /// writer's epoch.
         pub fn epoch(&self) -> u64 {
             self.epoch
         }
 
-        /// Construct a store over an already-open connection at a chosen epoch,
-        /// WITHOUT acquiring the lease. Test-only: it exists to reconstruct the
-        /// two-handles-one-database state of a lease handover (an old draining writer
-        /// and its replacement at different epochs), which the live lease's OS lock
-        /// would otherwise make impossible to set up. Not for production — real opens
-        /// go through `open_sqlite`, which holds the single-writer lease.
+        /// Construct a store over an open connection without acquiring a lease.
+        ///
+        /// Tests use this to model stale and replacement connections at different
+        /// epochs, a state the OS lock prevents constructing through `open_sqlite`.
         #[cfg(test)]
         pub(crate) fn for_test(conn: Connection, epoch: u64) -> Self {
             #[derive(Debug)]
@@ -160,18 +152,15 @@ mod sqlite_backend {
             f(&guard).map_err(|e| StoreError::Backend(e.to_string()))
         }
 
-        /// Run a closure inside an epoch-FENCED write transaction: the write is
+        /// Run a closure inside an epoch-fenced write transaction. The write is
         /// rejected ([`StoreError::Fenced`]) if a newer writer has taken over the
-        /// database, otherwise it commits atomically.
+        /// database; otherwise it commits atomically.
         ///
-        /// Use this instead of [`with_conn`] for a durable write that must NOT be
-        /// applied by a superseded writer — for example a credential vault's
-        /// token-rotation commit, where a draining old instance must never clobber a
-        /// fresh token its replacement already wrote. The OS advisory lock already
-        /// prevents two *live* lease holders, but during a lease handover an old
-        /// instance can briefly still hold an open connection after releasing the
-        /// lock; the persisted epoch fence rejects its late writes at the database
-        /// layer (the lock alone cannot).
+        /// Use this instead of [`with_conn`] for a durable write that cannot be
+        /// applied by a superseded writer. The OS advisory lock prevents concurrent
+        /// lease holders, but during a handover a stale instance can retain an open
+        /// connection after releasing the lock. The persisted epoch rejects its late
+        /// writes at the database layer.
         ///
         /// Mechanism: an IMMEDIATE transaction reads the database's stored fence
         /// epoch and, if it is greater than this store's lease epoch, rejects without
@@ -179,9 +168,8 @@ mod sqlite_backend {
         /// database for this epoch and runs `f`, committing atomically. Returning an
         /// error from `f` rolls the transaction back.
         ///
-        /// Additive and opt-in: the fence table is created lazily on the first fenced
-        /// write, so existing [`with_conn`]-only stores have a byte-identical
-        /// database and are unaffected. A store mixes both paths freely.
+        /// The fence table is created lazily on the first fenced write.
+        /// [`with_conn`]-only stores do not create it, and callers may use both paths.
         pub fn with_conn_fenced<T>(
             &self,
             f: impl FnOnce(&rusqlite::Transaction) -> rusqlite::Result<T>,
@@ -198,8 +186,6 @@ mod sqlite_backend {
             )
             .map_err(|e| StoreError::Backend(e.to_string()))?;
 
-            // COALESCE over the (at most one) fence row yields 0 when unclaimed, so
-            // no OptionalExtension import is needed.
             let db_epoch: u64 = tx
                 .query_row(
                     "SELECT COALESCE((SELECT epoch FROM cortexkit_fence WHERE id = 0), 0)",
@@ -209,15 +195,12 @@ mod sqlite_backend {
                 .map_err(|e| StoreError::Backend(e.to_string()))?;
 
             if db_epoch > self.epoch {
-                // A newer writer owns the database; reject without applying `f`. The
-                // transaction rolls back on drop.
                 return Err(StoreError::Fenced {
                     holder_epoch: self.epoch,
                     db_epoch,
                 });
             }
             if self.epoch > db_epoch {
-                // Claim the database for this writer's epoch, fencing older writers.
                 tx.execute(
                     "INSERT INTO cortexkit_fence (id, epoch) VALUES (0, ?1) \
                      ON CONFLICT(id) DO UPDATE SET epoch = excluded.epoch",
@@ -235,7 +218,7 @@ mod sqlite_backend {
         /// Apply a `namespace`'s migration chain to this store's database, once.
         ///
         /// Applied migrations are tracked per `(namespace, version)`, so a module
-        /// that owns several domains in one database registers an INDEPENDENT chain
+        /// that owns several domains in one database registers an independent chain
         /// per domain (`migrate("work_graph", ..)`, `migrate("hires", ..)`): each
         /// domain's history is separate, and adding a domain later never re-runs or
         /// entangles another's migrations. A single-domain module just calls this
@@ -251,10 +234,10 @@ mod sqlite_backend {
     /// separately via [`SqliteStore::migrate`], so a multi-domain module can apply
     /// several independent per-domain chains into its one database.
     ///
-    /// The lease is acquired BEFORE the file is opened, so a second live writer is
+    /// The lease is acquired before the file is opened, so a second live writer is
     /// rejected (`StoreError::Lease`) rather than corrupting a shared file.
     ///
-    /// The lease lives next to the database file (its parent directory), DERIVED
+    /// The lease lives next to the database file (its parent directory), derived
     /// from the descriptor's path rather than passed in. This makes the
     /// one-lease-per-database invariant structural: two distinct database paths get
     /// distinct leases (correct isolation), and the same database path gets one
@@ -274,16 +257,14 @@ mod sqlite_backend {
             .unwrap_or_else(|| PathBuf::from("."));
         std::fs::create_dir_all(&parent).map_err(StoreError::Io)?;
 
-        // Acquire the single-writer lease first, co-located with the database file
-        // so the lease identity follows the database path by construction.
         let lease = FileLeaseStore::new(&parent)
             .acquire(&lease_key(descriptor))
             .map_err(StoreError::Lease)?;
         let epoch = lease.epoch();
 
         let conn = Connection::open(&path).map_err(|e| StoreError::Backend(e.to_string()))?;
-        // Durability + concurrency pragmas: WAL for concurrent readers, a busy
-        // timeout so a transient lock waits rather than erroring, foreign keys on.
+        // WAL permits concurrent readers. The busy timeout makes transient locks
+        // wait rather than fail, and foreign-key enforcement is enabled.
         conn.pragma_update(None, "journal_mode", "WAL")
             .map_err(|e| StoreError::Backend(e.to_string()))?;
         conn.busy_timeout(Duration::from_secs(5))
@@ -291,29 +272,8 @@ mod sqlite_backend {
         conn.pragma_update(None, "foreign_keys", "ON")
             .map_err(|e| StoreError::Backend(e.to_string()))?;
 
-        // Owner-only, decided here rather than left to the caller's umask.
-        //
-        // SQLite sets no mode of its own, so without this the shipped default is
-        // world-readable `0644` — measured across every module store on a real
-        // deployment. A crate that already decides WAL mode, busy timeout and
-        // foreign keys has taken responsibility for how this file behaves on
-        // disk; leaving permissions to callers means the decision is made by the
-        // ambient umask, which is to say not made at all.
-        //
-        // The WAL and SHM siblings are the half that gets missed. Recently
-        // committed rows live in the WAL until a checkpoint, so protecting only
-        // the database file leaves the NEWEST data permissive while the database
-        // itself reads as correct — and on real hosts the WAL is routinely
-        // larger than the database.
-        //
-        // Ordering: after the pragma that ENABLES WAL, so the sibling files
-        // exist to be protected on a first open rather than being created
-        // unprotected immediately afterwards.
-        //
-        // A group-readable store is not a configuration this crate supports: it
-        // hands out an exclusive single-writer lease, so an out-of-band reader
-        // is already outside the contract. That need is a read replica or an
-        // export operation, not a looser file mode.
+        // Apply owner-only permissions after enabling WAL, which may create sibling
+        // files. WAL can hold recently committed rows before checkpointing.
         for suffix in ["", "-wal", "-shm"] {
             protect_file(Path::new(&format!("{path}{suffix}")))
                 .map_err(|e| StoreError::Backend(e.to_string()))?;
@@ -399,30 +359,9 @@ pub use sqlite_backend::{open_sqlite, SqliteStore};
 mod tests {
     use super::*;
 
-    /// The database file AND its WAL sibling are owner-only on disk after
-    /// `open_sqlite`, including a database that already exists permissively.
-    ///
-    /// Two properties, asserted separately because they fail independently.
-    /// SQLite sets no mode, so without this the shipped default is `0644`.
-    /// And the WAL is the half that gets missed: recently committed rows live
-    /// there until a checkpoint, so protecting only the database leaves the
-    /// NEWEST data readable while the database file itself looks correct.
-    ///
-    /// Asserts the mode ON DISK rather than that `open_sqlite` returned Ok — a
-    /// hardening step that silently did nothing would still return Ok.
-    ///
-    /// The scenario is REOPENING an already-deployed store, which is the only
-    /// shape in which the WAL assertion means anything. A first open cannot
-    /// exercise it: SQLite creates a fresh WAL inheriting the database's mode,
-    /// so by then the database is already `0600` and the WAL follows for free.
-    /// A permissive WAL only exists because a PREVIOUS process wrote one under
-    /// the old umask — exactly the state every deployed machine is in.
-    ///
-    /// Mutation-proved, both suffixes independently: dropping `""` fails the
-    /// database assertion, dropping `"-wal"` fails the WAL assertion, and
-    /// neither is carried by the other. An earlier version of this test used a
-    /// first open and the `"-wal"` mutation SURVIVED it — the assertion was
-    /// there, it just could not fail.
+    /// Reopening covers pre-existing permissive files. A first open cannot test
+    /// permissive WAL repair because a fresh WAL inherits the restricted database
+    /// mode.
     #[cfg(unix)]
     #[test]
     fn reopening_a_permissive_store_protects_the_database_and_its_wal() {
@@ -435,7 +374,6 @@ mod tests {
         let path = std::path::PathBuf::from(path);
         let wal = std::path::PathBuf::from(format!("{}-wal", path.display()));
 
-        // First open: create a real database, then close it.
         {
             let store = open_sqlite(&descriptor).expect("first open");
             store
@@ -449,14 +387,10 @@ mod tests {
                 .expect("migrate");
         }
 
-        // A clean close checkpoints and REMOVES the WAL, so one has to be put
-        // back deliberately. That is not artificial: a WAL surviving on disk is
-        // precisely what an unclean shutdown leaves behind, and it is the only
-        // state in which a permissive WAL can be waiting at open time.
+        // A clean close removes the WAL. Recreate it to model a file left by an
+        // unclean shutdown.
         std::fs::write(&wal, b"").expect("leave a WAL behind");
 
-        // Reproduce the deployed state: both files permissive, as every store
-        // created before this hardening actually is on disk.
         for file in [&path, &wal] {
             std::fs::set_permissions(file, std::fs::Permissions::from_mode(0o644))
                 .expect("set permissive mode");
@@ -486,8 +420,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// A unique temp root + a descriptor whose sqlite file lives under it. The
-    /// lease is derived from the db path (its parent), so no separate lease dir.
     fn tmp() -> (std::path::PathBuf, StorageDescriptor) {
         use std::sync::atomic::{AtomicU64, Ordering};
         static SEQ: AtomicU64 = AtomicU64::new(0);
@@ -536,7 +468,6 @@ mod tests {
             assert_eq!(n, 2, "seed rows inserted");
             assert_eq!(store.epoch(), 1);
         }
-        // Reopen: migration must NOT re-run (no duplicate seed rows), epoch bumps.
         {
             let store = open_sqlite(&d).expect("reopen");
             store.migrate("facts", M1).expect("migrate again");
@@ -563,10 +494,6 @@ mod tests {
 
     #[test]
     fn distinct_databases_do_not_falsely_contend() {
-        // The footgun the first consumer hit: two DISTINCT databases must not
-        // contend on one lease. Because the lease is derived from the db path, two
-        // descriptors with different paths get different leases and both open while
-        // live, even with the same module_id/namespace.
         let (root_a, a) = tmp();
         let (root_b, b) = tmp();
         let held_a = open_sqlite(&a).expect("open a");
@@ -595,7 +522,6 @@ mod tests {
         ];
         let store = open_sqlite(&d).expect("v2");
         store.migrate("facts", M2).expect("v2 migrate");
-        // The v2 column exists and v1 did not re-run (table already present).
         let ok: i64 = store
             .with_conn(|c| {
                 c.query_row("SELECT COUNT(*) FROM facts WHERE weight = 0", [], |r| {
@@ -609,9 +535,6 @@ mod tests {
 
     #[test]
     fn independent_namespace_chains_in_one_database() {
-        // A multi-domain module (one database, several domains) registers an
-        // independent migration chain per domain. Each chain's history is separate:
-        // adding the second domain later does not re-run or entangle the first.
         let (root, d) = tmp();
         const WORK_GRAPH: &[Migration] = &[Migration {
             version: 1,
@@ -622,11 +545,8 @@ mod tests {
             statements: "CREATE TABLE hires (id INTEGER PRIMARY KEY);",
         }];
         let store = open_sqlite(&d).expect("open");
-        // Both domains use version 1, but distinct namespaces -> both run.
         store.migrate("work_graph", WORK_GRAPH).expect("work_graph");
         store.migrate("hires", HIRES).expect("hires");
-        // Re-applying is a no-op per namespace; same version across namespaces did
-        // not collide (both tables exist).
         store
             .migrate("work_graph", WORK_GRAPH)
             .expect("work_graph again");
@@ -694,7 +614,6 @@ mod tests {
         store.migrate("kv", FENCE_SCHEMA).expect("migrate");
         let r: Result<(), StoreError> = store.with_conn_fenced(|tx| {
             tx.execute("INSERT INTO kv (k, v) VALUES ('a', '1')", [])?;
-            // Force the closure to fail AFTER a write: the transaction must roll back.
             tx.query_row("SELECT * FROM does_not_exist", [], |_| Ok(()))?;
             Ok(())
         });
@@ -711,17 +630,11 @@ mod tests {
 
     #[test]
     fn superseded_writer_is_fenced_out_after_handover() {
-        // The lease-handover race the credential vault must survive: an OLD store
-        // instance (lower lease epoch) that still holds an open connection after a
-        // NEW instance took over must NOT clobber the database. The live OS lock
-        // prevents two simultaneous LEASE holders, so this models the in-memory state
-        // of the race directly: two handles on one db file at epochs 2 (replacement)
-        // and 1 (draining old) — exactly what the persisted epoch fence must catch
-        // and the lock alone cannot.
+        // Model the post-handover state directly: the OS lock prevents two live
+        // lease holders, but a stale connection can persist after releasing its lease.
         let (root, d) = tmp();
         let path = sqlite_path(&d);
 
-        // First, a real open migrates the schema (epoch 1, released on drop).
         open_sqlite(&d)
             .expect("seed schema")
             .migrate("kv", FENCE_SCHEMA)
@@ -758,8 +671,6 @@ mod tests {
 
     #[test]
     fn equal_epoch_writer_is_not_fenced() {
-        // A writer at the SAME epoch the db is already claimed at (its own prior
-        // fenced write) is allowed — the fence rejects only a STRICTLY newer claim.
         let (root, d) = tmp();
         let path = sqlite_path(&d);
         open_sqlite(&d)

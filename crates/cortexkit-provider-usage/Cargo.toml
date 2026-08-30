@@ -1,14 +1,5 @@
-# cortexkit-provider-usage — the shared WIRE REPRESENTATION of the ai-provider
-# quota `usage.get` payload: pure serde types only, NO fetch/transform logic.
-# Consumers (the quota module that produces it, ALF's router reads, astrocyte's
-# capacity axis, the ck CLI renderer) all compile against ONE definition so the
-# shape cannot drift without a shared-crate PR every side reviews.
-#
-# SHAPE, NOT POLICY: read-time transform semantics — e.g. the quota module's
-# banked-reset relaxation, which zeroes `used_percent` and carries the provider
-# truth in `raw_used_percent` — are PRODUCER behavior documented on the fields
-# below but NOT enforced by these types. A consumer renders whatever the wire
-# says; this crate makes no guarantee about how a producer derived the numbers.
+# Wire types preserve producer-supplied values; they do not enforce read-time transforms.
+# Banked-reset relaxation sets `used_percent` to zero; `raw_used_percent` retains the provider value.
 [package]
 name = "cortexkit-provider-usage"
 version = "0.6.0"

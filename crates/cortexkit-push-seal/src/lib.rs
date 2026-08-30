@@ -3,50 +3,29 @@
 //!
 //! # What breaks in consumers when this crate changes
 //!
-//! Stated first because it is not visible from inside this crate. The sealed
-//! bytes are opened by a **separate implementation in another repository**,
-//! which does not build this code. So a change here is not a local behaviour
-//! change:
+//! Sealed bytes are opened by a separate implementation in another repository,
+//! which does not build this code.
 //!
 //! - Changing the ciphersuite, `info`, the associated data, or the envelope
-//!   layout is a **wire-format divergence**. The opener fails with an
-//!   authentication error, which renders on the device as an undecryptable
-//!   notification — the same appearance as a locked phone. Nothing fails here.
+//!   layout is a wire-format divergence. The opener fails with an authentication
+//!   error, which renders on the device as an undecryptable notification — the
+//!   same appearance as a locked phone. Nothing fails here.
 //! - This crate is consumed by relative path, and a path dependency is recorded
-//!   in `Cargo.lock` with a version string and **no content hash**. So an
-//!   unchanged version means new code compiles into a consuming repository with
-//!   no lockfile diff anywhere. **The version number is the only channel through
-//!   which a consumer can learn that sealed output changed.**
+//!   in `Cargo.lock` with a version string and no content hash. An unchanged
+//!   version means new code compiles into a consuming repository with no lockfile
+//!   diff anywhere. The version number is the only channel through which a
+//!   consumer can learn that sealed output changed.
 //!
-//! Therefore: **bump the version on any change to emitted bytes or behaviour.**
-//! Not on comments or tests — a version that moves for prose trains its readers
-//! to bump reflexively and then stops meaning anything.
-//!
-//! # This crate has no production caller yet, and that is staged rather than dead
-//!
-//! `seal` is reached only from this crate's tests and its `handseal` example.
-//! The consumer is the notification submit endpoint, which is unbuilt: the
-//! surface that will call this holds the recipient key and does not exist yet.
-//!
-//! Recorded here because an uncalled function is indistinguishable from an
-//! abandoned one, and the next reader running a dead-code pass arrives at this
-//! file with no way to tell them apart. Deleting it would take the ciphersuite
-//! pinning and the envelope layout with it — the two facts that a separate
-//! implementation in another repository is already built against, and which
-//! nothing in this workspace would fail to notice the loss of.
-//!
-//! The examples are not decoration either: `handseal` and `handopen` are how a
-//! sealed payload is produced by hand before the endpoint exists, and the
-//! round trip between them is the only end-to-end exercise of this crate
-//! outside its own tests.
+//! Bump the version on any change to emitted bytes or behaviour. Do not bump it
+//! for comments or tests, because prose-only bumps make the version unreliable.
 //!
 //! # The parameters, and why they are spelled out
 //!
 //! An HPKE ciphersuite is a triple. Naming two of its three parts leaves the
-//! third to each implementation's default, and the two defaults were about to
-//! disagree: RFC 9180's suite table opens with AES-128-GCM, while the opener's
-//! platform offers exactly one X25519 suite. Every such disagreement produces
-//! the same authentication failure, whose diagnosis points at the transport.
+//! third to each implementation's default. RFC 9180's suite table opens with
+//! AES-128-GCM, while the opener's platform offers exactly one X25519 suite.
+//! Every such disagreement produces the same authentication failure, whose
+//! diagnosis points at the transport.
 //!
 //! | parameter | RFC 9180 codepoint | value |
 //! |---|---|---|
@@ -54,19 +33,13 @@
 //! | KDF  | `0x0001` | `HKDF-SHA256` |
 //! | AEAD | `0x0003` | `ChaCha20Poly1305` |
 //!
-//! The codepoints are recorded because they are what both implementations feed
-//! to their libraries. A platform-specific suite name is a symbol for this
-//! triple, not a wire fact, and two sides agreeing on a name that exists in only
-//! one of their vocabularies have agreed about a string rather than about bytes.
+//! Codepoints are the wire facts both implementations pass to their libraries.
+//! A platform-specific suite name is a symbol for this triple, not a wire fact.
 //!
-//! `info` is empty **because the recipient key is dedicated to this purpose**.
-//! `info` is the key schedule's domain separator: it earns its keep when one key
-//! serves several applications. If this key is ever shared with another protocol
-//! — for instance to add sender authentication by reusing a transport static —
-//! empty stops being safe and a fixed non-empty domain string becomes the
-//! mitigation. The condition is written down rather than the conclusion, because
-//! the reader who reuses the key is exactly the reader who cannot see why it
-//! mattered.
+//! `info` is empty because the recipient key is dedicated to this purpose. It is
+//! the key schedule's domain separator when one key serves several applications.
+//! If this key is shared with another protocol, empty `info` is unsafe; use a
+//! fixed non-empty domain string.
 
 use hpke::{
     aead::ChaCha20Poly1305, kdf::HkdfSha256, kem::X25519HkdfSha256, Deserializable, OpModeR,
@@ -76,23 +49,17 @@ use hpke::{
 /// The one envelope version this crate emits and accepts.
 pub const VERSION: u8 = 0x01;
 
-/// Normative plaintext cap, measured **before** sealing.
+/// Normative plaintext cap, measured before sealing.
 ///
-/// The unit is load-bearing rather than decoration: "2048 bytes" reads as either
-/// plaintext or sealed, both fit under the platform's payload limit at this
-/// value, and the two readings diverge at a larger one. Plaintext is normative
-/// because the composing party is the only one holding plaintext and the only
-/// one that can decide what to drop; a sealed-byte cap would require it to model
-/// this crate's overhead, which it would get wrong silently.
+/// The composing party holds the plaintext and decides what to drop. A sealed
+/// byte cap would require it to duplicate this crate's overhead calculation.
 pub const MAX_PLAINTEXT_BYTES: usize = 2048;
 
 /// Length of the encapsulated key for the pinned KEM.
 const ENC_LEN: usize = 32;
 
-/// Failure modes, kept separate because they have different diagnoses.
-///
-/// Collapsing them makes a field report unactionable: "it did not open" has at
-/// least four causes and only one of them is a defect in the bytes.
+/// Sealing failures preserve their cause so callers can diagnose input and key
+/// errors separately.
 #[derive(Debug, PartialEq, Eq)]
 pub enum SealError {
     /// The plaintext exceeds [`MAX_PLAINTEXT_BYTES`]. Carries both numbers.
@@ -101,24 +68,23 @@ pub enum SealError {
     /// the whole ciphertext, so a truncated blob does not decrypt to a fragment,
     /// it fails to decrypt entirely and renders as the generic placeholder —
     /// indistinguishable from a device that has not been unlocked.
-    PlaintextTooLarge { limit: usize, observed: usize },
+    PlaintextTooLarge {
+        limit: usize,
+        observed: usize,
+    },
     /// The recipient public key is not a valid X25519 point.
     BadRecipientKey,
-    /// The HPKE operation itself failed.
     Hpke,
 }
 
-/// Failure modes when opening. Separate from [`SealError`] deliberately.
 #[derive(Debug, PartialEq, Eq)]
 pub enum OpenError {
     /// The envelope is shorter than a version byte plus an encapsulated key.
     Malformed { observed: usize },
     /// The version byte is not one this build understands.
     ///
-    /// Distinct from [`OpenError::Aead`] on purpose. The byte exists so that a
-    /// format change is loud; folding it into a generic failure would put a
-    /// format change into the same bucket as a corrupt payload, which is the
-    /// bucket that already has three other causes.
+    /// Kept distinct from [`OpenError::Aead`] so callers can distinguish an
+    /// unsupported wire format from payload corruption.
     UnknownVersion { observed: u8 },
     /// The recipient private key is not a valid X25519 scalar.
     BadRecipientKey,
@@ -167,24 +133,16 @@ pub fn seal(recipient_public_key: &[u8], plaintext: &[u8]) -> Result<Vec<u8>, Se
 impl OpenError {
     /// The wire vocabulary a conformance vector reports.
     ///
-    /// Lives here rather than in the corpus generator so the four-to-three
-    /// collapse has ONE home. A generator that restated it would be a second
-    /// independent statement of the same fact, free to drift from this one.
+    /// This mapping is defined here rather than in the corpus generator to avoid
+    /// two independent mappings that can drift.
     ///
-    /// **Three of the four variants collapse to `malformed`, and that is
-    /// deliberate rather than lossy.** `Aead` already covers a wrong key, a
-    /// wrong ciphersuite, a wrong `info`, a wrong associated data and altered
-    /// bytes — the authentication tag cannot separate them, and an opener that
-    /// could would be telling an attacker which part of the envelope was wrong.
-    /// `Malformed` and `BadRecipientKey` join it because they are equally
-    /// "this envelope is not usable", and splitting them on the wire would
-    /// imply a distinction the opener cannot honour.
+    /// `Aead`, `Malformed`, and `BadRecipientKey` map to `malformed`; the wire
+    /// vocabulary distinguishes only an unsupported version from an unusable
+    /// envelope. The authentication tag cannot distinguish a wrong key,
+    /// ciphersuite, `info`, associated data, or altered bytes.
     ///
-    /// The non-obvious consequence, worth stating because it looks like a bug:
-    /// an envelope carrying a valid version and encapsulated key with an EMPTY
-    /// ciphertext clears the length gate and fails as `Aead`, yet still reports
-    /// `malformed`. The vector expecting `malformed` passes for a reason its
-    /// author did not choose.
+    /// An envelope with a valid version and encapsulated key but empty ciphertext
+    /// passes the length gate and fails as `Aead`, then reports `malformed`.
     pub fn wire_code(&self) -> &'static str {
         match self {
             OpenError::UnknownVersion { .. } => "unsupported_version",
@@ -197,21 +155,15 @@ impl OpenError {
 
 /// Opens an envelope produced by [`seal`].
 ///
-/// Present for tests and for generating the cross-language corpus. Production
-/// opening happens in the recipient's own implementation.
-///
-/// **No size cap here, deliberately.** `seal` enforces one because it is the
-/// only party holding plaintext; the bound on the opening side is the
-/// transport's, which caps bytes before they reach this code. A second cap here
-/// would duplicate a limit owned elsewhere and could disagree with it — the
-/// same two-numbers-one-fact hazard the plaintext cap exists to avoid.
+/// This function has no size cap. `seal` enforces the plaintext cap; transport
+/// bounds the envelope before it reaches this code. A second opening cap could
+/// disagree with the transport limit.
 pub fn open(recipient_private_key: &[u8], envelope: &[u8]) -> Result<Vec<u8>, OpenError> {
     if envelope.len() < 1 + ENC_LEN {
         return Err(OpenError::Malformed {
             observed: envelope.len(),
         });
     }
-    // Checked before anything else, and refused rather than skipped.
     if envelope[0] != VERSION {
         return Err(OpenError::UnknownVersion {
             observed: envelope[0],
@@ -245,12 +197,10 @@ mod tests {
         (sk.to_bytes().to_vec(), pk.to_bytes().to_vec())
     }
 
-    /// The suite is pinned by CODEPOINT, not by the type names above.
+    /// Pins the suite by RFC 9180 codepoint rather than library type name.
     ///
-    /// Naming the types in the signatures makes a feature-flag change a compile
-    /// error, which is necessary and not sufficient: a library could rename or
-    /// re-point a type and still compile. The codepoints are what the opener's
-    /// implementation is agreeing to, so they are what this asserts.
+    /// Type names can remain stable while their codepoints change. The external
+    /// opener agrees on codepoints.
     #[test]
     fn the_pinned_suite_is_the_one_the_opener_agreed_to() {
         assert_eq!(X25519HkdfSha256::KEM_ID, 0x0020, "KEM codepoint");
@@ -270,17 +220,15 @@ mod tests {
         let (_, pk) = keypair();
         let sealed = seal(&pk, b"x").expect("seal");
         assert_eq!(sealed[0], VERSION, "version byte leads");
-        // 1 + 32 + ciphertext, and the ciphertext carries a 16-byte tag.
+        // ChaCha20Poly1305 adds a 16-byte authentication tag.
         assert_eq!(sealed.len(), 1 + ENC_LEN + 1 + 16);
     }
 
     /// Two seals of identical plaintext to one recipient must differ.
     ///
-    /// This lives here rather than in the shared corpus because the corpus
-    /// cannot see it: every vector opens correctly under a sealer that reuses
-    /// one ephemeral key forever, since each vector is examined alone. Base-mode
-    /// confidentiality rests on a fresh ephemeral per message, so without this
-    /// there is no place the defect would surface.
+    /// A vector corpus cannot detect ephemeral-key reuse because it opens each
+    /// vector independently. Base-mode confidentiality requires a fresh
+    /// ephemeral key per message.
     #[test]
     fn each_seal_uses_a_fresh_ephemeral() {
         let (_, pk) = keypair();
@@ -333,13 +281,8 @@ mod tests {
         );
     }
 
-    /// The wire mapping is total and the collapse is exercised.
-    ///
-    /// Includes the empty-ciphertext case explicitly, because it reaches
-    /// `malformed` by a route nobody would predict: 33 bytes clears the length
-    /// gate, so it fails authentication rather than shape, and still reports
-    /// `malformed`. Without this case a vector expecting `malformed` passes
-    /// while the reasoning behind it goes unrecorded.
+    /// Empty ciphertext passes the 33-byte length gate, fails authentication,
+    /// and maps to `malformed`.
     #[test]
     fn every_open_failure_maps_to_the_wire_vocabulary() {
         let (sk, pk) = keypair();
@@ -369,7 +312,6 @@ mod tests {
             "a wrong key must not be distinguishable from other failures"
         );
 
-        // Positive control: a valid envelope produces no failure to map.
         assert!(open(&sk, &sealed).is_ok());
     }
 
@@ -381,11 +323,10 @@ mod tests {
         assert_eq!(open(&other_sk, &sealed), Err(OpenError::Aead));
     }
 
-    /// The associated data is load-bearing, and the no-AAD call compiles.
+    /// The version byte must be authenticated as associated data.
     ///
-    /// An implementation that forgets to authenticate the version byte gets an
-    /// authentication failure — which lands in the same bucket as a wrong suite
-    /// and a wrong key. This proves the binding exists rather than trusting it.
+    /// Omitting it produces the same authentication failure as a wrong suite or
+    /// key.
     #[test]
     fn the_version_byte_is_authenticated_not_merely_present() {
         let (sk, pk) = keypair();
@@ -395,8 +336,7 @@ mod tests {
         let enc = <X25519HkdfSha256 as hpke::Kem>::EncappedKey::from_bytes(&sealed[1..1 + ENC_LEN])
             .unwrap();
 
-        // Opening with NO associated data must fail, which is what proves the
-        // sealer bound it.
+        // Failure without associated data proves the sealer bound the version.
         let without_aad = hpke::single_shot_open::<ChaCha20Poly1305, HkdfSha256, X25519HkdfSha256>(
             &OpModeR::Base,
             &recipient,

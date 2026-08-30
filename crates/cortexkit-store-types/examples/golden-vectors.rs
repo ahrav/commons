@@ -8,8 +8,7 @@
 use cortexkit_store_types::{postgres_database_name, sqlite_store_path, StorageDescriptor};
 
 fn main() {
-    // Representative module ids: real ones, the slug-collision pair (a-b vs a_b
-    // must NOT share a database name), and a too-long id (must fit pg's 63 bytes).
+    // `a-b` and `a_b` must produce distinct database names.
     let ids = [
         "alfonso-routing",
         "llm-runner",
