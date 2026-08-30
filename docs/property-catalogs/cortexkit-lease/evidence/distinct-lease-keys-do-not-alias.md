@@ -1,0 +1,10 @@
+# `distinct-lease-keys-do-not-alias`
+
+- **Discovery:** architecture, security, and protocol-format passes.
+- **Primary evidence:** public key fields and constructor at `crates/cortexkit-lease/src/lib.rs:92-110`; public identity derivation at `crates/cortexkit-lease/src/lib.rs:112-123`; the file path hashes that identity with public `fnv1a`/`fnv1a_hex` (`crates/cortexkit-lease/src/lib.rs:204-210,341-358`). PostgreSQL uses the same `fnv1a(key.identity())` value for its advisory lock and epoch row (`crates/cortexkit-store-postgres/src/lib.rs:62-67,203-215`).
+- **Confirmed witness:** `("a\u{1f}b","c","d")` and `("a","b","c\u{1f}d")` join to the same identity. Fields are public and unvalidated.
+- **Additional mechanism:** FNV-1a-64 has no collision detection and the file stores no full identity. Practical targeted-collision cost was not established.
+- **Existing evidence:** file-backend separation tests use only separator-free values (`crates/cortexkit-lease/src/lib.rs:508-545`). Public identity and hash APIs have a checked-in golden assertion (`crates/cortexkit-lease/src/lib.rs:482-488`), and PostgreSQL has a golden advisory-key assertion (`crates/cortexkit-store-postgres/src/lib.rs:396-402`); neither covers separator-bearing tuples or hash collisions.
+- **Failure scenario:** distinct stores share the file lock path or PostgreSQL advisory lock and epoch row, causing false `Held`, a shared epoch counter, or false fencing.
+- **Instrumentation:** identity and hash outputs are already publicly observable and covered by golden tests. Missing evidence is an adversarial separator-bearing tuple test plus a stored full-key binding or collision check at the file path and PostgreSQL epoch row.
+- **Open-question log:** `StorageDescriptor` fields are deserialized strings (`crates/cortexkit-store-types/src/lib.rs:65-79`), but deployed value constraints are outside this repository. Descriptor-derived backend labels are closed to the `Sqlite` and `Postgres` enum variants (`crates/cortexkit-store-types/src/lib.rs:39-63`), although callers can still construct a public `LeaseKey` with an arbitrary backend string.
