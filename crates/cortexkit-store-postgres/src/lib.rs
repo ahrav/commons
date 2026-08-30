@@ -21,7 +21,7 @@
 //! file-lease semantics so a distributed writer's durable writes can carry a
 //! monotonic fence token.
 
-use cortexkit_lease::{LeaseError, LeaseKey};
+use cortexkit_lease::{fnv1a, LeaseError, LeaseKey};
 use cortexkit_store_types::{StorageBackend, StorageDescriptor};
 use postgres::{Client, NoTls};
 
@@ -63,18 +63,7 @@ impl std::error::Error for StoreError {}
 /// `pg_advisory_lock` takes a bigint; we hash the `(module_id, backend, namespace)`
 /// identity into one so distinct modules/namespaces map to distinct locks.
 fn advisory_key(key: &LeaseKey) -> i64 {
-    // FNV-1a 64-bit over the same identity the file lease uses, reinterpreted as a
-    // signed bigint for postgres' advisory-lock API.
-    let identity = format!(
-        "{}\u{1f}{}\u{1f}{}",
-        key.module_id, key.backend, key.scope_key
-    );
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for b in identity.as_bytes() {
-        h ^= *b as u64;
-        h = h.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    h as i64
+    fnv1a(&key.identity()) as i64
 }
 
 fn lease_key(descriptor: &StorageDescriptor) -> LeaseKey {
@@ -402,6 +391,14 @@ mod tests {
             })
             .expect("count");
         assert_eq!(count, 2, "both namespace chains recorded independently");
+    }
+
+    /// The advisory key must be stable across versions: two builds deriving
+    /// different keys for one store would take different locks and both write.
+    #[test]
+    fn advisory_key_derivation_is_stable() {
+        let k = LeaseKey::new("test-module", "postgres", "main");
+        assert_eq!(advisory_key(&k), -3_153_521_753_806_872_150_i64);
     }
 
     #[test]

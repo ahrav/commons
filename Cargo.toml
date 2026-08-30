@@ -11,3 +11,5 @@ edition = "2021"
 license = "MIT"
 repository = "https://github.com/cortexkit/commons"
 authors = ["Ufuk Altinok"]
+# std file locking (File::try_lock / try_lock_shared / unlock) stabilized in 1.89.
+rust-version = "1.89"
