@@ -28,12 +28,10 @@
 //! the shared lease root is shared across all modules.
 
 use std::{
-    fs::{File, OpenOptions},
+    fs::{File, OpenOptions, TryLockError},
     io::{Read, Seek, SeekFrom, Write},
     path::PathBuf,
 };
-
-use fs2::FileExt;
 
 /// Force owner-only permissions on a file this process owns the lifecycle of.
 ///
@@ -253,12 +251,12 @@ impl LeaseStore for FileLeaseStore {
 
         // Liveness gate: a live holder still owns the lock, so the try-lock fails
         // with the OS "contended" error.
-        match file.try_lock_exclusive() {
+        match file.try_lock() {
             Ok(()) => {}
-            Err(e) if is_lock_contended(&e) => {
+            Err(TryLockError::WouldBlock) => {
                 return Err(LeaseError::Held { key: key.clone() });
             }
-            Err(e) => return Err(LeaseError::Io(e)),
+            Err(TryLockError::Error(e)) => return Err(LeaseError::Io(e)),
         }
 
         // We hold the lock: bump the persisted epoch (the CAS fence token).
@@ -287,17 +285,14 @@ impl LeaseStore for FileLeaseStore {
         protect_file(&path).map_err(LeaseError::Io)?;
 
         // Shared liveness gate: only an exclusive holder contends; other shared
-        // holders coexist. On unix this is flock(LOCK_SH|LOCK_NB); on Windows,
-        // LockFileEx without LOCKFILE_EXCLUSIVE_LOCK (both via fs2).
-        // Fully-qualified call: std >= 1.89 has an inherent File::try_lock_shared
-        // (returning TryLockError) that would otherwise shadow the fs2 trait
-        // method this crate's error handling is built around.
-        match FileExt::try_lock_shared(&file) {
+        // holders coexist (flock shared mode on unix, LockFileEx shared mode on
+        // Windows).
+        match file.try_lock_shared() {
             Ok(()) => {}
-            Err(e) if is_lock_contended(&e) => {
+            Err(TryLockError::WouldBlock) => {
                 return Err(LeaseError::Held { key: key.clone() });
             }
-            Err(e) => return Err(LeaseError::Io(e)),
+            Err(TryLockError::Error(e)) => return Err(LeaseError::Io(e)),
         }
 
         // Read-only peek at the persisted writer epoch: shared holders are not
@@ -313,17 +308,6 @@ impl LeaseStore for FileLeaseStore {
             key: key.clone(),
         }))
     }
-}
-
-/// Whether a `try_lock_exclusive` error means "another live holder owns the lock"
-/// (vs a real IO failure). The OS-level contended error differs by platform:
-/// `EWOULDBLOCK` on unix, `ERROR_LOCK_VIOLATION` on Windows, and `ErrorKind` only
-/// maps the unix one to `WouldBlock` (the Windows code lands in the catch-all
-/// kind). Comparing against fs2's own `lock_contended_error()` by raw OS code is
-/// exact on both platforms, so a genuinely-held lease is reported as `Held`, never
-/// misread as `Io`.
-fn is_lock_contended(e: &std::io::Error) -> bool {
-    e.raw_os_error() == fs2::lock_contended_error().raw_os_error()
 }
 
 /// Read the persisted epoch without modifying it (0 if new/empty). Called while
@@ -477,6 +461,14 @@ mod tests {
         assert!(protect_file(&missing).is_ok());
     }
 
+    /// Changing the identity or hash derivation orphans existing on-disk lease
+    /// files and remaps postgres advisory locks.
+    #[test]
+    fn identity_hash_derivation_is_stable() {
+        assert_eq!(key("main").identity(), "test-module\u{1f}sqlite\u{1f}main");
+        assert_eq!(fnv1a_hex(&key("main").identity()), "51a7eaa424b9fd8f");
+    }
+
     #[test]
     fn acquire_then_second_holder_is_rejected() {
         let (store, dir) = tmp_store();
@@ -613,10 +605,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    // Unix-only: the child uses fcntl.flock. On Windows the same-process tests
-    // above still exercise the real LockFileEx shared/exclusive semantics via
-    // fs2, because LockFileEx locks are per-handle (two handles in one process
-    // behave like two processes for contention purposes).
+    // Unix-only: the child uses fcntl.flock. On Windows, the same-process tests
+    // exercise the real LockFileEx shared/exclusive semantics, because
+    // LockFileEx locks are per-handle (two handles in one process behave like
+    // two processes for contention purposes).
     #[cfg(unix)]
     #[test]
     fn shared_lease_across_processes_blocks_exclusive() {
