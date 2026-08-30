@@ -366,10 +366,16 @@ mod tests {
     }
 
     fn tmp_store() -> (FileLeaseStore, PathBuf) {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        // A process-wide atomic sequence prevents same-process test calls from
+        // sharing a directory when timestamps collide; a shared dir lets one
+        // test's cleanup delete another's live lease file.
         let dir = std::env::temp_dir().join(format!(
-            "cortexkit-lease-{}-{}",
+            "cortexkit-lease-{}-{}-{}",
             std::process::id(),
-            fnv1a_hex(&format!("{:?}", std::time::Instant::now()))
+            fnv1a_hex(&format!("{:?}", std::time::Instant::now())),
+            SEQ.fetch_add(1, Ordering::Relaxed)
         ));
         (FileLeaseStore::new(&dir), dir)
     }
