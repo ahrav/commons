@@ -289,18 +289,7 @@ fn parse_cost(
                         Some(v) => convert(field, v).map(Some),
                     }
                 };
-            // The threshold lives at tier.tier.size with tier.tier.type ==
-            // "context" in the models.dev shape — measured at 335/335 tier
-            // rows on the live payload. Earlier revisions read invented keys
-            // (context_over / min_context) that the upstream never emitted, so
-            // every threshold silently parsed to 0; a missing threshold is now
-            // a loud error, because a tier whose floor defaults to 0 applies
-            // its over-threshold rate to every request. The `type` gate is
-            // load-bearing too: `min_context` is a claim that the dimension IS
-            // context, so a non-context tier (per-image, per-second) must not
-            // have its size read as a token threshold — the upstream already
-            // lists image/audio/video models, so a second tier type is a
-            // plausible upstream addition, not a hypothetical.
+
             let tier_err = || CatalogParseError::MissingTierThreshold {
                 provider: provider.to_string(),
                 model: model.to_string(),
@@ -547,12 +536,7 @@ mod tests {
         assert_eq!(model.cost.tiers[0].input, Some(2_500_000_000));
     }
 
-    /// The threshold must come from `tier.tier.size` — the shape models.dev
-    /// actually emits (335/335 tier rows on the 2026-08-11 live payload).
-    /// Earlier revisions read invented keys (`context_over`/`min_context`)
-    /// that no upstream snapshot ever carried, so every threshold silently
-    /// parsed to 0 and the fixture, authored from the same misunderstanding,
-    /// certified it. These two tests pin both failure directions.
+    /// Thresholds use `tier.tier.size`; missing thresholds must not default to zero.
     #[test]
     fn tier_threshold_missing_is_a_loud_error_never_zero() {
         // A tier with rates but NO tier.size: must refuse, not default to 0.

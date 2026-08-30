@@ -1,12 +1,7 @@
-//! Lock the derivation helpers to the committed cross-language golden vectors.
-//!
-//! `tests/golden/storage_vectors.json` is the canonical contract the TS lib
-//! (@cortexkit/store) also asserts against. If a change here alters a database
-//! name, store path, or descriptor shape, this fails — and that change is then a
-//! deliberate cross-language wire break (regenerate the fixture via
-//! `cargo run -p cortexkit-store-types --example golden-vectors` and update both
-//! sides), never an accidental drift that silently lands a TS module on a
-//! different database than the Rust resolver.
+//! `tests/golden/storage_vectors.json` defines database names, store paths, and
+//! descriptor shapes shared with `@cortexkit/store`. Regenerate it with
+//! `cargo run -p cortexkit-store-types --example golden-vectors` when changing
+//! this cross-language wire contract.
 
 use cortexkit_store_types::{postgres_database_name, sqlite_store_path, StorageDescriptor};
 use serde_json::Value;
@@ -47,8 +42,6 @@ fn helpers_reproduce_the_golden_vectors() {
 
 #[test]
 fn golden_vectors_break_slug_collisions() {
-    // The fixture must contain the a-b / a_b pair and they must have DISTINCT
-    // database names (the whole point of hashing the full id, not slug-folding).
     let doc: Value = serde_json::from_str(VECTORS).unwrap();
     let by_id: std::collections::HashMap<&str, &str> = doc["vectors"]
         .as_array()

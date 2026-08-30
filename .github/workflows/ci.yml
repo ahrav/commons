@@ -16,11 +16,8 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  # Cross-platform matrix is deliberate: cortexkit-paths carries cfg(windows)
-  # canonicalization (verbatim \\?\ + UNC strip, drive-letter uppercasing) that
-  # only compiles/runs on Windows. Running the matrix on every push validates
-  # those Windows vectors continuously, instead of relying on a manual
-  # native-Windows check before each release.
+  # Windows runners validate cortexkit-paths cfg(windows) canonicalization,
+  # which only compiles and runs on Windows.
   test:
     name: Test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
@@ -44,11 +41,9 @@ jobs:
       - name: Test
         run: cargo test --workspace --all-targets
 
-  # cortexkit-store-postgres's live tests need a real postgres. GitHub service
-  # containers are Linux-only, so they run here (the cross-OS matrix above skips
-  # them: no DSN -> skip-pass, which is correct on macOS/Windows). CORTEXKIT_REQUIRE_PG
-  # makes a missing DSN FAIL here instead of silently skip-passing, so a broken
-  # service wiring can never show a false green.
+  # GitHub service containers are Linux-only. Without a DSN, live PostgreSQL
+  # tests skip on macOS and Windows. CORTEXKIT_REQUIRE_PG makes a missing DSN
+  # fail here, preventing broken service wiring from skip-passing.
   postgres:
     name: Postgres backend (live)
     runs-on: ubuntu-latest

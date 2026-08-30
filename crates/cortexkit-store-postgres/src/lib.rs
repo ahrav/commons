@@ -147,9 +147,6 @@ pub fn open_postgres(descriptor: &StorageDescriptor) -> Result<PostgresStore, St
 
     let lease_id = advisory_key(&lease_key(descriptor));
 
-    // Single-writer gate: try the session advisory lock without blocking. If a
-    // live writer (another connection) holds it, reject as Held rather than block
-    // forever.
     let acquired: bool = client
         .query_one("SELECT pg_try_advisory_lock($1)", &[&lease_id])
         .map_err(|e| StoreError::Backend(e.to_string()))?
@@ -160,8 +157,6 @@ pub fn open_postgres(descriptor: &StorageDescriptor) -> Result<PostgresStore, St
         }));
     }
 
-    // We hold the lock: ensure the shared infra tables exist (race-safely), then
-    // bump the epoch fence.
     let epoch =
         match ensure_infra_tables(&mut client).and_then(|()| bump_epoch(&mut client, lease_id)) {
             Ok(epoch) => epoch,
@@ -296,11 +291,8 @@ mod tests {
     fn test_dsn() -> Option<String> {
         match std::env::var("CORTEXKIT_TEST_PG_DSN") {
             Ok(dsn) => Some(dsn),
-            // Anti-masking guard: the CI job that is SUPPOSED to run the live tests
-            // sets CORTEXKIT_REQUIRE_PG. If that marker is present but the DSN is
-            // not, the postgres service wiring is broken and these tests would
-            // silently skip-pass (a false green) — fail loud instead. Locally
-            // (marker unset) a missing DSN just skips.
+            // CORTEXKIT_REQUIRE_PG turns a missing DSN into a test failure;
+            // when unset, a missing DSN skips the live tests.
             Err(_) => {
                 assert!(
                     std::env::var("CORTEXKIT_REQUIRE_PG").is_err(),
@@ -355,15 +347,12 @@ mod tests {
         store.migrate(&ns, M1).expect("migrate");
         assert!(store.epoch() >= 1);
 
-        // A second live open on the same lease key is rejected while the first holds.
         match open_postgres(&d) {
             Err(StoreError::Lease(_)) => {}
             Err(e) => panic!("expected Lease(Held), got {e}"),
             Ok(_) => panic!("expected Lease(Held), got a second open"),
         }
 
-        // Migration is run-once: a domain query proves the table exists, and the
-        // schema-version row is present for this namespace.
         let applied: i64 = store
             .with_client(|c| {
                 Ok(c.query_one(
@@ -379,7 +368,6 @@ mod tests {
         );
 
         drop(store);
-        // After release, a re-open succeeds and the epoch advanced.
         let reopened = open_postgres(&d).expect("reopen after release");
         assert!(reopened.epoch() >= 2, "epoch is monotonic across opens");
     }

@@ -3,8 +3,7 @@
 //! The quota module serves an array of [`ProviderUsage`] per request; ALF's
 //! router (`codexbar-window-extractors.ts`), astrocyte's capacity axis, and the
 //! `ck quota` renderer all consume that shape. This crate is the single
-//! definition those consumers compile against, so the wire shape cannot drift
-//! without a shared-crate PR every side reviews.
+//! definition those consumers compile against, so they share one wire shape.
 //!
 //! # Shape, not policy
 //!
@@ -138,11 +137,10 @@ pub struct Usage {
 
 /// An amount of money or credit, in integer minor units.
 ///
-/// Not a float, and the reason is not stylistic. A balance is compared against
-/// zero on every routing decision that reads it, and binary floating point
-/// cannot hold ordinary decimal amounts exactly — the nearest `f64` to `0.1` is
-/// not `0.1`, so sums drift and a comparison near zero can fall either way. The
-/// providers agree: DeepSeek and MiniMax both send decimal strings, and
+/// Balances are compared against zero on every routing decision that reads
+/// them. Binary floating point cannot hold ordinary decimal amounts exactly:
+/// the nearest `f64` to `0.1` is not `0.1`, so sums drift and a comparison near
+/// zero can fall either way. DeepSeek and MiniMax send decimal strings, and
 /// Anthropic sends integer minor units with an exponent.
 ///
 /// Parse a provider's own representation once, where its precision is still
@@ -182,11 +180,10 @@ pub enum PoolFunding {
     /// pools without defining them, and guessing the funding is how a consumer
     /// ends up spending money it meant to protect.
     ///
-    /// It is also the deserialization fallback, and the two meanings genuinely
-    /// agree — a funding kind added after this consumer was built is, to this
-    /// consumer, of unknown funding. Without the fallback an unrecognised value
-    /// fails the whole `ProviderUsage` entry rather than this one field, so a
-    /// new pool kind would take an account's *usage* down with it and read as
+    /// It is also the deserialization fallback: an unrecognised funding kind has
+    /// unknown funding to this consumer. Without the fallback an unrecognised
+    /// value fails the whole `ProviderUsage` entry rather than this one field, so
+    /// a new pool kind would take an account's *usage* down with it and read as
     /// the provider being unavailable.
     #[serde(other)]
     Unknown,
@@ -201,9 +198,8 @@ pub enum PoolBasis {
     /// Computed from a total and a consumption figure that covers several pools
     /// at once, so the split between them is not known.
     ///
-    /// The distinction is load-bearing for any "spend only granted credits"
-    /// policy: against a `Reported` pool it is exact, and against a `Derived`
-    /// one it can only be a ceiling.
+    /// A "spend only granted credits" policy is exact for a `Reported` pool; a
+    /// `Derived` pool supplies only a ceiling.
     Derived,
     /// No basis was stated, or one was stated that this consumer does not
     /// recognise. **Treat `remaining` as a ceiling, never as exact.**
@@ -212,8 +208,7 @@ pub enum PoolBasis {
     /// value into [`Self::Derived`]. Both are read conservatively, so the
     /// spending behaviour is the same either way — but `Derived` is a statement
     /// about how a number was obtained, and answering "I do not know" with it
-    /// would have the producer assert a fact it does not hold. That is the
-    /// failure this type exists to prevent, one level up.
+    /// would have the producer assert a fact it does not hold.
     ///
     /// Reading it conservatively is safe in the direction that matters: an
     /// exact remainder treated as a ceiling under-spends, while a ceiling
@@ -399,7 +394,7 @@ pub struct ProviderUsage {
     /// morning both produce a degraded entry, and only the second is worth
     /// anyone's attention.
     ///
-    /// Classes currently produced:
+    /// Produced classes:
     ///
     /// | Value | Meaning |
     /// |---|---|
@@ -410,15 +405,14 @@ pub struct ProviderUsage {
     /// | `upstream_failed` | The upstream could not be reached or returned an error status. Usually transient. |
     /// | `decode_failed` | The response arrived but was not the expected shape. |
     ///
-    /// **This list will grow.** A consumer must render an unrecognised class as
-    /// a degraded entry with an unknown reason — never drop the entry, and
+    /// Class vocabulary is open. A consumer must render an unrecognised class
+    /// as a degraded entry with an unknown reason — never drop the entry, and
     /// never fold it into an existing bucket. It is a `String` rather than an
     /// enum for exactly that reason: on an observability surface, meeting an
     /// unknown value must not turn into a parse failure that makes a provider
     /// disappear at the moment its state changed.
     ///
-    /// Absent on healthy entries, and absent from any producer that predates
-    /// this field.
+    /// Absent on healthy entries or when the producer does not supply a class.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub error_class: Option<String>,
     /// Present when this entry is a last-known-good reading served through an
@@ -432,9 +426,8 @@ pub struct ProviderUsage {
     /// second is not — and a consumer with only a timestamp has to guess with a
     /// wall-clock threshold, which denies fresh-enough data to catch stale data.
     ///
-    /// A producer serving preserved readings is behaving correctly: a brief
-    /// upstream failure should not blank a window. This field discloses that it
-    /// is happening rather than reporting a fault.
+    /// A brief upstream failure should not blank a window. This field discloses
+    /// a preserved reading rather than reporting a fault.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub stale: Option<Stale>,
 }
@@ -462,7 +455,6 @@ pub struct Stale {
 }
 
 impl ProviderUsage {
-    /// A healthy entry with resolved windows.
     pub fn healthy(provider: &str, account: Option<String>, source: &str, usage: Usage) -> Self {
         Self {
             provider: provider.to_string(),
@@ -521,10 +513,8 @@ impl ProviderUsage {
 #[cfg(test)]
 mod tests {
 
-    /// An entry without the field serializes exactly as before.
-    ///
-    /// Every consumer decoding today's shape must keep working, so absence has
-    /// to be byte-identical rather than merely tolerated.
+    /// Fresh entries omit `stale`; serializing a null field would still change
+    /// the wire payload.
     #[test]
     fn a_fresh_entry_carries_no_stale_key() {
         let entry = ProviderUsage::healthy("codex", None, "oauth", Usage::default());
@@ -569,11 +559,8 @@ mod tests {
         );
     }
 
-    /// A producer that cannot classify the failure still discloses the state.
-    ///
-    /// Optional rather than required so a preserved reading is never suppressed
-    /// for want of a label -- disclosing "this is stale, cause unstated" beats
-    /// looking fresh.
+    /// `class` stays optional so an unclassified preserved reading remains
+    /// visibly stale.
     #[test]
     fn a_disclosure_without_a_class_still_decodes() {
         let json = r#"{"provider":"codex","stale":{"since":"2026-08-13T10:02:00Z"}}"#;
@@ -584,7 +571,6 @@ mod tests {
         assert_eq!(stale.since, "2026-08-13T10:02:00Z");
     }
 
-    /// An entry from a producer that predates the field decodes unchanged.
     #[test]
     fn an_entry_without_the_field_decodes() {
         let json = r#"{"provider":"codex","source":"oauth"}"#;
@@ -742,8 +728,8 @@ mod tests {
         assert_eq!(back, enriched);
     }
 
-    /// The field is additive: a producer that does not set it must serialize
-    /// exactly as before, or adding it changes every existing entry on the wire.
+    /// An absent class must omit `errorClass`; serializing `null` would change
+    /// every entry.
     #[test]
     fn an_entry_without_a_class_serializes_as_it_did_before_the_field_existed() {
         let entry = ProviderUsage::degraded("codex", "no session: nothing configured");
@@ -773,11 +759,8 @@ mod tests {
         assert_eq!(back, entry);
     }
 
-    /// The classes are open by design, so a consumer built today must survive a
-    /// producer that ships a class it has never heard of. Modelling the field as
-    /// a `String` is what buys that: an enum would make this a parse failure,
-    /// and on an observability surface a parse failure means the entry vanishes
-    /// at the moment its state changed.
+    /// Consumers must decode unrecognised classes so new values do not erase the
+    /// provider entry from observability.
     #[test]
     fn an_unknown_class_decodes_rather_than_failing() {
         let json = r#"{"provider":"someprovider","error":"something new","errorClass":"a_class_from_the_future"}"#;
@@ -795,12 +778,8 @@ mod tests {
         assert_eq!(entry.error.as_deref(), Some("something new"));
     }
 
-    /// An entry with no pools serializes exactly as it did before pools existed.
-    ///
-    /// Consumers pin these payloads, so an additive field that appears as `null`
-    /// on every existing entry is not additive in practice. The check is on the
-    /// rendered text rather than on the field, because that is what a consumer
-    /// parses.
+    /// Consumers pin wire payloads, so absent pools must omit `spend` instead of
+    /// serializing `null`.
     #[test]
     fn an_entry_without_pools_does_not_mention_them() {
         let entry = ProviderUsage::healthy("codex", None, "oauth", Usage::default());
@@ -852,14 +831,13 @@ mod tests {
     ///
     /// This payload crosses a repository boundary: one project produces it,
     /// others consume it, and their versions move independently. A closed enum
-    /// makes the first new funding kind fail deserialization of the WHOLE
+    /// makes an unrecognised funding kind fail deserialization of the whole
     /// `ProviderUsage` entry rather than one field, so an account's rate windows
     /// would vanish because of a credit pool the consumer had never heard of --
     /// and a vanished entry reads as the provider being unavailable.
     ///
-    /// Asserted on a mixed entry rather than on the enum alone, because the
-    /// blast radius is the point: the usage figure below is what a router acts
-    /// on, and it is downstream of the pool that failed.
+    /// A mixed entry verifies an unknown pool does not discard the usage figure
+    /// a router acts on.
     #[test]
     fn an_unknown_funding_kind_does_not_discard_the_entry() {
         let json = r#"{
@@ -878,7 +856,6 @@ mod tests {
         // The unrecognised kind lands on Unknown, which is the correct reading:
         // a funding this consumer cannot name is one it must not spend from.
         assert_eq!(pools[1].funding, PoolFunding::Unknown);
-        // And the part a router acts on survived.
         assert_eq!(
             entry.usage.and_then(|u| u.primary).map(|w| w.used_percent),
             Some(42.0)

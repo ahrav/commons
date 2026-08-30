@@ -7,12 +7,8 @@ repository.workspace = true
 authors.workspace = true
 description = "Seals push-notification payloads with HPKE so only the recipient device can read them."
 
-# Deliberately unpublished. The hazard is NOT that no external consumer exists —
-# that reasoning invites publication the day one appears. Publishing creates a
-# SECOND distribution path to the same bytes: a consumer resolving a registry
-# version while a sibling checkout floats to different code, compiling both into
-# one binary. For a crate emitting a wire format that is a silent divergence
-# between sealer and opener, not a build error.
+# Publishing permits registry and sibling-checkout versions to coexist in one
+# binary, risking silent wire-format divergence between sealer and opener.
 publish = false
 
 [dependencies]

@@ -2,9 +2,9 @@
 //! CortexKit module storage.
 //!
 //! There is one central storage config. subc resolves it into a
-//! [`StorageDescriptor`] per module and delivers that descriptor to the module
-//! (today via the registration handshake). The module hands the descriptor to the
-//! `cortexkit-store` crate, which opens the actual database.
+//! [`StorageDescriptor`] per module and delivers that descriptor to the module.
+//! The module hands the descriptor to the `cortexkit-store` crate, which opens the
+//! actual database.
 //!
 //! This crate is kept dependency-light (serde only, no database driver) so the
 //! wire crate that carries the descriptor can depend on it without pulling sqlite
@@ -13,12 +13,10 @@
 //!
 //! ## Design invariants
 //!
-//! - The backend set is **extensible** (sqlite now, postgres soon, cloud later). A
-//!   new variant is additive; module code does not branch on the backend, it just
-//!   hands the descriptor to `cortexkit-store`.
-//! - Database **isolation** is explicit, never derived from a naming convention,
-//!   so a future per-(module, project) isolation is an additive variant rather
-//!   than a breaking change to how names are built.
+//! - Backend variants are additive; module code hands descriptors to
+//!   `cortexkit-store` instead of branching on the backend.
+//! - Database **isolation** is explicit, never derived from naming conventions,
+//!   so descriptor semantics do not depend on how database names are built.
 //! - The descriptor a module receives is fully **resolved and least-privilege**:
 //!   it never carries central config or an admin credential. For postgres the DSN
 //!   reaches only the module's own database.
@@ -27,8 +25,8 @@ use serde::{Deserialize, Serialize};
 
 /// How many physical databases a module's storage spans.
 ///
-/// Explicit, never inferred from a name, so finer isolation can be added without
-/// changing existing descriptors.
+/// `Isolation` is explicit rather than inferred from a database name, so
+/// descriptor semantics do not depend on database naming.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "kind")]
 pub enum Isolation {
@@ -36,16 +34,12 @@ pub enum Isolation {
     /// own rows internally (e.g. by a project key); it does not get a separate
     /// database per project.
     Module,
-    // A future `PerProject { .. }` variant is additive: a module that needs a
-    // separate physical database per project would receive that isolation, and
-    // the per-project descriptor arrives once the project is known.
 }
 
 /// The backend a module's storage runs on.
 ///
-/// Extensible by design: adding a variant (e.g. a cloud backend) does not change
-/// the descriptor's meaning for existing backends, and `cortexkit-store` opens
-/// whichever variant it is handed.
+/// Backend variants preserve existing descriptor meanings. Module code delegates
+/// backend handling to `cortexkit-store`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "backend")]
 pub enum StorageBackend {
@@ -55,7 +49,6 @@ pub enum StorageBackend {
     /// reaches only `database` (never an admin or `CREATEDB` DSN). The per-module
     /// database is provisioned out of band; the module connects with this DSN.
     Postgres { dsn: String, database: String },
-    // A future `Cloud { endpoint, auth_ref, .. }` variant is additive.
 }
 
 impl StorageBackend {
@@ -82,17 +75,14 @@ pub struct StorageDescriptor {
     pub storage_namespace: String,
     /// How many physical databases this storage spans.
     pub isolation: Isolation,
-    /// Where and how the storage lives.
     pub backend: StorageBackend,
 }
 
 /// Build the per-module postgres database name: `cortexkit_<slug>_<16hex>`.
 ///
-/// The 16-hex suffix is a hash of the FULL `module_id`, so two ids that slug to
-/// the same string (for example `a-b` and `a_b` both slug to `a_b`) still produce
-/// distinct database names. This is why a bare "hyphen to underscore" rule is
-/// unsafe on its own. The slug is bounded so the whole name fits postgres' 63-byte
-/// identifier limit.
+/// The 16-hex suffix hashes the full `module_id`, preventing collisions between
+/// ids with the same slug, such as `a-b` and `a_b`. The slug is bounded so the
+/// whole name fits postgres' 63-byte identifier limit.
 pub fn postgres_database_name(module_id: &str) -> String {
     const MAX_SLUG: usize = 36; // 63 - len("cortexkit_") - len("_") - 16
     let slug: String = module_id
@@ -136,8 +126,6 @@ mod tests {
 
     #[test]
     fn slug_collision_is_broken_by_the_hash() {
-        // The Oracle's flagged hazard: a bare hyphen->underscore rule collides
-        // `a-b` with `a_b`. The hash of the full id keeps them distinct.
         let a = postgres_database_name("a-b");
         let b = postgres_database_name("a_b");
         assert_ne!(a, b, "distinct module ids must not share a database name");
@@ -158,16 +146,14 @@ mod tests {
             sqlite_store_path("/home/u/.local/share", "alfonso-routing"),
             "/home/u/.local/share/cortexkit/alfonso-routing/store.db"
         );
-        // A trailing slash on the data home does not double up.
         assert_eq!(
             sqlite_store_path("/data/", "m"),
             "/data/cortexkit/m/store.db"
         );
     }
 
-    // Golden round-trip: the descriptor wire shape is a contract. If a field name
-    // or tag changes, this fails loudly (the change is then intentional, not
-    // accidental drift).
+    // Descriptor wire shape is a contract; field or tag changes require updating
+    // this golden JSON.
     #[test]
     fn sqlite_descriptor_golden_json() {
         let d = StorageDescriptor {
