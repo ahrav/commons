@@ -1,0 +1,544 @@
+# `cortexkit-push-seal` property catalog
+
+## Provenance and scope
+
+- System: `crates/cortexkit-push-seal`
+- Workspace revision observed: `34b0cae2d2ea7e181222c3d8b1957e394eb1dc2c`
+- Target crate revision: unchanged since `292ed993c452456106124a398d0b40c392f68858`
+- Catalog date: 2026-08-30
+- Working tree at discovery: clean for this crate
+- External evidence: none. The scope question was asked before analysis. No design docs, related repositories, issue trackers, incident reports, known failure modes, or earlier property artifacts were supplied.
+- Repository evidence consulted: crate source, examples, manifest, workspace README and CI, Git history for the crate, and the source of the resolved `hpke 0.14.0` dependency where this crate delegates parsing and RNG behavior.
+
+Documentation and commit messages are treated as claims or leads. Code resolves implemented behavior. The separate opener mentioned in `src/lib.rs:6-7` was not available, so cross-implementation agreement remains unverified.
+
+## System model by discovery lens
+
+| Lens | Model |
+|---|---|
+| Architecture and data flow | `seal` checks the plaintext and public key, calls HPKE base mode, and emits `version \|\| enc \|\| ciphertext` (`src/lib.rs:103-131`). `open` checks length and version, parses the private and encapsulated keys, then opens the ciphertext (`src/lib.rs:161-188`). `wire_code` maps local open failures to a two-string external vocabulary (`src/lib.rs:133-154`). |
+| State and persistence | The crate source defines no retained state, persistence, cache, queue, or direct file I/O. `seal` enters the resolved OS entropy implementation, which may cache backend state and read `/dev/urandom` on Linux fallback paths. The envelope is the only artifact retained by this API. |
+| Concurrency | The crate source defines no threads, async work, locks, atomics, or shared mutable state. The resolved entropy implementation uses internal atomic/cache state, so concurrency-specific crate invariants are not inferred from the absence of local synchronization. |
+| Claimed safety | The docs claim a fixed suite, layout, version, AAD, empty `info`, inclusive plaintext cap, error vocabulary, recipient confidentiality, and version-bump discipline (`src/lib.rs:4-56,97-160`). |
+| Claimed liveness | No explicit liveness guarantee. The library has no convergence or eventual-completion protocol. `seal` also depends on the OS entropy path, which may block, retry, or fall back before returning or panicking. |
+| Bug history and density | Seven commits touch the crate. Three concentrate on selecting the correct operator-pasted key in `handseal`; no production incident or library regression is recorded. The library implementation has not changed since its initial commit. |
+| Existing test strategy | Ten in-module unit tests cover one round trip, suite IDs, one layout size, two random seals, cap boundaries, selected open failures, wrong recipient, and AAD presence. There is no cross-language corpus, integration test, property test, fuzz target, fault injection, or example test. |
+| Failure and degradation | The crate itself performs no retry or fallback. Its dependency may retry or fall back while obtaining entropy and panics if the ambient RNG ultimately fails. Crate documentation claims that a sealer/opener wire mismatch is silent locally and appears on the device as an undecryptable notification (`src/lib.rs:9-12`); the unavailable device path was not verified. |
+| Dependencies | `hpke 0.14` supplies all cryptographic behavior. `rand_core 0.9` and dev-dependency `hex` are declared but unused in this crate. `Cargo.lock` is not tracked, so patch-level dependency resolution is not repository-pinned. |
+| Product context | This crate seals push-notification payloads. The actual opener is in another repository. The examples are operator tools for generating a keypair and hand-checking a round trip. |
+| Unproven assumptions | The transport bounds input before `open`; the recipient key is dedicated to this protocol; the external opener agrees on suite, layout, gate order, and wire codes; every byte-affecting change includes a crate-version bump. |
+| Wildcard | `open` hardcodes `ENC_LEN` while `seal` uses the serialized key length. The version value is not pinned to literal `0x01` by a test. The example label parser uses substring and first-match selection. Base-mode HPKE provides neither replay detection nor sender authentication. |
+
+### Contract-versus-code leads
+
+These disagreements stay visible because code may be the defect.
+
+1. `BadRecipientKey` is documented as invalid X25519 point/scalar detection (`src/lib.rs:75-90`), but the resolved dependency checks only the 32-byte serialized length. A degenerate 32-byte public key can instead reach `SealError::Hpke`.
+2. The docs say sealing failures preserve their cause (`src/lib.rs:61-62`), but the dependency's ambient RNG wrapper panics on entropy failure.
+3. The docs delegate `open`'s size bound to transport (`src/lib.rs:156-160`), but no transport or bound exists in this repository.
+4. The docs require version bumps for emitted-byte or behavior changes (`src/lib.rs:13-20`), but no repository check enforces the rule.
+5. The docs say the recipient key is dedicated to this purpose (`src/lib.rs:39-42`), but this repository cannot inspect key use in the device or caller.
+
+## Existing-check inventory
+
+All existing checks are **unaudited**. Test adequacy belongs to `/testing:invariant-test-review`; production-guard placement and failure behavior belong to `/low-level-systems:defensive-assertions-and-invariant-guards`.
+
+### Production and example guards
+
+| Location | Semantics and message | Status |
+|---|---|---|
+| `src/lib.rs:104-109` | Rejects plaintext over 2048 bytes with `PlaintextTooLarge { limit, observed }`. | unaudited runtime guard |
+| `src/lib.rs:162-166` | Rejects envelopes shorter than 33 bytes with `Malformed { observed }`. | unaudited runtime guard |
+| `src/lib.rs:167-171` | Rejects any leading byte other than `VERSION` with `UnknownVersion { observed }`. | unaudited runtime guard |
+| `src/lib.rs:111-123` | Maps public-key deserialization to `BadRecipientKey` and HPKE sealing failure to `Hpke`. | unaudited runtime validation/error mapping |
+| `src/lib.rs:173-187` | Maps private-key deserialization to `BadRecipientKey`, encapsulated-key parsing and HPKE open failures to `Aead`. | unaudited runtime validation/error mapping |
+| `examples/handseal.rs:20-31` | Requires two arguments; exits 2 with usage or parser error. | unaudited example guard |
+| `examples/handseal.rs:56-77` | Selects `push_seal_pubkey_hex`, accepts `:` or `=`, rejects a token-only labelled block. | unaudited example guard |
+| `examples/handseal.rs:81-99` | Rejects empty, non-hex, and non-64-character keys with operator-facing messages. | unaudited example guard |
+| `examples/handseal.rs:33-35` | Slices validated ASCII hex in two-character chunks and uses `expect("checked above")`; correctness depends on `validate` running first. | unaudited example invariant/panic site |
+| `examples/handseal.rs:38` | `expect("seal")`; converts every library sealing error into a panic. | panic site, not an invariant guard |
+| `examples/handopen.rs:2-9` | Positional indexing, slicing, and `unwrap`; malformed arguments can panic. | panic sites, not invariant guards |
+
+No production `assert!`, `debug_assert!`, or equivalent invariant assertion was found.
+
+### Claim-bearing tests
+
+| Test and location | Existing semantics | Status |
+|---|---|---|
+| `the_pinned_suite_is_the_one_the_opener_agreed_to`, `src/lib.rs:204-209` | Three literal codepoint equalities; messages name KEM, KDF, and AEAD. | unaudited |
+| `a_sealed_payload_opens_to_the_same_plaintext`, `:211-216` | One matching-key round trip for a ten-byte ASCII plaintext. | unaudited |
+| `the_envelope_is_version_then_enc_then_ciphertext`, `:218-225` | Symbolic version equality and one total-length check for a one-byte plaintext. | unaudited |
+| `each_seal_uses_a_fresh_ephemeral`, `:232-242` | Two sequential seals must have different `enc`; message: `encapsulated key must not repeat across messages`. | unaudited |
+| `an_oversized_plaintext_is_refused_with_both_numbers`, `:244-259` | Cap+1 is rejected with both numbers; the exact cap is a positive control. | unaudited |
+| `an_unknown_version_is_refused_as_a_version_rather_than_as_corruption`, `:261-271` | Full-length envelope relabelled `0x02` returns `UnknownVersion`; message names format change. | unaudited |
+| `a_truncated_envelope_is_malformed_rather_than_an_aead_failure`, `:273-282` | A 32-byte prefix returns `Malformed { observed: 32 }`. | unaudited |
+| `every_open_failure_maps_to_the_wire_vocabulary`, `:286-316` | Covers `UnknownVersion`, `Malformed`, and `Aead`; does not construct `BadRecipientKey`; includes a valid-envelope control. | unaudited |
+| `the_wrong_recipient_cannot_open`, `:318-324` | A different generated keypair returns `Aead`. | unaudited |
+| `the_version_byte_is_authenticated_not_merely_present`, `:330-356` | Empty AAD fails; correct AAD succeeds as a positive control. | unaudited |
+
+## Property catalog
+
+### matching-key-roundtrip-preserves-plaintext
+
+- **Type:** safety
+- **Status:** active
+- **Exercised:** yes, narrowly; one plaintext in `src/lib.rs:211-216`
+- **Guarantee:** For every plaintext of at most 2048 bytes and every generated matching keypair, opening the sealed envelope returns exactly the original bytes.
+- **Check:** `always(open(sk, seal(pk, plaintext)?)? == plaintext)` for lengths `0..=MAX_PLAINTEXT_BYTES`, including non-UTF-8 bytes. `always` fits because every accepted seal/open pair must preserve bytes.
+- **Fault/timing angle:** Boundary lengths 0 and 2048; binary payloads; no injected fault.
+- **Required faults and enabling state:** Matching keypair and accepted plaintext. The workload must reach both length boundaries.
+- **Confidence:** high; [evidence](evidence/matching-key-roundtrip-preserves-plaintext.md)
+- **Existing check:** `src/lib.rs:211-216`; status unaudited.
+- **Impact:** Failure destroys the crate's core function and, according to crate documentation, renders notifications undecryptable.
+- **Open questions:** None.
+
+### pinned-ciphersuite-codepoints
+
+- **Type:** safety
+- **Status:** active
+- **Exercised:** yes; all three codepoints are asserted in `src/lib.rs:204-209`
+- **Guarantee:** The suite remains KEM `0x0020`, KDF `0x0001`, and AEAD `0x0003`.
+- **Check:** `always(KEM_ID == 0x0020 && KDF_ID == 0x0001 && AEAD_ID == 0x0003)`. `always` fits because these are build-wide wire constants.
+- **Fault/timing angle:** Dependency upgrade or type substitution behind a stable name.
+- **Required faults and enabling state:** None; evaluate on every build.
+- **Confidence:** high; [evidence](evidence/pinned-ciphersuite-codepoints.md)
+- **Existing check:** `src/lib.rs:204-209`; status unaudited.
+- **Impact:** Mismatch causes cross-repository authentication failure with no local sealer error.
+- **Open questions:** Whether the unavailable opener asserts the same literals.
+
+### cross-implementation-wire-vectors-conform
+
+- **Type:** safety
+- **Status:** active
+- **Exercised:** not yet; the external opener and shared vector corpus were not supplied
+- **Guarantee:** The local sealer and external opener agree byte-for-byte on suite, version, layout, `info`, AAD, plaintext, and failure classification in both directions.
+- **Check:** Under a recorded deterministic `getrandom` custom backend, local `seal` of each fixed `(recipient public key, plaintext, RNG byte stream)` equals the expected envelope that the external opener accepts; fixed external envelopes open locally to expected plaintext or exact wire failure. Record target and build-purpose identity with every vector. `always` fits because every vector is a normative cross-implementation contract.
+- **Fault/timing angle:** Independent implementation drift, release skew, or dependency drift that keeps local self-roundtrip tests green.
+- **Required faults and enabling state:** External opener or authoritative corpus, deterministic custom entropy backend, matching key material, positive vectors, and multi-defect negative vectors.
+- **Confidence:** high that the contract is required, low that it currently holds; [evidence](evidence/cross-implementation-wire-vectors-conform.md)
+- **Existing check:** none; all current cryptographic tests seal and open with this implementation.
+- **Impact:** This is the direct oracle for the documented cross-repository compatibility boundary.
+- **Open questions:** Corpus location, ownership, vocabulary, opener build identity, and vector-production process. `(needs human input)`
+
+### envelope-layout-and-overhead-stay-fixed
+
+- **Type:** safety
+- **Status:** active
+- **Exercised:** yes, narrowly; one-byte plaintext in `src/lib.rs:218-225`
+- **Guarantee:** Every envelope is `0x01 || 32-byte enc || ciphertext`, and its length is `plaintext.len() + 49`.
+- **Check:** `always(envelope[0] == 0x01 && enc.len() == 32 && envelope.len() == plaintext.len() + 49 && envelope.len() <= 2097)`, plus a manual split that opens successfully. Literal sizes pin the wire rather than restating local constants; 2097 is the maximum local envelope size.
+- **Fault/timing angle:** KEM or AEAD change, field insertion/reordering, stale `ENC_LEN`.
+- **Required faults and enabling state:** Accepted plaintexts at lengths 0, 1, 2048 and a matching keypair.
+- **Confidence:** high; [evidence](evidence/envelope-layout-and-overhead-stay-fixed.md)
+- **Existing check:** `src/lib.rs:218-225`; `:335-351` manually splits the envelope only for a negative empty-AAD open, and `:355` uses public `open` as its success control. Status unaudited.
+- **Impact:** Wrong offsets or overhead break the external opener and downstream transport sizing.
+- **Open questions:** Transport encoding and byte limit are unavailable.
+
+### version-one-is-only-emitted-and-accepted-version
+
+- **Type:** safety
+- **Status:** active
+- **Exercised:** yes, partially; two non-version values are tested, but literal `VERSION == 0x01` is not pinned
+- **Guarantee:** `seal` emits literal version `0x01`, and `open` accepts no other version after the minimum-length gate passes.
+- **Check:** `always(VERSION == 0x01 && seal(...)?[0] == 0x01)` and, for all `v != 0x01` on envelopes of at least 33 bytes, `open(...) == UnknownVersion { observed: v }`.
+- **Fault/timing angle:** One-byte constant edit or rollout of a second format.
+- **Required faults and enabling state:** Full-length envelope with each non-`0x01` leading byte.
+- **Confidence:** high; [evidence](evidence/version-one-is-only-emitted-and-accepted-version.md)
+- **Existing check:** `src/lib.rs:261-271,291-296`; status unaudited and does not pin the literal constant.
+- **Impact:** A version drift is a silent cross-repository wire break.
+- **Open questions:** Whether future rollout requires dual-version acceptance.
+
+### version-byte-is-exact-aad
+
+- **Type:** safety
+- **Status:** active
+- **Exercised:** yes, partially; empty AAD is rejected, but other wrong non-empty AAD values are not tested
+- **Guarantee:** The associated data used by both sides is exactly the envelope's one-byte version field.
+- **Check:** After the version gate establishes `envelope[0] == VERSION`, `always([VERSION] == [envelope[0]])`; direct HPKE open succeeds with computed AAD `[VERSION]` and fails with `[]`, `[0x00]`, and `[0x01, 0x00]`. `always` fits every accepted envelope and reflects what the code computes.
+- **Fault/timing angle:** AAD refactor or multi-version acceptance while `open` continues using the build constant.
+- **Required faults and enabling state:** Valid envelope plus exact and altered AAD values.
+- **Confidence:** high for current code; [evidence](evidence/version-byte-is-exact-aad.md)
+- **Existing check:** `src/lib.rs:330-356`; status unaudited.
+- **Impact:** Unbound or mismatched version bytes permit parse confusion or cause opaque authentication failures.
+- **Open questions:** None at version 1; multi-version rollout remains unspecified.
+
+### hpke-info-remains-empty
+
+- **Type:** safety
+- **Status:** active
+- **Exercised:** not yet; no check varies `info`
+- **Guarantee:** Both sealer and opener use an empty HPKE `info` value.
+- **Check:** Pin both call sites to `&[]`, then differentially open one sealed envelope with empty and fixed non-empty `info`; only empty succeeds. `always` fits because `info` is a build-wide wire constant. The durable compatibility oracle belongs in the external conformance corpus.
+- **Fault/timing angle:** Adding domain separation on only one implementation.
+- **Required faults and enabling state:** Direct dependency-level open using empty and non-empty `info`.
+- **Confidence:** high for this implementation; [evidence](evidence/hpke-info-remains-empty.md)
+- **Existing check:** none.
+- **Impact:** Any one-sided change breaks every envelope.
+- **Open questions:** Whether the recipient key is actually dedicated is tracked separately.
+
+### plaintext-cap-is-inclusive-and-nontruncating
+
+- **Type:** safety
+- **Status:** active
+- **Exercised:** yes; exact cap and cap+1 in `src/lib.rs:244-259`
+- **Guarantee:** Plaintexts over 2048 bytes return both the limit and observed size before key parsing, RNG use, or envelope allocation; accepted lengths are never rejected as `PlaintextTooLarge`.
+- **Check:** `always(len > 2048 => PlaintextTooLarge { limit: 2048, observed: len })` and `always(len <= 2048 => result != PlaintextTooLarge)`, with source or instrumentation confirming guard order. For a generated valid key and working entropy source, a 2048-byte plaintext must round-trip unchanged.
+- **Fault/timing angle:** Off-by-one errors and accidental truncation.
+- **Required faults and enabling state:** Plaintext lengths 2047, 2048, 2049, and a much larger value.
+- **Confidence:** high; [evidence](evidence/plaintext-cap-is-inclusive-and-nontruncating.md)
+- **Existing check:** `src/lib.rs:244-259`; cap+1 classification and exact-cap seal success are unaudited, and the exact-cap plaintext is not opened.
+- **Impact:** Truncation produces an authenticated blob that does not represent caller intent; rejecting everything would block notifications.
+- **Open questions:** Whether the composing caller also preflights the cap.
+
+### tampered-or-truncated-envelope-never-opens
+
+- **Type:** safety
+- **Status:** active
+- **Exercised:** yes, partially; one short prefix and two version mutations are tested
+- **Guarantee:** Under the AEAD authenticity assumption, proper prefixes and bit mutations are rejected except with negligible forgery probability.
+- **Check:** For the finite sampled corpus, `always(open(sk, proper_prefix).is_err())` and `always(open(sk, single_bit_mutation).is_err())`; any acceptance is a failure requiring cryptographic investigation. The check is empirical evidence, not a proof of zero forgery probability.
+- **Fault/timing angle:** Short read, partial write, transport corruption, or active tampering in the version, `enc`, ciphertext, or tag.
+- **Required faults and enabling state:** A valid envelope, all proper-prefix lengths, and bit flips across every field.
+- **Confidence:** high from AEAD structure, but campaign coverage is incomplete; [evidence](evidence/tampered-or-truncated-envelope-never-opens.md)
+- **Existing check:** `src/lib.rs:261-282,286-296,330-356`; status unaudited.
+- **Impact:** Acceptance would expose attacker-controlled or partial notification content.
+- **Open questions:** None.
+
+### wrong-recipient-never-opens
+
+- **Type:** safety
+- **Status:** active
+- **Exercised:** yes; one independently generated keypair in `src/lib.rs:318-324`
+- **Guarantee:** Under HPKE and AEAD security assumptions, an envelope sealed to one recipient opens under a distinct recipient key only with negligible forgery probability.
+- **Check:** After asserting `other_pk != pk`, require `always(open(other_sk, seal(pk, plaintext)?) == Err(OpenError::Aead))` for the sampled keypairs; any acceptance is a failure requiring cryptographic investigation.
+- **Fault/timing angle:** Key selection or environment mix-up.
+- **Required faults and enabling state:** Two generated keypairs with asserted-distinct public keys and a non-empty plaintext.
+- **Confidence:** high; [evidence](evidence/wrong-recipient-never-opens.md)
+- **Existing check:** `src/lib.rs:318-324`; status unaudited. It generates another keypair but does not assert the two public keys differ, so its enabling state is probabilistic.
+- **Impact:** Violation breaks recipient confidentiality.
+- **Open questions:** None.
+
+### open-error-precedence-is-stable
+
+- **Type:** safety
+- **Status:** active
+- **Exercised:** not yet for inputs with multiple simultaneous defects
+- **Guarantee:** Open failures are selected in the order: short envelope, unsupported version, bad private-key length, then dependency decapsulation or authenticated-open failure.
+- **Check:** `always(result == first_applicable_error)` over a table combining short length, unknown version, wrong-length private key, and corrupt ciphertext. `always` fits because precedence is part of deterministic wire classification.
+- **Fault/timing angle:** Multi-defect envelope, especially a truncated future-version envelope.
+- **Required faults and enabling state:** Inputs with at least two defects at once; single-defect tests are vacuous for precedence.
+- **Confidence:** high for this implementation; cross-implementation agreement is unknown; [evidence](evidence/open-error-precedence-is-stable.md)
+- **Existing check:** length, version, and authenticated-open gates are tested separately at `src/lib.rs:261-316`; the wrong-length private-key gate is unexercised. Status unaudited.
+- **Impact:** If the unavailable opener uses different precedence, the implementations produce different corpus results and diagnosis.
+- **Open questions:** The unavailable opener's gate order.
+
+### wire-error-vocabulary-is-stable
+
+- **Type:** safety
+- **Status:** active
+- **Exercised:** yes, partially; `BadRecipientKey` is not constructed by the existing mapping test
+- **Guarantee:** `UnknownVersion` maps to `unsupported_version`; `Malformed`, `BadRecipientKey`, and `Aead` map to `malformed`; no other string is emitted.
+- **Check:** `always(wire_code(error) == expected_literal)` for every enum variant. `always` fits because the mapping is a total wire function.
+- **Fault/timing angle:** New error variant, string rename, or reclassification.
+- **Required faults and enabling state:** Construct all variants, including a wrong-length private key.
+- **Confidence:** high; [evidence](evidence/wire-error-vocabulary-is-stable.md)
+- **Existing check:** `src/lib.rs:286-316`; status unaudited and misses one variant.
+- **Impact:** Drift breaks the cross-language conformance vocabulary.
+- **Open questions:** Whether opener-side key misconfiguration should intentionally collapse to `malformed`.
+
+### each-seal-uses-fresh-ephemeral
+
+- **Type:** safety
+- **Status:** active
+- **Exercised:** yes, narrowly; two sequential calls in `src/lib.rs:232-242`
+- **Guarantee:** Every successful `seal` after the plaintext and key gates uses a newly generated ephemeral and a newly constructed sender context.
+- **Check:** A custom backend records exactly one fresh draw per successful call and supplies distinct fixed draw bytes; each call constructs a new sender context. A negative-control backend repeats draw bytes and must produce repeated `enc`, proving the no-repeat canary detects degraded entropy. Production no-repeat campaigns remain statistical evidence, not proof. `always` applies to the per-successful-call draw/context obligation.
+- **Fault/timing angle:** Degraded or accidental deterministic custom RNG, or cached sender context. The resolved default `SysRng` obtains OS bytes per call; fork duplication is not asserted for that backend.
+- **Required faults and enabling state:** Many successful seals with identical valid recipient and accepted plaintext under working entropy. The resolved `getrandom` custom backend can observe or control draw calls.
+- **Confidence:** high for intended behavior; [evidence](evidence/each-seal-uses-fresh-ephemeral.md)
+- **Existing check:** `src/lib.rs:232-242`; status unaudited.
+- **Impact:** Reuse can repeat the AEAD key/nonce pair and break confidentiality.
+- **Open questions:** Whether production build flags can select a custom entropy backend and how that configuration is controlled.
+
+### open-is-total-over-bounded-input
+
+- **Type:** safety
+- **Status:** active
+- **Exercised:** yes, partially; lengths 32 and 33 are covered, not arbitrary inputs
+- **Guarantee:** Within the caller-owned envelope bound and available-memory contract, every private-key and envelope byte string returns `Ok` or a documented `OpenError` without indexing or parsing panic.
+- **Check:** For `envelope.len() <= TRANSPORT_MAX_ENVELOPE_BYTES`, `always(catch_unwind(|| open(key, envelope)).is_ok())` over generated bytes, with focused lengths 0, 32, 33, 48, and 49. Allocation failure is outside this claim.
+- **Fault/timing angle:** Boundary slicing and malformed authenticated data.
+- **Required faults and enabling state:** Arbitrary key and envelope bytes within the caller-owned bound, including very short inputs. The exact bound is unresolved.
+- **Confidence:** medium by code inspection because the caller bound is unavailable; [evidence](evidence/open-is-total-over-bounded-input.md)
+- **Existing check:** `src/lib.rs:273-306`; status unaudited.
+- **Impact:** Panic would turn malformed input into denial of service for any caller exposing `open`.
+- **Open questions:** Whether untrusted input reaches this helper outside corpus generation.
+
+### entropy-failure-does-not-unwind
+
+- **Type:** safety
+- **Status:** active — dependency source predicts this claim is violated if the ambient RNG fails
+- **Exercised:** not yet; no repository check uses the resolved backend-selection seam
+- **Guarantee:** Under sufficient memory, an entropy-source error is returned through the sealing error surface instead of unwinding through `seal`.
+- **Check:** Build with the resolved `getrandom` `unsupported` backend; call `seal` with accepted plaintext and a fixed valid, non-low-order 32-byte public key; prove the backend was invoked; then require `always(catch_unwind(seal) == Ok(Err(_)))`. The input preconditions and backend witness prevent earlier guards from producing a vacuous green result.
+- **Fault/timing angle:** OS entropy-source failure before encapsulation.
+- **Required faults and enabling state:** Sufficient memory, accepted plaintext, fixed valid non-low-order public key, and deterministic entropy failure through `getrandom_backend="unsupported"` or a failing custom backend, with an invocation witness.
+- **Confidence:** high that the resolved dependency panics; medium that the crate promises otherwise; [evidence](evidence/entropy-failure-does-not-unwind.md)
+- **Existing check:** none.
+- **Impact:** Depending on panic policy, one entropy failure can abort a request task or process instead of returning a diagnosable error.
+- **Open questions:** Consumer panic policy and deployment conditions; both need human input.
+
+### transport-bounds-open-envelope-size
+
+- **Type:** safety
+- **Status:** active
+- **Exercised:** not yet; no production transport caller exists in this repository
+- **Guarantee:** Every call to `open` receives an envelope no larger than the transport-owned maximum.
+- **Check:** `always(envelope.len() <= TRANSPORT_MAX_ENVELOPE_BYTES)` at the caller boundary, with an allocation watermark confirming bounded memory. `always` fits every call.
+- **Fault/timing angle:** Oversized untrusted envelope under memory pressure.
+- **Required faults and enabling state:** Caller integration plus maximum-size and over-limit inputs.
+- **Confidence:** low for the system, high that this crate delegates the obligation; [evidence](evidence/transport-bounds-open-envelope-size.md)
+- **Existing check:** none.
+- **Impact:** Without the delegated bound, `open` allocates and performs work in proportion to attacker-controlled input.
+- **Open questions:** Which transport owns the bound and its exact value. `(needs human input)`
+
+### recipient-key-is-dedicated-to-push-sealing
+
+- **Type:** safety
+- **Status:** active
+- **Exercised:** not yet; key use is outside this repository
+- **Guarantee:** A recipient key used with empty HPKE `info` is never reused by another protocol or purpose.
+- **Check:** `always(key_id used by push sealing is absent from every non-push protocol key-use site)`. `always` fits the domain-separation assumption.
+- **Fault/timing angle:** Key reuse introduced by provisioning, migration, or sender-authentication work.
+- **Required faults and enabling state:** Complete key-provisioning and device-use inventory across repositories.
+- **Confidence:** low; only the local documentation claims dedication; [evidence](evidence/recipient-key-is-dedicated-to-push-sealing.md)
+- **Existing check:** none.
+- **Impact:** If the key is shared, empty `info` loses protocol-level domain separation.
+- **Open questions:** Actual device and provisioning key-use graph. `(needs human input)`
+
+### labelled-input-selects-only-push-key
+
+- **Type:** safety
+- **Status:** active
+- **Exercised:** not yet; examples have no tests
+- **Guarantee:** A single-separator block with one exact `push_seal_pubkey_hex` label selects that value with either `:` or `=`; a block with only `apns_device_token_hex` is rejected; bare 64-character hex remains supported; empty, non-hex, and wrong-length selected values are rejected rather than repaired.
+- **Check:** `always(select_key(input) == expected)` over single-separator exact-label key-only and token-only blocks, both separators, valid bare hex, empty values, non-hex, and wrong lengths. Duplicate labels, substring labels, and extra separators/suffixes are excluded until their contract is decided.
+- **Fault/timing angle:** Operator paste of a single-separator key-only or token-only labelled block.
+- **Required faults and enabling state:** Single-separator exact-label blocks and bare input representing each listed case; the token-only situation must occur at least once.
+- **Confidence:** high for the narrow exact-label contract; [evidence](evidence/labelled-input-selects-only-push-key.md)
+- **Existing check:** guards at `examples/handseal.rs:53-99`; no test; status unaudited.
+- **Impact:** Wrong selection can seal successfully to a value whose matching private key is unavailable; crate documentation says this failure may appear only on the device.
+- **Open questions:** Whether matching must use a whole label and whether duplicate or extra-separator labels must be rejected during key rotation.
+
+### bad-recipient-key-paths-are-reachable
+
+- **Type:** reachability
+- **Status:** active
+- **Exercised:** not yet by repository tests
+- **Guarantee:** Both public `BadRecipientKey` return paths can be reached under their preceding successful gates.
+- **Check:** `reachable(seal(short_public_key, accepted_plaintext) == Err(SealError::BadRecipientKey))` and `reachable(open(short_private_key, current_version_full_length_envelope) == Err(OpenError::BadRecipientKey))`.
+- **Fault/timing angle:** Truncated or prefixed local key material.
+- **Required faults and enabling state:** Accepted-size plaintext for `seal`; at least 33-byte current-version envelope for `open`; public/private key lengths other than 32.
+- **Confidence:** high from control flow and resolved dependency source; [evidence](evidence/bad-recipient-key-paths-are-reachable.md)
+- **Existing check:** none.
+- **Impact:** Without these enabling states, public variants and the `BadRecipientKey -> malformed` wire mapping remain unexercised.
+- **Open questions:** The separate contract disagreement over whether `BadRecipientKey` should mean length-only or semantic validation remains unresolved.
+
+### bad-recipient-key-follows-resolved-deserializer
+
+- **Type:** safety
+- **Status:** active
+- **Exercised:** not yet by repository tests
+- **Guarantee:** After earlier gates pass, each API returns `BadRecipientKey` exactly when the resolved HPKE public/private-key deserializer rejects the supplied bytes.
+- **Check:** With accepted plaintext for `seal` and a current-version full-length envelope for `open`, `always((from_bytes(key).is_err()) == (result == BadRecipientKey))` for the respective resolved key type.
+- **Fault/timing angle:** Dependency deserializer changes from length-only behavior to same-size semantic validation, or local error mapping drifts.
+- **Required faults and enabling state:** Inputs accepted and rejected by each resolved deserializer while all earlier API gates pass.
+- **Confidence:** high for current control flow; [evidence](evidence/bad-recipient-key-follows-resolved-deserializer.md)
+- **Existing check:** none.
+- **Impact:** Preserves the documented error classification without pretending this repository has independently defined X25519 point/scalar validity.
+- **Open questions:** Whether public docs should describe the resolved length-only behavior or the API should impose a stricter independent validity contract.
+
+### degenerate-public-key-hpke-error-is-reachable
+
+- **Type:** reachability
+- **Status:** active
+- **Exercised:** not yet by repository tests
+- **Guarantee:** The `SealError::Hpke` branch is reachable with a 32-byte public value whose X25519 shared secret is all zero.
+- **Check:** `reachable(seal(degenerate_key, b"x") == Err(SealError::Hpke))`. `reachable` fits because this records a specific branch that existing happy-path keys never enter.
+- **Fault/timing angle:** Degenerate or low-order recipient public value.
+- **Required faults and enabling state:** Known degenerate 32-byte input and a working entropy source; ordinary generated keys cannot witness the branch.
+- **Confidence:** high from resolved dependency source; [evidence](evidence/degenerate-public-key-hpke-error-is-reachable.md)
+- **Existing check:** none.
+- **Impact:** Without this reachability condition, `SealError::Hpke` and its caller handling can remain untested forever.
+- **Open questions:** Which degenerate vectors should be normative for the pinned dependency.
+
+### encapped-key-parse-failure-is-unreachable
+
+- **Type:** reachability
+- **Status:** active
+- **Exercised:** not yet; no branch-level reachability instrumentation exists
+- **Guarantee:** Under the resolved X25519 deserializer contract, the `EncappedKey::from_bytes` error mapping at `src/lib.rs:176` is never entered.
+- **Check:** `unreachable(encapped_key_parse_error_branch)`. `unreachable` fits because this is a dedicated code point whose execution would mean `ENC_LEN` no longer matches the dependency's serialized key size.
+- **Fault/timing angle:** KEM or dependency change that alters serialized size or adds same-size semantic validation while local splitting remains unchanged.
+- **Required faults and enabling state:** None under the resolved dependency behavior; a future size or deserializer-semantics change can wake the branch.
+- **Confidence:** high from two-hop dependency source analysis; [evidence](evidence/encapped-key-parse-failure-is-unreachable.md)
+- **Existing check:** none; the layout test only catches the size relationship indirectly.
+- **Impact:** If this branch becomes reachable, the dependency deserializer contract no longer matches local assumptions and the new failure is mapped to `Aead` and then `malformed`.
+- **Open questions:** None.
+
+### low-order-encapsulation-aead-path-is-reachable
+
+- **Type:** reachability
+- **Status:** active
+- **Exercised:** not yet by repository tests
+- **Guarantee:** A low-order 32-byte encapsulated key can reach the dependency's decapsulation rejection and is collapsed to `OpenError::Aead` and wire code `malformed`.
+- **Check:** Use direct dependency decapsulation or branch instrumentation to prove `DecapError` was reached for a low-order `enc`; then require the public result to be `OpenError::Aead` with wire code `malformed`. `reachable` fits the witnessed dependency-facing path; the public result alone is non-discriminating.
+- **Fault/timing angle:** Attacker-controlled low-order `enc` field with an otherwise valid envelope shape.
+- **Required faults and enabling state:** Valid recipient private key and a dependency-approved low-order X25519 point in bytes 1..33.
+- **Confidence:** high from dependency decapsulation source; [evidence](evidence/low-order-encapsulation-aead-path-is-reachable.md)
+- **Existing check:** none; empty ciphertext reaches a different `OpenError` cause that is also collapsed to `Aead`.
+- **Impact:** Without this situation, the KEM-level rejection and its caller classification can remain untested while ordinary random fuzzing almost never reaches it.
+- **Open questions:** Which low-order vector should be normative for the pinned dependency.
+
+### byte-determining-dependency-closure-is-pinned
+
+- **Type:** safety
+- **Status:** active
+- **Exercised:** not yet; no repository mechanism records or verifies the resolved closure
+- **Guarantee:** Every supported target and build purpose that produces or verifies sealed bytes uses its approved enabled-feature set, entropy-backend configuration, command edge set, and version-and-checksum identity for the full transitive dependency graph.
+- **Check:** `always((enabled_features, getrandom_backend, cargo_edges, resolved_graph) == approved_build_identity[target, purpose])` for default verification, deterministic-vector generation, and entropy-failure testing on each supported target. `always` fits because one target can intentionally have several backend/configuration identities.
+- **Fault/timing angle:** A new in-range dependency release appears between developer, CI, consumer, or release builds.
+- **Required faults and enabling state:** A tracked build identity and deliberate changes to an in-range dependency, enabled feature, target, and entropy backend to prove each drift class is rejected. No such record exists today.
+- **Confidence:** high on the resolution mechanism and current gap; [evidence](evidence/byte-determining-dependency-closure-is-pinned.md)
+- **Existing check:** none. Codepoint assertions are strictly weaker and cannot detect same-codepoint behavioral changes.
+- **Impact:** Dependency drift can change bytes or error behavior without a crate-source diff or version signal, and it makes revision-to-revision wire comparisons ambiguous.
+- **Open questions:** Whether the external opener pins its closure and where conformance vectors record build identity. `(needs human input)`
+
+### version-bump-accompanies-wire-change
+
+- **Type:** safety
+- **Status:** active
+- **Exercised:** not yet; no post-introduction commit changed library wire behavior
+- **Guarantee:** Every change to emitted bytes, accepted bytes, error classification, or wire-code strings includes a crate-version bump; prose-only and test-only changes do not.
+- **Check:** `always(byte_or_behavior_diff == version_diff)` over each crate-changing commit, using fixed sealed/open vectors or a recorded deterministic custom RNG backend plus a public-behavior manifest. The vector producer's build identity is part of the oracle. `always` fits every qualifying revision.
+- **Fault/timing angle:** Source or dependency change that keeps self-roundtrip tests green while breaking the external opener.
+- **Required faults and enabling state:** At least one qualifying historical or proposed change; otherwise the rule passes vacuously.
+- **Confidence:** high that the rule is documented, low that it is enforced; [evidence](evidence/version-bump-accompanies-wire-change.md)
+- **Existing check:** none.
+- **Impact:** The docs call the version the only notification channel for path consumers.
+- **Open questions:** Ownership and location of the cross-language wire corpus. `(needs human input)`
+
+## Limitation, delegated-obligation, and unresolved-contract register
+
+These findings are not active safety properties. A future sender-authentication or replay-protection mechanism would invalidate the current behavior for good reasons, so checks that require the limitation to persist would be inverted security oracles.
+
+| Finding | Evidence | Required human decision |
+|---|---|---|
+| The crate neither adds nor enforces replay identifiers, counters, timestamps, or expiry. Encrypted plaintext may carry such metadata, but this crate does not inspect it. | [replayed-envelope-opens-identically](evidence/replayed-envelope-opens-identically.md) | Decide whether payload or device semantics provide replay protection and whether replay belongs in the threat model. |
+| HPKE base mode authenticates envelope bytes but not sender identity; any holder of the public key can seal. | [base-mode-does-not-authenticate-sender](evidence/base-mode-does-not-authenticate-sender.md) | Identify the external sender-authentication layer or decide whether the protocol needs one. |
+| `BadRecipientKey` is documented as semantic X25519 validation, while the resolved dependency performs length-only deserialization and reports a degenerate public value through `Hpke`. | [key-error-classification-matches-key-shape](evidence/key-error-classification-matches-key-shape.md) | Decide whether the docs should describe length-only behavior or the API should add stricter validation. |
+| The label parser uses substring and first-match selection, and ignores text after a second separator; duplicate, prefixed, suffixed, and extra-separator semantics are unspecified. Bare valid hex is separately documented and supported. | [labelled-input-selects-only-push-key](evidence/labelled-input-selects-only-push-key.md) | Define ambiguous labelled-input behavior before adding an oracle for those cases. |
+| `kp` prints `PK ` and `SK ` prefixes, but `handseal` rejects either whole line as non-hex or wrong length; its 66-character diagnostic mentions only `SK `. | [labelled-input-selects-only-push-key](evidence/labelled-input-selects-only-push-key.md) | Decide whether operator output should be directly pasteable or explicitly require stripping the prefix, and make the diagnostic symmetric. |
+| `seal` can wait inside the OS entropy path, which may retry or fall back, and no completion bound is documented. | [entropy-failure-does-not-unwind](evidence/entropy-failure-does-not-unwind.md) | Decide whether the caller needs a deadline or a separately supervised sealing boundary. |
+
+## Fault-to-property map
+
+| Fault or enabling state | Properties that become non-vacuous | Available in this repository? |
+|---|---|---|
+| Lengths 0, 2048, and 2049 | `matching-key-roundtrip-preserves-plaintext`, `plaintext-cap-is-inclusive-and-nontruncating`, `envelope-layout-and-overhead-stay-fixed` | yes |
+| Suite, KEM-size, AAD, `info`, or version edit | `pinned-ciphersuite-codepoints`, `envelope-layout-and-overhead-stay-fixed`, `version-one-is-only-emitted-and-accepted-version`, `version-byte-is-exact-aad`, `hpke-info-remains-empty` | yes at build/test time |
+| External opener or authoritative two-direction vector corpus | `cross-implementation-wire-vectors-conform` | no; requires human-supplied external evidence |
+| Proper-prefix truncation or bit mutation | `tampered-or-truncated-envelope-never-opens` | yes |
+| Different valid recipient key | `wrong-recipient-never-opens` | yes |
+| Two simultaneous input defects | `open-error-precedence-is-stable` | yes |
+| Key bytes accepted/rejected by the resolved deserializer under successful preceding gates | `wire-error-vocabulary-is-stable`, `bad-recipient-key-paths-are-reachable`, `bad-recipient-key-follows-resolved-deserializer` | yes |
+| Repeated seals or degraded RNG | `each-seal-uses-fresh-ephemeral` | repetition yes; RNG degradation no |
+| Bounded arbitrary malformed bytes | `open-is-total-over-bounded-input` | yes once the external bound is named |
+| OS entropy failure | `entropy-failure-does-not-unwind` | yes through resolved `getrandom` `unsupported` or custom backend configuration |
+| Oversized envelope at production transport boundary | `transport-bounds-open-envelope-size` | no production transport caller present; the `handopen` example is uncapped |
+| Cross-protocol key reuse | `recipient-key-is-dedicated-to-push-sealing` | no; requires external inventory |
+| Exact-label token-only paste | `labelled-input-selects-only-push-key` | yes, but example helper is private |
+| Degenerate or low-order public value | `degenerate-public-key-hpke-error-is-reachable` | yes |
+| KEM serialized-size or deserializer-semantics drift | `encapped-key-parse-failure-is-unreachable`, `envelope-layout-and-overhead-stay-fixed` | build-time only |
+| Low-order attacker-controlled `enc` | `low-order-encapsulation-aead-path-is-reachable` | yes with a fixed dependency-approved vector |
+| New in-range crypto dependency release | `byte-determining-dependency-closure-is-pinned` | no tracked closure today |
+| Byte-affecting commit without version bump | `version-bump-accompanies-wire-change` | no qualifying historical commit yet |
+
+## Relationship map
+
+- **Wire agreement group:** `cross-implementation-wire-vectors-conform`, `pinned-ciphersuite-codepoints`, `envelope-layout-and-overhead-stay-fixed`, `version-one-is-only-emitted-and-accepted-version`, `version-byte-is-exact-aad`, `hpke-info-remains-empty`, `open-error-precedence-is-stable`, `wire-error-vocabulary-is-stable`, and `byte-determining-dependency-closure-is-pinned` share the out-of-repository opener boundary.
+- **Cryptographic acceptance group:** `matching-key-roundtrip-preserves-plaintext`, `tampered-or-truncated-envelope-never-opens`, `wrong-recipient-never-opens`, and `each-seal-uses-fresh-ephemeral` share the HPKE call sites.
+- **Entropy and build-identity group:** `each-seal-uses-fresh-ephemeral`, `entropy-failure-does-not-unwind`, and `byte-determining-dependency-closure-is-pinned` share the resolved entropy backend and build configuration.
+- **Input-classification group:** `plaintext-cap-is-inclusive-and-nontruncating`, `open-is-total-over-bounded-input`, `bad-recipient-key-paths-are-reachable`, `bad-recipient-key-follows-resolved-deserializer`, `degenerate-public-key-hpke-error-is-reachable`, `encapped-key-parse-failure-is-unreachable`, and `low-order-encapsulation-aead-path-is-reachable` share public API guards and dependency parsers.
+- **External-assumption group:** `transport-bounds-open-envelope-size`, `recipient-key-is-dedicated-to-push-sealing`, and `version-bump-accompanies-wire-change` require evidence outside this crate before system-level conclusions can be drawn.
+- **Operator-paste group:** `labelled-input-selects-only-push-key` and `wrong-recipient-never-opens` share the wrong-64-hex-value hazard documented in three commits. A wrong 64-hex value decodes to 32 bytes and does not exercise `BadRecipientKey`.
+- **Suspected dominance:** If exact cross-language vectors record dependency identity and cover suite, layout, version, AAD, `info`, error precedence, and wire strings, they dominate most individual wire-agreement checks for compatibility, but not `each-seal-uses-fresh-ephemeral`, key dedication, or size delegation.
+- **Suspected dominance:** `matching-key-roundtrip-preserves-plaintext` over the full accepted domain subsumes happy-path self-acceptance and empty-plaintext behavior, but it does not prove external compatibility or tamper rejection.
+
+## Portfolio evaluation synthesis
+
+Fresh-context evaluation ran after the first catalog draft.
+
+### Gaps
+
+1. The first draft had no `unreachable` record for the encapsulated-key parse branch and no reachability record for the real low-order decapsulation path. A bounded dependency-facing branch pass confirmed both. `encapped-key-parse-failure-is-unreachable` and `low-order-encapsulation-aead-path-is-reachable` were added.
+2. Dependency-resolution drift appeared in the system model but not the catalog. A bounded build-identity pass added `byte-determining-dependency-closure-is-pinned` and excluded floating compiler identity from the wire-byte claim.
+3. Local self-roundtrip did not directly test the documented external-opener boundary. `cross-implementation-wire-vectors-conform` now records the missing two-direction deterministic oracle and remains blocked on the unavailable opener/corpus.
+4. Dual-version rollout is a real future risk, but no such system exists to mine. It is not a catalog property. If planned, construct its invariant and rollout contract first with `/software-design:invariant-driven-domain-modeling` and schema/version-compatibility review.
+
+### Refinements
+
+- Fresh-ephemeral checking now asserts a fresh RNG request and sender context per call; observed no-repeat checks are explicitly statistical canaries.
+- The AAD property now checks the computed `[VERSION]` value under the explicit version-gate precondition.
+- Label-parser claims now cover exact-label base cases and documented bare-hex support; substring, duplicate-label, and extra-separator semantics remain open contract questions.
+- The cap property now checks guard ordering instead of claiming that no temporary bytes can exist.
+- The layout property now records the locally derivable maximum envelope size of 2097 bytes.
+- RNG failure is marked as a source-confirmed contradiction to the error-return claim and uses the resolved `getrandom` build-time failure seam; entropy blocking/retry is retained as a liveness limitation.
+- Empty `info` now names its dependency-level observation method and the external corpus as the durable oracle.
+- Build identity is keyed by target and purpose so default verification, deterministic-vector generation, and entropy-failure testing can intentionally use different backend configurations.
+
+### Biases and dispositions
+
+- The first draft treated replayability and absent sender authentication as safety properties. They are current security limitations; hardening would correctly invalidate them. They moved to the limitation register and are excluded from test handoff.
+- `transport-bounds-open-envelope-size` and `recipient-key-is-dedicated-to-push-sealing` remain active at system scope because local docs explicitly delegate correctness to those external obligations. They are not local crate-test claims and remain blocked on human evidence.
+- The portfolio has no `sometimes` record. This is deliberate for this small stateless library: finite boundary tables and mutation loops can record situation counts within their owning checks without adding standalone campaign properties. Required enabling states remain explicit. Revisit this exemption if a seeded, long-running, or distributed harness is introduced.
+
+### Harness fit and balance
+
+- Build constants and dependency identity belong at build or repository boundaries.
+- Pure byte-domain properties fit local API or dependency-level boundaries.
+- RNG failure uses the resolved `getrandom` backend-selection seam; a custom backend can also observe draw calls.
+- Transport bounds and key dedication belong in unavailable caller/provisioning systems.
+- Safety dominance is expected: the crate has no persistent state, scheduler, or recovery protocol. Four reachability-type records, including one `unreachable` semantic, cover rare dependency-facing branches.
+
+## Handoff list
+
+Every active record goes to `/testing:test-strategy` for test form, oracle, and boundary selection. Existing tests stay `unaudited` until `/testing:invariant-test-review` reviews them. The limitation register is excluded until a human turns a limitation into a required security contract.
+
+| Property | Additional route |
+|---|---|
+| `matching-key-roundtrip-preserves-plaintext` | `/testing:test-strategy`; local byte-domain boundary |
+| `pinned-ciphersuite-codepoints` | `/testing:test-strategy`; build-constant boundary |
+| `cross-implementation-wire-vectors-conform` | Human opener/corpus evidence request, then `/testing:test-strategy` for deterministic custom-backend vector production and two-direction conformance |
+| `envelope-layout-and-overhead-stay-fixed` | `/testing:test-strategy`; local byte-layout boundary |
+| `version-one-is-only-emitted-and-accepted-version` | `/testing:test-strategy`; build constant plus parser boundary |
+| `version-byte-is-exact-aad` | `/testing:test-strategy`; dependency-level differential oracle |
+| `hpke-info-remains-empty` | `/testing:test-strategy`; dependency-level differential oracle and external corpus |
+| `plaintext-cap-is-inclusive-and-nontruncating` | `/testing:test-strategy`; local boundary table |
+| `tampered-or-truncated-envelope-never-opens` | `/testing:test-strategy`; local mutation and prefix domain |
+| `wrong-recipient-never-opens` | `/testing:test-strategy`; local multi-key boundary |
+| `open-error-precedence-is-stable` | `/testing:test-strategy`; local multi-defect classification table and external corpus |
+| `wire-error-vocabulary-is-stable` | `/testing:test-strategy`; local enum table and external corpus |
+| `each-seal-uses-fresh-ephemeral` | `/testing:test-strategy`; RNG-call/context observation plus a statistical repeated-call canary |
+| `open-is-total-over-bounded-input` | `/testing:test-strategy`; arbitrary-byte parser boundary under the caller-owned size/resource contract |
+| `entropy-failure-does-not-unwind` | `/testing:test-strategy` for resolved `getrandom` backend configuration and panic/error oracle; not a deterministic-simulation problem in the current architecture |
+| `transport-bounds-open-envelope-size` | `/testing:test-strategy` at the eventual caller/transport boundary |
+| `recipient-key-is-dedicated-to-push-sealing` | Human evidence request, then `/testing:test-strategy` only if the provisioning boundary is observable |
+| `labelled-input-selects-only-push-key` | `/testing:test-strategy` for example/helper boundary and parser oracle |
+| `bad-recipient-key-paths-are-reachable`, `bad-recipient-key-follows-resolved-deserializer`, `degenerate-public-key-hpke-error-is-reachable` | `/testing:test-strategy`; route current docs/guard semantics to `/low-level-systems:defensive-assertions-and-invariant-guards` only if production validation is proposed |
+| `encapped-key-parse-failure-is-unreachable` | `/testing:test-strategy`; branch reachability plus build-size assertion |
+| `low-order-encapsulation-aead-path-is-reachable` | `/testing:test-strategy`; dependency-approved fixed semantic vector |
+| `byte-determining-dependency-closure-is-pinned` | `/testing:test-strategy`; repository/build identity boundary |
+| `version-bump-accompanies-wire-change` | `/testing:test-strategy` for repository-history and conformance-artifact gates |
+
+No property currently requires `/testing:deterministic-simulation-testing`: the crate has no scheduler, clock, network, persistence, or multi-node state. If later work adds replay state, key rotation state, or a multi-version rollout protocol, reassess that routing.
