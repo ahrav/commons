@@ -111,7 +111,11 @@ impl LeaseKey {
 
     /// The namespaced identity string the lock is derived from. Module and backend
     /// are included so the same `scope_key` under two modules maps to two locks.
-    fn identity(&self) -> String {
+    ///
+    /// Lock-file names ([`fnv1a_hex`] of this string) and postgres advisory-lock
+    /// keys both derive from it, so its format is a compatibility contract:
+    /// changing it orphans existing lease files and remaps advisory locks.
+    pub fn identity(&self) -> String {
         format!(
             "{}\u{1f}{}\u{1f}{}",
             self.module_id, self.backend, self.scope_key
@@ -336,7 +340,11 @@ fn bump_epoch(file: &mut File) -> std::io::Result<u64> {
 }
 
 /// FNV-1a 64-bit, hex: a dependency-free deterministic filename hash.
-fn fnv1a_hex(s: &str) -> String {
+///
+/// Derives lease lock-file names and (via `cortexkit-store-postgres`) advisory-
+/// lock keys, so the output for a given input is a compatibility contract across
+/// versions.
+pub fn fnv1a_hex(s: &str) -> String {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     for b in s.as_bytes() {
         h ^= *b as u64;
