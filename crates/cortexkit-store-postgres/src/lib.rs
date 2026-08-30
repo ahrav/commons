@@ -21,7 +21,7 @@
 //! file-lease semantics so a distributed writer's durable writes can carry a
 //! monotonic fence token.
 
-use cortexkit_lease::{LeaseError, LeaseKey};
+use cortexkit_lease::{fnv1a, LeaseError, LeaseKey};
 use cortexkit_store_types::{StorageBackend, StorageDescriptor};
 use postgres::{Client, NoTls};
 
@@ -63,8 +63,7 @@ impl std::error::Error for StoreError {}
 /// `pg_advisory_lock` takes a bigint; we hash the `(module_id, backend, namespace)`
 /// identity into one so distinct modules/namespaces map to distinct locks.
 fn advisory_key(key: &LeaseKey) -> i64 {
-    u64::from_str_radix(&cortexkit_lease::fnv1a_hex(&key.identity()), 16)
-        .expect("fnv1a_hex returns 16 hex chars") as i64
+    fnv1a(&key.identity()) as i64
 }
 
 fn lease_key(descriptor: &StorageDescriptor) -> LeaseKey {

@@ -253,8 +253,7 @@ impl LeaseStore for FileLeaseStore {
         // detect a stale writer.
         protect_file(&path).map_err(LeaseError::Io)?;
 
-        // Liveness gate: a live holder still owns the lock, so the try-lock fails
-        // with the OS "contended" error.
+        // A live holder owns the lock, so try_lock fails with WouldBlock.
         match file.try_lock() {
             Ok(()) => {}
             Err(TryLockError::WouldBlock) => {
@@ -339,18 +338,23 @@ fn bump_epoch(file: &mut File) -> std::io::Result<u64> {
     Ok(next)
 }
 
-/// FNV-1a 64-bit, hex: a dependency-free deterministic filename hash.
+/// FNV-1a 64-bit hash of a lease identity.
 ///
-/// Derives lease lock-file names and (via `cortexkit-store-postgres`) advisory-
-/// lock keys, so the output for a given input is a compatibility contract across
-/// versions.
-pub fn fnv1a_hex(s: &str) -> String {
+/// Lease lock-file names ([`fnv1a_hex`]) and `cortexkit-store-postgres`
+/// advisory-lock keys derive from it, so the output for a given input is a
+/// compatibility contract across versions.
+pub fn fnv1a(s: &str) -> u64 {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     for b in s.as_bytes() {
         h ^= *b as u64;
         h = h.wrapping_mul(0x0000_0100_0000_01b3);
     }
-    format!("{h:016x}")
+    h
+}
+
+/// `fnv1a_hex` provides the lock-file name form.
+pub fn fnv1a_hex(s: &str) -> String {
+    format!("{:016x}", fnv1a(s))
 }
 
 #[cfg(test)]

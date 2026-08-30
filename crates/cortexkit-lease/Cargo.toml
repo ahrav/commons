@@ -7,5 +7,3 @@ repository.workspace = true
 authors.workspace = true
 rust-version.workspace = true
 description = "Single-writer durable lease (OS advisory lock + monotonic epoch fence) for CortexKit modules."
-
-[dependencies]
