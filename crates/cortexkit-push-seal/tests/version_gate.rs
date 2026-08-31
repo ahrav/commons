@@ -170,29 +170,49 @@ fn changed_sections(base: &Value, head: &Value) -> String {
     sections.join(", ")
 }
 
-// The head version must exceed every version in `prior_manifests`, not the merge base
-// alone. Two branches that independently bump to the same version both satisfy a
-// merge-base-only check, so one version ends up carrying two wire surfaces.
+#[derive(Clone, Copy)]
+struct Revision<'a> {
+    fixture: Option<&'a str>,
+    manifest: &'a str,
+}
+
+fn at<'a>(fixture: Option<&'a str>, manifest: &'a str) -> Revision<'a> {
+    Revision { fixture, manifest }
+}
+
+// One rule covers every revision the head could land beside: a prior constrains the
+// version only when its represented wire surface differs from the head's. A prior with
+// no fixture predates the surface, and a prior sharing the head's surface describes the
+// same bytes, so neither is a version the head must clear. The merge base answers
+// "did this branch change anything" and the base tip answers "is this version already
+// taken", and both follow from that one rule.
 // commentlint: allow(JUDGE)
 fn check_version_gate(
-    base_fixture: Option<&str>,
+    priors: &[Revision],
     head_fixture: &str,
-    prior_manifests: &[&str],
     head_manifest: &str,
 ) -> Result<(), String> {
-    let Some(base_fixture) = base_fixture else {
-        return Ok(());
-    };
-    let base_surface = represented_wire_surface(base_fixture)?;
     let head_surface = represented_wire_surface(head_fixture)?;
-    if base_surface == head_surface {
+    let mut constraints = Vec::new();
+    for prior in priors {
+        let Some(fixture) = prior.fixture else {
+            continue;
+        };
+        let prior_surface = represented_wire_surface(fixture)?;
+        if prior_surface == head_surface {
+            continue;
+        }
+        constraints.push((
+            package_version(prior.manifest)?,
+            changed_sections(&prior_surface, &head_surface),
+        ));
+    }
+    if constraints.is_empty() {
         return Ok(());
     }
-    let changed = changed_sections(&base_surface, &head_surface);
     let head_version = package_version(head_manifest)?;
     let head = parse_version(&head_version)?;
-    for manifest in prior_manifests {
-        let prior_version = package_version(manifest)?;
+    for (prior_version, changed) in constraints {
         let prior = parse_version(&prior_version)?;
         if head == prior {
             return Err(format!(
@@ -234,49 +254,70 @@ fn synthetic_version_gate_cases() {
     let reformatted = format!("\n{}\n", unchanged.replace(",\"", ",\n\""));
 
     assert_eq!(
-        check_version_gate(Some(&unchanged), &unchanged, &[manifest_v1], manifest_v1),
+        check_version_gate(
+            &[at(Some(&unchanged), manifest_v1)],
+            &unchanged,
+            manifest_v1
+        ),
         Ok(())
     );
-    assert!(
-        check_version_gate(Some(&unchanged), &wire_change, &[manifest_v1], manifest_v1)
-            .unwrap_err()
-            .contains("without a package version bump")
-    );
+    assert!(check_version_gate(
+        &[at(Some(&unchanged), manifest_v1)],
+        &wire_change,
+        manifest_v1
+    )
+    .unwrap_err()
+    .contains("without a package version bump"));
     assert_eq!(
-        check_version_gate(Some(&unchanged), &wire_change, &[manifest_v1], manifest_v2),
+        check_version_gate(
+            &[at(Some(&unchanged), manifest_v1)],
+            &wire_change,
+            manifest_v2
+        ),
         Ok(())
     );
-    assert!(
-        check_version_gate(Some(&unchanged), &wire_change, &[manifest_v1], manifest_v0)
-            .unwrap_err()
-            .contains("did not increase")
-    );
+    assert!(check_version_gate(
+        &[at(Some(&unchanged), manifest_v1)],
+        &wire_change,
+        manifest_v0
+    )
+    .unwrap_err()
+    .contains("did not increase"));
     assert_eq!(
-        check_version_gate(None, &wire_change, &[manifest_v1], manifest_v1),
-        Ok(())
-    );
-    assert_eq!(
-        check_version_gate(Some(&unchanged), &prose_only, &[manifest_v1], manifest_v1),
-        Ok(())
-    );
-    assert_eq!(
-        check_version_gate(Some(&unchanged), &reformatted, &[manifest_v1], manifest_v1),
+        check_version_gate(&[at(None, manifest_v1)], &wire_change, manifest_v1),
         Ok(())
     );
     assert_eq!(
         check_version_gate(
-            Some(&unchanged),
+            &[at(Some(&unchanged), manifest_v1)],
+            &prose_only,
+            manifest_v1
+        ),
+        Ok(())
+    );
+    assert_eq!(
+        check_version_gate(
+            &[at(Some(&unchanged), manifest_v1)],
+            &reformatted,
+            manifest_v1
+        ),
+        Ok(())
+    );
+    assert_eq!(
+        check_version_gate(
+            &[at(Some(&unchanged), manifest_v1)],
             &unchanged,
-            &[manifest_v1],
             "[package]\nname = \"cortexkit-push-seal\"\nversion = \"0.1.0\"\n# prose\n"
         ),
         Ok(())
     );
-    assert!(
-        check_version_gate(Some("not json"), &unchanged, &[manifest_v1], manifest_v1)
-            .unwrap_err()
-            .contains("unparseable fixture")
-    );
+    assert!(check_version_gate(
+        &[at(Some("not json"), manifest_v1)],
+        &unchanged,
+        manifest_v1
+    )
+    .unwrap_err()
+    .contains("unparseable fixture"));
 }
 
 #[test]
@@ -310,14 +351,13 @@ fn a_commented_version_still_gates_a_wire_change() {
     let commented = "[package]\nversion = \"0.1.0\" # pinned until the wire settles\n";
 
     assert!(
-        check_version_gate(Some(&unchanged), &wire_change, &[commented], commented)
+        check_version_gate(&[at(Some(&unchanged), commented)], &wire_change, commented)
             .unwrap_err()
             .contains("without a package version bump")
     );
     assert!(check_version_gate(
-        Some(&unchanged),
+        &[at(Some(&unchanged), commented)],
         &wire_change,
-        &[commented],
         "[package]\nversion = \"0.0.9\" # rolled back\n"
     )
     .unwrap_err()
@@ -333,7 +373,7 @@ fn literal_string_quoting_reads_the_same_version() {
 
     assert_eq!(package_version(literal), package_version(double));
     assert!(
-        check_version_gate(Some(&unchanged), &wire_change, &[double], literal)
+        check_version_gate(&[at(Some(&unchanged), double)], &wire_change, literal)
             .unwrap_err()
             .contains("without a package version bump")
     );
@@ -346,12 +386,12 @@ fn an_unreadable_manifest_fails_the_gate() {
     let base = "[package]\nversion = \"0.1.0\"\n";
 
     assert!(
-        check_version_gate(Some(&unchanged), &wire_change, &[base], "[package")
+        check_version_gate(&[at(Some(&unchanged), base)], &wire_change, "[package")
             .unwrap_err()
             .contains("unparseable manifest")
     );
     assert!(
-        check_version_gate(Some(&unchanged), &wire_change, &[base], "[workspace]\n")
+        check_version_gate(&[at(Some(&unchanged), base)], &wire_change, "[workspace]\n")
             .unwrap_err()
             .contains("no [package] version")
     );
@@ -364,9 +404,8 @@ fn a_workspace_inherited_version_names_itself_in_the_failure() {
     let base = "[package]\nversion = \"0.1.0\"\n";
 
     let error = check_version_gate(
-        Some(&unchanged),
+        &[at(Some(&unchanged), base)],
         &wire_change,
-        &[base],
         "[package]\nversion.workspace = true\n",
     )
     .unwrap_err();
@@ -374,9 +413,8 @@ fn a_workspace_inherited_version_names_itself_in_the_failure() {
     assert!(!error.contains("has no [package] version"), "{error}");
 
     let error = check_version_gate(
-        Some(&unchanged),
+        &[at(Some(&unchanged), base)],
         &wire_change,
-        &[base],
         "[package]\nversion = 1\n",
     )
     .unwrap_err();
@@ -393,18 +431,16 @@ fn the_failure_names_the_section_that_changed() {
     expected_only["expected"]["envelope_hex"] = json!("02");
 
     let error = check_version_gate(
-        Some(&unchanged),
+        &[at(Some(&unchanged), manifest)],
         &inputs_only.to_string(),
-        &[manifest],
         manifest,
     )
     .unwrap_err();
     assert!(error.contains("changed: inputs"), "{error}");
 
     let error = check_version_gate(
-        Some(&unchanged),
+        &[at(Some(&unchanged), manifest)],
         &expected_only.to_string(),
-        &[manifest],
         manifest,
     )
     .unwrap_err();
@@ -423,7 +459,7 @@ fn an_unparseable_version_fails_the_gate() {
         "[package]\nversion = \"zero.two.zero\"\n",
     ] {
         assert!(
-            check_version_gate(Some(&unchanged), &wire_change, &[base], head)
+            check_version_gate(&[at(Some(&unchanged), base)], &wire_change, head)
                 .unwrap_err()
                 .contains("unparseable package version"),
             "an unparseable version passed the gate: {head:?}"
@@ -446,9 +482,8 @@ fn prerelease_versions_compare_by_semver_precedence() {
     ] {
         assert_eq!(
             check_version_gate(
-                Some(&unchanged),
+                &[at(Some(&unchanged), &manifest(base))],
                 &wire_change,
-                &[&manifest(base)],
                 &manifest(head)
             ),
             Ok(()),
@@ -464,9 +499,8 @@ fn prerelease_versions_compare_by_semver_precedence() {
     ] {
         assert!(
             check_version_gate(
-                Some(&unchanged),
+                &[at(Some(&unchanged), &manifest(base))],
                 &wire_change,
-                &[&manifest(base)],
                 &manifest(head)
             )
             .unwrap_err()
@@ -476,9 +510,8 @@ fn prerelease_versions_compare_by_semver_precedence() {
     }
 
     assert!(check_version_gate(
-        Some(&unchanged),
+        &[at(Some(&unchanged), &manifest("0.2.0+build.1"))],
         &wire_change,
-        &[&manifest("0.2.0+build.1")],
         &manifest("0.2.0+build.2")
     )
     .unwrap_err()
@@ -495,18 +528,22 @@ fn numeric_prerelease_identifiers_order_by_value_at_any_width() {
 
     assert_eq!(
         check_version_gate(
-            Some(&unchanged),
+            &[at(
+                Some(&unchanged),
+                &manifest(&format!("0.2.0-alpha.{narrower}"))
+            )],
             &wire_change,
-            &[&manifest(&format!("0.2.0-alpha.{narrower}"))],
             &manifest(&format!("0.2.0-alpha.{wide}"))
         ),
         Ok(())
     );
     assert!(
         check_version_gate(
-            Some(&unchanged),
+            &[at(
+                Some(&unchanged),
+                &manifest(&format!("0.2.0-alpha.{wide}"))
+            )],
             &wire_change,
-            &[&manifest(&format!("0.2.0-alpha.{wide}"))],
             &manifest(&format!("0.2.0-alpha.{narrower}"))
         )
         .unwrap_err()
@@ -514,26 +551,29 @@ fn numeric_prerelease_identifiers_order_by_value_at_any_width() {
         "a decrease past u64 was accepted"
     );
     assert!(check_version_gate(
-        Some(&unchanged),
+        &[at(
+            Some(&unchanged),
+            &manifest(&format!("0.2.0-alpha.{wide}"))
+        )],
         &wire_change,
-        &[&manifest(&format!("0.2.0-alpha.{wide}"))],
         &manifest(&format!("0.2.0-alpha.{wide}"))
     )
     .unwrap_err()
     .contains("without a package version bump"));
     assert_eq!(
         check_version_gate(
-            Some(&unchanged),
+            &[at(
+                Some(&unchanged),
+                &manifest(&format!("0.2.0-alpha.{wide}"))
+            )],
             &wire_change,
-            &[&manifest(&format!("0.2.0-alpha.{wide}"))],
             &manifest("0.2.0-alpha.abc")
         ),
         Ok(())
     );
     assert!(check_version_gate(
-        Some(&unchanged),
+        &[at(Some(&unchanged), &manifest("0.2.0-alpha.abc"))],
         &wire_change,
-        &[&manifest("0.2.0-alpha.abc")],
         &manifest(&format!("0.2.0-alpha.{wide}"))
     )
     .unwrap_err()
@@ -552,7 +592,7 @@ fn a_malformed_prerelease_identifier_fails_the_gate() {
         "[package]\nversion = \"0.2.0-\"\n",
     ] {
         assert!(
-            check_version_gate(Some(&unchanged), &wire_change, &[base], head)
+            check_version_gate(&[at(Some(&unchanged), base)], &wire_change, head)
                 .unwrap_err()
                 .contains("unparseable package version"),
             "a malformed prerelease passed the gate: {head:?}"
@@ -564,31 +604,78 @@ fn a_malformed_prerelease_identifier_fails_the_gate() {
 fn a_version_already_taken_on_the_base_tip_fails_the_gate() {
     let unchanged = fixture_with("0.1.0", "01", "synthetic");
     let wire_change = fixture_with("0.1.0", "02", "synthetic");
+    let other_change = fixture_with("0.1.0", "03", "synthetic");
     let merge_base = "[package]\nversion = \"0.1.0\"\n";
     let base_tip = "[package]\nversion = \"0.2.0\"\n";
     let head = "[package]\nversion = \"0.2.0\"\n";
 
     assert_eq!(
-        check_version_gate(Some(&unchanged), &wire_change, &[merge_base], head),
+        check_version_gate(&[at(Some(&unchanged), merge_base)], &wire_change, head),
         Ok(())
     );
     assert!(check_version_gate(
-        Some(&unchanged),
+        &[
+            at(Some(&unchanged), merge_base),
+            at(Some(&other_change), base_tip)
+        ],
         &wire_change,
-        &[merge_base, base_tip],
         head
     )
     .unwrap_err()
     .contains("without a package version bump"));
     assert_eq!(
         check_version_gate(
-            Some(&unchanged),
+            &[
+                at(Some(&unchanged), merge_base),
+                at(Some(&other_change), base_tip)
+            ],
             &wire_change,
-            &[merge_base, base_tip],
             "[package]\nversion = \"0.3.0\"\n"
         ),
         Ok(())
     );
+}
+
+#[test]
+fn a_base_tip_that_already_carries_this_surface_demands_no_further_bump() {
+    let unchanged = fixture_with("0.1.0", "01", "synthetic");
+    let wire_change = fixture_with("0.1.0", "02", "synthetic");
+    let merge_base = "[package]\nversion = \"0.1.0\"\n";
+    let bumped = "[package]\nversion = \"0.2.0\"\n";
+
+    // The base tip already carries this surface at this version, so merging introduces
+    // no change relative to it.
+    assert_eq!(
+        check_version_gate(
+            &[
+                at(Some(&unchanged), merge_base),
+                at(Some(&wire_change), bumped)
+            ],
+            &wire_change,
+            bumped
+        ),
+        Ok(())
+    );
+    // A prior that predates the fixture constrains nothing either.
+    assert_eq!(
+        check_version_gate(
+            &[at(None, merge_base), at(Some(&wire_change), bumped)],
+            &wire_change,
+            bumped
+        ),
+        Ok(())
+    );
+    // Same surface on the base tip, but the head walked the version backwards.
+    assert!(check_version_gate(
+        &[
+            at(Some(&unchanged), merge_base),
+            at(Some(&wire_change), bumped)
+        ],
+        &wire_change,
+        "[package]\nversion = \"0.1.0\"\n"
+    )
+    .unwrap_err()
+    .contains("without a package version bump"));
 }
 
 fn git(args: &[&str]) -> Result<String, String> {
@@ -623,42 +710,39 @@ fn actual_git_diff_requires_version_bump() {
     let base = std::env::var("PUSH_SEAL_BASE_SHA").expect("PUSH_SEAL_BASE_SHA must be set");
     let head = std::env::var("PUSH_SEAL_HEAD_SHA").expect("PUSH_SEAL_HEAD_SHA must be set");
 
-    // The merge base fixes what the head is compared against, so unrelated fixture
-    // drift on the base branch tip does not register as this branch's change.
+    // Two revisions the head could land beside: the merge base answers whether this
+    // branch changed the surface at all, and the base tip answers whether the version is
+    // already taken there. A revision without the fixture predates it and constrains
+    // nothing, so its manifest is never read.
+    // commentlint: allow(JUDGE)
     let merge_base = git(&["merge-base", &base, &head])
         .unwrap_or_else(|error| panic!("no merge base between {base} and {head}: {error}"));
     let merge_base = merge_base.trim();
-
-    // A merge base lacking the fixture may lack the manifest too, so reading the
-    // manifest first would panic on the bootstrap case this gate accepts.
-    let Some(base_fixture) = revision_file(merge_base, FIXTURE_PATH).unwrap() else {
-        return;
-    };
     let head_fixture = revision_file(&head, FIXTURE_PATH)
         .unwrap()
         .unwrap_or_else(|| panic!("{FIXTURE_PATH} missing at {head}"));
-    let merge_base_manifest = revision_file(merge_base, MANIFEST_PATH)
-        .unwrap()
-        .unwrap_or_else(|| panic!("{MANIFEST_PATH} missing at {merge_base}"));
     let head_manifest = revision_file(&head, MANIFEST_PATH)
         .unwrap()
         .unwrap_or_else(|| panic!("{MANIFEST_PATH} missing at {head}"));
-    // The base tip is where a merge lands. A version already published there is taken,
-    // whether or not this branch descends from the commit that took it.
-    // commentlint: allow(JUDGE)
-    let mut prior_manifests = vec![merge_base_manifest];
-    if base != merge_base {
-        if let Some(base_tip_manifest) = revision_file(&base, MANIFEST_PATH).unwrap() {
-            prior_manifests.push(base_tip_manifest);
-        }
-    }
-    let prior_manifests: Vec<&str> = prior_manifests.iter().map(String::as_str).collect();
 
-    check_version_gate(
-        Some(&base_fixture),
-        &head_fixture,
-        &prior_manifests,
-        &head_manifest,
-    )
-    .unwrap();
+    let mut revisions = vec![merge_base.to_owned()];
+    if base != merge_base {
+        revisions.push(base.clone());
+    }
+    let priors: Vec<(Option<String>, String)> = revisions
+        .iter()
+        .filter_map(|revision| {
+            let fixture = revision_file(revision, FIXTURE_PATH).unwrap()?;
+            let manifest = revision_file(revision, MANIFEST_PATH)
+                .unwrap()
+                .unwrap_or_else(|| panic!("{MANIFEST_PATH} missing at {revision}"));
+            Some((Some(fixture), manifest))
+        })
+        .collect();
+    let priors: Vec<Revision> = priors
+        .iter()
+        .map(|(fixture, manifest)| at(fixture.as_deref(), manifest))
+        .collect();
+
+    check_version_gate(&priors, &head_fixture, &head_manifest).unwrap();
 }
