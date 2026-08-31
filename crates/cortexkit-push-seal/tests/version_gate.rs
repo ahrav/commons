@@ -40,13 +40,36 @@ fn package_version(manifest: &str) -> &str {
     panic!("package version missing");
 }
 
-// Numeric identifiers rank below alphanumeric ones in SemVer precedence, which the
-// derived variant order reproduces.
+// A numeric identifier is held as digits rather than an integer: SemVer bounds neither
+// its width nor its value, and any fixed-width fallback to lexical comparison inverts
+// the order of two identifiers whose digit counts differ.
 // commentlint: allow(JUDGE)
-#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, PartialEq, Eq)]
 enum Identifier {
-    Numeric(u64),
+    Numeric(String),
     Alphanumeric(String),
+}
+
+impl Ord for Identifier {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        use std::cmp::Ordering;
+        match (self, other) {
+            // Digits carry no leading zero, so more digits means a larger value and
+            // equal digit counts order lexically.
+            (Identifier::Numeric(left), Identifier::Numeric(right)) => {
+                left.len().cmp(&right.len()).then_with(|| left.cmp(right))
+            }
+            (Identifier::Numeric(_), Identifier::Alphanumeric(_)) => Ordering::Less,
+            (Identifier::Alphanumeric(_), Identifier::Numeric(_)) => Ordering::Greater,
+            (Identifier::Alphanumeric(left), Identifier::Alphanumeric(right)) => left.cmp(right),
+        }
+    }
+}
+
+impl PartialOrd for Identifier {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -100,15 +123,35 @@ fn parse_version(version: &str) -> Result<Version, String> {
             "unparseable package version {version:?}: more than three numeric fields"
         ));
     }
-    let prerelease = prerelease
-        .split('.')
-        .filter(|identifier| !identifier.is_empty())
-        .map(|identifier| match identifier.parse() {
-            Ok(number) => Identifier::Numeric(number),
-            Err(_) => Identifier::Alphanumeric(identifier.to_owned()),
-        })
-        .collect();
+    let prerelease = match without_build.split_once('-') {
+        None => Vec::new(),
+        Some(_) => prerelease
+            .split('.')
+            .map(|identifier| identifier_of(version, identifier))
+            .collect::<Result<Vec<_>, _>>()?,
+    };
     Ok(Version { triple, prerelease })
+}
+
+// An empty or leading-zero identifier is not a version Cargo accepts, so it is reported
+// rather than ordered under a guess.
+// commentlint: allow(JUDGE)
+fn identifier_of(version: &str, identifier: &str) -> Result<Identifier, String> {
+    if identifier.is_empty() {
+        return Err(format!(
+            "unparseable package version {version:?}: empty prerelease identifier"
+        ));
+    }
+    if !identifier.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Ok(Identifier::Alphanumeric(identifier.to_owned()));
+    }
+    if identifier.len() > 1 && identifier.starts_with('0') {
+        return Err(format!(
+            "unparseable package version {version:?}: leading zero in numeric prerelease \
+             identifier {identifier:?}"
+        ));
+    }
+    Ok(Identifier::Numeric(identifier.to_owned()))
 }
 
 // `provenance` and `build_identity` are recording metadata, not wire data or classification; changing them does not require a version bump.
@@ -355,6 +398,81 @@ fn prerelease_versions_compare_by_semver_precedence() {
     )
     .unwrap_err()
     .contains("without a package version bump"));
+}
+
+#[test]
+fn numeric_prerelease_identifiers_order_by_value_at_any_width() {
+    let unchanged = fixture_with("0.1.0", "01", "synthetic");
+    let wire_change = fixture_with("0.1.0", "02", "synthetic");
+    let manifest = |version: &str| format!("[package]\nversion = \"{version}\"\n");
+    let wide = "100000000000000000000";
+    let narrower = "99999999999999999999";
+
+    assert_eq!(
+        check_version_gate(
+            Some(&unchanged),
+            &wire_change,
+            &[&manifest(&format!("0.2.0-alpha.{narrower}"))],
+            &manifest(&format!("0.2.0-alpha.{wide}"))
+        ),
+        Ok(())
+    );
+    assert!(
+        check_version_gate(
+            Some(&unchanged),
+            &wire_change,
+            &[&manifest(&format!("0.2.0-alpha.{wide}"))],
+            &manifest(&format!("0.2.0-alpha.{narrower}"))
+        )
+        .unwrap_err()
+        .contains("did not increase"),
+        "a decrease past u64 was accepted"
+    );
+    assert!(check_version_gate(
+        Some(&unchanged),
+        &wire_change,
+        &[&manifest(&format!("0.2.0-alpha.{wide}"))],
+        &manifest(&format!("0.2.0-alpha.{wide}"))
+    )
+    .unwrap_err()
+    .contains("without a package version bump"));
+    assert_eq!(
+        check_version_gate(
+            Some(&unchanged),
+            &wire_change,
+            &[&manifest(&format!("0.2.0-alpha.{wide}"))],
+            &manifest("0.2.0-alpha.abc")
+        ),
+        Ok(())
+    );
+    assert!(check_version_gate(
+        Some(&unchanged),
+        &wire_change,
+        &[&manifest("0.2.0-alpha.abc")],
+        &manifest(&format!("0.2.0-alpha.{wide}"))
+    )
+    .unwrap_err()
+    .contains("did not increase"));
+}
+
+#[test]
+fn a_malformed_prerelease_identifier_fails_the_gate() {
+    let unchanged = fixture_with("0.1.0", "01", "synthetic");
+    let wire_change = fixture_with("0.1.0", "02", "synthetic");
+    let base = "[package]\nversion = \"0.1.0\"\n";
+
+    for head in [
+        "[package]\nversion = \"0.2.0-alpha.007\"\n",
+        "[package]\nversion = \"0.2.0-alpha..1\"\n",
+        "[package]\nversion = \"0.2.0-\"\n",
+    ] {
+        assert!(
+            check_version_gate(Some(&unchanged), &wire_change, &[base], head)
+                .unwrap_err()
+                .contains("unparseable package version"),
+            "a malformed prerelease passed the gate: {head:?}"
+        );
+    }
 }
 
 #[test]
