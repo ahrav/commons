@@ -41,7 +41,7 @@ These disagreements stay visible because code may be the defect.
 
 ## Existing-check inventory
 
-U1 local boundary and classification checks are audited below. Other checks remain **unaudited**. Production-guard placement and failure behavior belong to `/low-level-systems:defensive-assertions-and-invariant-guards`.
+Audited checks are identified below. Other checks remain **unaudited**. Production-guard placement and failure behavior belong to `/low-level-systems:defensive-assertions-and-invariant-guards`.
 
 ### Production and example guards
 
@@ -65,7 +65,9 @@ No production `assert!`, `debug_assert!`, or equivalent invariant assertion was 
 
 | Test and location | Existing semantics | Status |
 |---|---|---|
-| [`the_pinned_suite_is_the_one_the_opener_agreed_to`](../../../crates/cortexkit-push-seal/src/lib.rs) | Three literal codepoint equalities; messages name KEM, KDF, and AEAD. | unaudited |
+| [`the_pinned_suite_has_the_documented_codepoints`](../../../crates/cortexkit-push-seal/src/lib.rs) | Three literal codepoint equalities; messages name KEM, KDF, and AEAD. | audited for local build-wide codepoints; external opener equality remains unaudited |
+| [`wire_v1_fixture_matches_local_bytes_and_classifications`](../../../crates/cortexkit-push-seal/src/lib.rs) | Regenerates one exact deterministic envelope through the private RNG seam, opens it, and checks all represented local errors and wire codes. | audited as a local fixture oracle; not independent opener evidence |
+| `synthetic_version_gate_cases` and `actual_git_diff_requires_version_bump`, `tests/version_gate.rs` | Exercise fixture/version policy in memory and compare explicitly named Git revisions only when both event SHAs are present. | audited for represented fixture changes; unrepresented behavior remains unaudited |
 | [`a_sealed_payload_opens_to_the_same_plaintext`](../../../crates/cortexkit-push-seal/src/lib.rs) | Exact byte round trips at lengths 0, 2047, and 2048 with non-UTF-8 fixtures. | audited for these local boundaries |
 | [`the_envelope_has_version_one_and_fixed_overhead`](../../../crates/cortexkit-push-seal/src/lib.rs) | Pins literal version 1, 32-byte encapsulation, 49-byte overhead, and 2097-byte maximum at lengths 0, 1, and 2048. | audited for the leading version and local size literals |
 | [`each_seal_uses_a_fresh_ephemeral`](../../../crates/cortexkit-push-seal/src/lib.rs) | Records one 32-byte draw per seal; distinct draws produce distinct `enc`, and repeated draws repeat it. | audited for local draw/context behavior |
@@ -100,13 +102,13 @@ No production `assert!`, `debug_assert!`, or equivalent invariant assertion was 
 
 - **Type:** safety
 - **Status:** active
-- **Exercised:** yes; all three codepoints are asserted in `the_pinned_suite_is_the_one_the_opener_agreed_to`
+- **Exercised:** yes; all three codepoints are asserted as literals and repeated in the schema-versioned local wire fixture
 - **Guarantee:** The suite remains KEM `0x0020`, KDF `0x0001`, and AEAD `0x0003`.
 - **Check:** `always(KEM_ID == 0x0020 && KDF_ID == 0x0001 && AEAD_ID == 0x0003)`. `always` fits because these are build-wide wire constants.
 - **Fault/timing angle:** Dependency upgrade or type substitution behind a stable name.
 - **Required faults and enabling state:** None; evaluate on every build.
 - **Confidence:** high; [evidence](evidence/pinned-ciphersuite-codepoints.md)
-- **Existing check:** [`the_pinned_suite_is_the_one_the_opener_agreed_to`](../../../crates/cortexkit-push-seal/src/lib.rs); status unaudited.
+- **Existing check:** [`the_pinned_suite_has_the_documented_codepoints`](../../../crates/cortexkit-push-seal/src/lib.rs) and [`wire_v1_fixture_matches_local_bytes_and_classifications`](../../../crates/cortexkit-push-seal/src/lib.rs); audited for local build-wide codepoints. External opener equality remains unaudited.
 - **Impact:** Mismatch causes cross-repository authentication failure with no local sealer error.
 - **Open questions:** Whether the unavailable opener asserts the same literals.
 
@@ -422,13 +424,13 @@ No production `assert!`, `debug_assert!`, or equivalent invariant assertion was 
 
 - **Type:** safety
 - **Status:** active
-- **Exercised:** not yet; no post-introduction commit changed library wire behavior
-- **Guarantee:** Every change to emitted bytes, accepted bytes, error classification, or wire-code strings includes a crate-version bump; prose-only and test-only changes do not.
-- **Check:** `always(byte_or_behavior_diff == version_diff)` over each crate-changing commit, using fixed sealed/open vectors or a recorded deterministic custom RNG backend plus a public-behavior manifest. The vector producer's build identity is part of the oracle. `always` fits every qualifying revision.
+- **Exercised:** yes for synthetic represented-fixture changes; no committed historical wire change exists
+- **Guarantee:** Every change to emitted bytes, accepted bytes, error classification, or wire-code strings includes a crate-version bump. Provenance prose, build-identity metadata, and fixture formatting do not. Replacing the vector material itself -- keys, entropy, or plaintext -- does require a bump: once the inputs move, the recorded envelope no longer witnesses the same computation, so the comparison cannot separate a deliberate refresh from drift the refresh would hide, and the gate holds the conservative side.
+- **Check:** One rule over the revisions the head could land beside, the merge base and the base-branch tip: a revision constrains the version only when its represented wire surface (`schema_version`, `ciphersuite`, `inputs`, `expected`) differs from the head's, and the head package version must then exceed that revision's by SemVer precedence, including prerelease identifiers of any width. A revision without the fixture predates the surface and constrains nothing, and a revision already carrying the head's surface describes the same bytes, so neither demands a bump. Provenance prose, build-identity metadata, and JSON formatting are excluded from the comparison. The manifest is deserialized as TOML, and an unreadable manifest or a version that is not SemVer fails the gate. A version inherited through `version.workspace = true` is unsupported and reported as such, because resolving it needs the root manifest at the same revision, which this gate does not read. The failure names which of the four sections moved, so a deliberate vector refresh is distinguishable from unexplained drift. Source-only and unrepresented behavior changes remain outside this gate.
 - **Fault/timing angle:** Source or dependency change that keeps self-roundtrip tests green while breaking the external opener.
-- **Required faults and enabling state:** At least one qualifying historical or proposed change; otherwise the rule passes vacuously.
-- **Confidence:** high that the rule is documented, low that it is enforced; [evidence](evidence/version-bump-accompanies-wire-change.md)
-- **Existing check:** none.
+- **Required faults and enabling state:** Synthetic unchanged, changed-without-bump, changed-with-bump, decreased-version, bootstrap, prose-only, reformatting, unrelated-change, unparseable-fixture, unparseable-version, manifest-formatting, prerelease-precedence, wide-numeric-prerelease, malformed-prerelease, unreadable-manifest, workspace-inherited-version, changed-section-reporting, version-taken-on-the-base-tip, and matching-base-tip-surface cases; readable pull-request base and head revisions for the actual Git comparison. Git failures other than proven path absence fail the gate rather than passing as bootstrap.
+- **Confidence:** high for represented fixture changes; low for unrepresented behavior and external compatibility; [evidence](evidence/version-bump-accompanies-wire-change.md)
+- **Existing check:** [`synthetic_version_gate_cases`](../../../crates/cortexkit-push-seal/tests/version_gate.rs), [`manifest_formatting_does_not_change_the_read_version`](../../../crates/cortexkit-push-seal/tests/version_gate.rs), [`a_commented_version_still_gates_a_wire_change`](../../../crates/cortexkit-push-seal/tests/version_gate.rs), [`literal_string_quoting_reads_the_same_version`](../../../crates/cortexkit-push-seal/tests/version_gate.rs), [`an_unparseable_version_fails_the_gate`](../../../crates/cortexkit-push-seal/tests/version_gate.rs), [`prerelease_versions_compare_by_semver_precedence`](../../../crates/cortexkit-push-seal/tests/version_gate.rs), [`numeric_prerelease_identifiers_order_by_value_at_any_width`](../../../crates/cortexkit-push-seal/tests/version_gate.rs), [`a_malformed_prerelease_identifier_fails_the_gate`](../../../crates/cortexkit-push-seal/tests/version_gate.rs), [`an_unreadable_manifest_fails_the_gate`](../../../crates/cortexkit-push-seal/tests/version_gate.rs), [`a_workspace_inherited_version_names_itself_in_the_failure`](../../../crates/cortexkit-push-seal/tests/version_gate.rs), [`the_failure_names_the_section_that_changed`](../../../crates/cortexkit-push-seal/tests/version_gate.rs), [`a_base_tip_that_already_carries_this_surface_demands_no_further_bump`](../../../crates/cortexkit-push-seal/tests/version_gate.rs), [`a_version_already_taken_on_the_base_tip_fails_the_gate`](../../../crates/cortexkit-push-seal/tests/version_gate.rs), and [`actual_git_diff_requires_version_bump`](../../../crates/cortexkit-push-seal/tests/version_gate.rs); audited for represented fixture cases only.
 - **Impact:** The docs call the version the only notification channel for path consumers.
 - **Open questions:** Ownership and location of the cross-language wire corpus. `(needs human input)`
 
@@ -466,7 +468,7 @@ These findings are not active safety properties. A future sender-authentication 
 | KEM serialized-size or deserializer-semantics drift | `encapped-key-parse-failure-is-unreachable`, `envelope-layout-and-overhead-stay-fixed` | build-time only |
 | Low-order attacker-controlled `enc` | `low-order-encapsulation-aead-path-is-reachable` | yes with a fixed dependency-approved vector |
 | New in-range crypto dependency release | `byte-determining-dependency-closure-is-pinned` | yes for default CI through the tracked `Cargo.lock` and `--locked`; broader identities remain unaudited |
-| Byte-affecting commit without version bump | `version-bump-accompanies-wire-change` | no qualifying historical commit yet |
+| Represented fixture change without version bump | `version-bump-accompanies-wire-change` | yes through synthetic policy cases and merge-base pull-request CI; no qualifying historical commit yet |
 
 ## Relationship map
 
