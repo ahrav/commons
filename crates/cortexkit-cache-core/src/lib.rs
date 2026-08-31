@@ -3,7 +3,7 @@
 //! This is the shared per-pass state machine that lets a harness pin a render-config
 //! across turns without thrashing the provider prefix cache. It is consumed by the
 //! Magic Context observer harness and the llm-runner author harness; both pin the same
-//! golden-vector contract (`cache-stability-golden-vectors.json`, schema_version 2).
+//! golden-vector contract (`cache-stability-golden-vectors.json`, schema_version 3).
 //!
 //! ## The one invariant
 //!
@@ -63,9 +63,10 @@ pub enum DurabilityClass {
     Lineage,
 }
 
-/// A frozen render unit: an opaque byte-complete payload the harness rendered on a bust
-/// pass. The core stores and replays `frozen_payload` verbatim and NEVER interprets it
-/// (kind is opaque too — `drop` | `strip` | `skeleton` | `synthesized-region` | `injection`).
+/// Stores an opaque, byte-complete payload captured on a bust pass.
+///
+/// The core matches units by `key`, preserves their order, and does not interpret `kind` or `frozen_payload`.
+/// A defer pass replays `frozen_payload` without re-rendering it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FrozenUnit {
     pub key: String,

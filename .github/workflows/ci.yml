@@ -45,7 +45,6 @@ jobs:
 
       # Runs only for pull requests: the gate compares the PR base and head
       # SHAs, and push/tag events lack a reliably resolvable base.
-      # commentlint: allow(JUDGE)
       - name: Require a push-seal version bump for represented wire changes
         if: matrix.os == 'ubuntu-latest' && github.event_name == 'pull_request'
         env:

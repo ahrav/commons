@@ -76,8 +76,7 @@ fn select_key(raw: &str) -> Result<String, String> {
     validate(raw.trim())
 }
 
-/// Malformed input is rejected rather than repaired so damaged pastes cannot
-/// silently select an unintended key.
+// Reject empty, non-hex, or non-64-character candidate keys; do not normalize input.
 fn validate(value: &str) -> Result<String, String> {
     if value.is_empty() {
         return Err("empty key".into());

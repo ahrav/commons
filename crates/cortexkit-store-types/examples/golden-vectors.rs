@@ -8,7 +8,7 @@
 use cortexkit_store_types::{postgres_database_name, sqlite_store_path, StorageDescriptor};
 
 fn main() {
-    // `a-b` and `a_b` must produce distinct database names.
+    // Slug collisions exercise the hash suffix; overlong IDs exercise the slug bound.
     let ids = [
         "alfonso-routing",
         "llm-runner",

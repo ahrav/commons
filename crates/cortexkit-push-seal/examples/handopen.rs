@@ -1,3 +1,7 @@
+// Inputs are raw hexadecimal: first recipient private key, then envelope.
+// Missing arguments, odd-length input, and non-hexadecimal input panic while parsing.
+// Successful plaintext uses lossy UTF-8; failures include the wire classification.
+
 fn main() {
     let a: Vec<String> = std::env::args().collect();
     let hx = |s: &str| {

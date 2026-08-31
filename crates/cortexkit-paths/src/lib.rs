@@ -1,9 +1,4 @@
-//! Shared path canonicalization primitives for CortexKit tooling.
-//!
-//! This crate deliberately owns only the dependency-light project-root identity
-//! primitive: resolving an existing filesystem path into a canonical path-backed
-//! [`ProjectRootId`]. It does not perform workspace discovery, Git inspection,
-//! transport serialization, or operation-target fallback handling.
+//! Canonicalize filesystem paths into CortexKit project-root identities.
 
 #![forbid(unsafe_code)]
 
@@ -15,50 +10,14 @@ use std::{
 
 /// Stable canonical identity for a project root.
 ///
-/// A `ProjectRootId` is represented by the canonical filesystem path of an
-/// existing project root. Construction uses [`std::fs::canonicalize`], so the
-/// stored path is absolute, has `.`/`..`/trailing separators collapsed, and has
-/// symlinks resolved.
-///
-/// Git worktrees are first-class roots: this crate does not ask Git for a
-/// repository common-dir and does not collapse linked worktrees back to their
-/// main checkout. Because a linked worktree has its own checkout directory, the
-/// canonical worktree path is a distinct id from the canonical main-checkout
-/// path while alternate spellings of either path still converge.
-/// A canonical project-root identity.
-///
-/// THE CANONICAL FORM THIS PRODUCES IS A CRYPTOGRAPHIC IDENTITY INPUT IN AT
-/// LEAST ONE CONSUMER, WHICH IS NOT VISIBLE FROM THIS CRATE. The vault hashes
-/// the canonical directory to derive the keychain service name holding its
-/// master key, and to derive the vault id that fences an admin-operation MAC to
-/// one vault. A change to canonicalization is therefore a BREAKING CHANGE to
-/// those identities.
-///
-/// It does not present as one. The vault looks up a keychain item that does not
-/// exist and reports a locked vault over an intact store, or two binaries derive
-/// different vault ids and every admin MAC fails verification. Nothing says
-/// "these two builds disagree about what this path is" -- so the usual
-/// reassurance for a path helper, that a mistake surfaces as a loud path
-/// mismatch, does not hold here.
-///
-/// The name is the trap: this reads as a path helper and is a canonicalizer for
-/// security identities. Route changes to the canonical form past the vault.
+/// Canonical form is a cryptographic compatibility boundary.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct ProjectRootId(PathBuf);
 
 impl ProjectRootId {
     /// Resolve an existing filesystem path into a canonical project-root id.
     ///
-    /// Non-existent paths are rejected with [`IdentityError::NonExistentPath`]
-    /// instead of being logically normalized. That policy avoids silently
-    /// aliasing roots whose future meaning could change when missing path
-    /// components or symlinks are later created.
-    ///
-    /// That rejection is load-bearing for callers who use it to DETECT a root
-    /// that has gone away, so this constructor keeps it. Callers that must still
-    /// address a vanished root -- ending or inspecting work that was admitted
-    /// while the root existed -- use [`Self::from_path_allowing_missing`], which
-    /// preserves the aliasing guarantee by a narrower means.
+    /// Missing paths return [`IdentityError::NonExistentPath`].
     pub fn from_path(path: impl AsRef<Path>) -> Result<Self, IdentityError> {
         let requested_path = path.as_ref().to_path_buf();
         match fs::canonicalize(path.as_ref()) {
@@ -77,27 +36,9 @@ impl ProjectRootId {
 
     /// Resolve a path into a project-root id even when the path no longer exists.
     ///
-    /// Resolves the longest prefix that still exists and re-appends the rest,
-    /// following any symlink encountered on the missing tail. This is the
-    /// behaviour of POSIX `realpath` on a non-existent path; [`fs::canonicalize`]
-    /// is the outlier in refusing partial resolution, so this matches a
-    /// documented reference rather than inventing a rule.
-    ///
-    /// WHY NOT LEXICAL NORMALIZATION: consumers key durable state on the
-    /// resolved string. On macOS every temporary directory is reached through a
-    /// symlink, so a lexically-normalized path is a DIFFERENT string from the id
-    /// minted while the root existed -- the caller would address an empty
-    /// lineage and receive a confident "no such thing" rather than an error.
-    /// That is one caller, one spelling, and two ids across time.
-    ///
-    /// WHAT THIS DOES NOT PROMISE: if a missing component later reappears as a
-    /// symlink pointing elsewhere, the id moves. [`Self::from_path`] does not
-    /// prevent that either -- it declines to answer while the component is
-    /// missing and then resolves through the new link exactly as this does, so
-    /// the hazard is shared rather than introduced here. The aliasing guarantee
-    /// the strict constructor exists for is preserved by refusing to create NEW
-    /// durable state under an id resolved this way; callers admit only
-    /// operations that read or end something already recorded.
+    /// The resolver canonicalizes the existing prefix and follows symlinks in the missing suffix.
+    /// Use only to read or finish work admitted while the root existed.
+    /// Missing components may later resolve through new symlinks, changing identity.
     pub fn from_path_allowing_missing(path: impl AsRef<Path>) -> Result<Self, IdentityError> {
         let resolved = resolve_allowing_missing(path.as_ref(), 0)?;
         Ok(Self(platform_project_root_path(resolved)))
@@ -205,14 +146,10 @@ fn platform_project_root_path(canonical_path: PathBuf) -> PathBuf {
     canonical_path
 }
 
-/// The kernel's own ceiling on symlink hops is typically 40 (`ELOOP`); matching
-/// it means a chain this code refuses is one the OS would refuse too.
+// Path resolution caps recursive symlink resolution at 40 hops.
 const MAX_SYMLINK_HOPS: u32 = 40;
 
-/// Resolve the longest existing prefix of `path` and re-append the missing tail.
-///
-/// Recurses on the parent rather than looping so that following a symlink on the
-/// missing tail re-enters the same resolution from the link's target.
+// Resolves the longest existing prefix and re-appends the missing tail.
 fn resolve_allowing_missing(path: &Path, hops: u32) -> Result<PathBuf, IdentityError> {
     match fs::canonicalize(path) {
         Ok(canonical_path) => return Ok(canonical_path),
