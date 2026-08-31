@@ -436,7 +436,12 @@ mod tests {
             } else if len % 2 == 0 {
                 envelope[0] = VERSION.wrapping_add(1);
                 reached[1] += 1;
-                (&[][..], OpenError::UnknownVersion { observed: 2 })
+                (
+                    &[][..],
+                    OpenError::UnknownVersion {
+                        observed: VERSION.wrapping_add(1),
+                    },
+                )
             } else {
                 envelope[0] = VERSION;
                 reached[2] += 1;
