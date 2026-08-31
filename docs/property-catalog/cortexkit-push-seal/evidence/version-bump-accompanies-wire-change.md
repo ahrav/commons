@@ -3,9 +3,10 @@
 - Discovery lenses: lifecycle transitions, version compatibility, bug history.
 - Trigger: docs call the crate version the only signal a path consumer receives.
 - Code trail: claim at `src/lib.rs:13-20`; version at `Cargo.toml:3`; publication choice at `Cargo.toml:10-12`; workspace rule at `README.md:42-51`.
-- Implemented mechanism: human process only. CI runs formatting, Clippy, and tests but no wire-corpus/version-diff gate.
+- Implemented mechanism: `tests/golden/push-seal-wire-v1.json` freezes one deterministic local envelope and all four local `OpenError` classifications. `tests/version_gate.rs` compares that fixture and package versions at explicit base/head revisions.
 - Failure scenario: source or dependency changes emitted bytes or acceptance behavior while self-roundtrip tests stay green and version remains `0.1.0`.
-- Timing/configuration: commit and release boundary, not runtime.
-- Existing evidence: tracked source diffs after introduction are prose/tests/examples, so source history has not exercised a qualifying wire change. Historical dependency closures are unavailable because the lockfile is untracked.
-- Instrumentation: fixed sealed/open vectors or a recorded deterministic custom RNG backend, plus a revision diff that requires a manifest version change when bytes or expected classifications move. Record the vector producer's target and build identity.
-- Investigation log: no corpus exists in this repository. Ownership and location of the external corpus need human input.
+- Timing/configuration: pull requests and pushes run the actual revision comparison on Ubuntu with explicit event SHAs. Local and `workflow_call` runs execute synthetic policy cases without claiming an actual revision comparison.
+- Existing evidence: synthetic tests reject a represented fixture change with an unchanged version, accept the same change with a version bump, accept initial fixture bootstrap, and ignore unrelated changes when the fixture is unchanged. The actual gate fails on unreadable named revisions.
+- Audit: audited only for changes represented by the committed fixture. Source changes that preserve the fixture, unrepresented behavior, and external opener compatibility remain unaudited.
+- Instrumentation: the fixture records schema version, synthetic test-only provenance, suite and mode, empty `info`, version AAD, plaintext, exact envelope, dependency/build identity, and represented classifications.
+- Investigation log: no independent opener corpus exists in this repository. The frozen bytes are a local regression oracle only.

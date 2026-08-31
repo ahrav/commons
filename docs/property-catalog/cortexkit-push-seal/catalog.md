@@ -41,7 +41,7 @@ These disagreements stay visible because code may be the defect.
 
 ## Existing-check inventory
 
-U1 local boundary and classification checks are audited below. Other checks remain **unaudited**. Production-guard placement and failure behavior belong to `/low-level-systems:defensive-assertions-and-invariant-guards`.
+Audited checks are identified below. Other checks remain **unaudited**. Production-guard placement and failure behavior belong to `/low-level-systems:defensive-assertions-and-invariant-guards`.
 
 ### Production and example guards
 
@@ -65,7 +65,9 @@ No production `assert!`, `debug_assert!`, or equivalent invariant assertion was 
 
 | Test and location | Existing semantics | Status |
 |---|---|---|
-| `the_pinned_suite_is_the_one_the_opener_agreed_to`, `src/lib.rs:204-209` | Three literal codepoint equalities; messages name KEM, KDF, and AEAD. | unaudited |
+| `the_pinned_suite_has_the_documented_codepoints`, `src/lib.rs` | Three literal codepoint equalities; messages name KEM, KDF, and AEAD. | audited for local build-wide codepoints; external opener equality remains unaudited |
+| `wire_v1_fixture_matches_local_bytes_and_classifications`, `src/lib.rs` | Regenerates one exact deterministic envelope through the private RNG seam, opens it, and checks all represented local errors and wire codes. | audited as a local fixture oracle; not independent opener evidence |
+| `synthetic_version_gate_cases` and `actual_git_diff_requires_version_bump`, `tests/version_gate.rs` | Exercise fixture/version policy in memory and compare explicitly named Git revisions only when both event SHAs are present. | audited for represented fixture changes; unrepresented behavior remains unaudited |
 | [`a_sealed_payload_opens_to_the_same_plaintext`](../../../crates/cortexkit-push-seal/src/lib.rs#L212) | Exact byte round trips at lengths 0, 2047, and 2048 with non-UTF-8 fixtures. | audited for these local boundaries |
 | [`the_envelope_has_version_one_and_fixed_overhead`](../../../crates/cortexkit-push-seal/src/lib.rs#L228) | Pins literal version 1, 32-byte encapsulation, 49-byte overhead, and 2097-byte maximum at lengths 0, 1, and 2048. | audited for the leading version and local size literals |
 | `each_seal_uses_a_fresh_ephemeral`, `:232-242` | Two sequential seals must have different `enc`; message: `encapsulated key must not repeat across messages`. | unaudited |
@@ -95,13 +97,13 @@ No production `assert!`, `debug_assert!`, or equivalent invariant assertion was 
 
 - **Type:** safety
 - **Status:** active
-- **Exercised:** yes; all three codepoints are asserted in `src/lib.rs:204-209`
+- **Exercised:** yes; all three codepoints are asserted as literals and repeated in the schema-versioned local wire fixture
 - **Guarantee:** The suite remains KEM `0x0020`, KDF `0x0001`, and AEAD `0x0003`.
 - **Check:** `always(KEM_ID == 0x0020 && KDF_ID == 0x0001 && AEAD_ID == 0x0003)`. `always` fits because these are build-wide wire constants.
 - **Fault/timing angle:** Dependency upgrade or type substitution behind a stable name.
 - **Required faults and enabling state:** None; evaluate on every build.
 - **Confidence:** high; [evidence](evidence/pinned-ciphersuite-codepoints.md)
-- **Existing check:** `src/lib.rs:204-209`; status unaudited.
+- **Existing check:** [`the_pinned_suite_has_the_documented_codepoints`](../../../crates/cortexkit-push-seal/src/lib.rs) and [`wire_v1_fixture_matches_local_bytes_and_classifications`](../../../crates/cortexkit-push-seal/src/lib.rs); audited for local build-wide codepoints. External opener equality remains unaudited.
 - **Impact:** Mismatch causes cross-repository authentication failure with no local sealer error.
 - **Open questions:** Whether the unavailable opener asserts the same literals.
 
@@ -417,13 +419,13 @@ No production `assert!`, `debug_assert!`, or equivalent invariant assertion was 
 
 - **Type:** safety
 - **Status:** active
-- **Exercised:** not yet; no post-introduction commit changed library wire behavior
+- **Exercised:** yes for synthetic represented-fixture changes; no committed historical wire change exists
 - **Guarantee:** Every change to emitted bytes, accepted bytes, error classification, or wire-code strings includes a crate-version bump; prose-only and test-only changes do not.
-- **Check:** `always(byte_or_behavior_diff == version_diff)` over each crate-changing commit, using fixed sealed/open vectors or a recorded deterministic custom RNG backend plus a public-behavior manifest. The vector producer's build identity is part of the oracle. `always` fits every qualifying revision.
+- **Check:** When the committed deterministic fixture differs between explicit base and head revisions, require the package version to differ. The fixture covers one exact local envelope and all four current public classifications. Source-only and unrepresented behavior changes remain outside this gate.
 - **Fault/timing angle:** Source or dependency change that keeps self-roundtrip tests green while breaking the external opener.
-- **Required faults and enabling state:** At least one qualifying historical or proposed change; otherwise the rule passes vacuously.
-- **Confidence:** high that the rule is documented, low that it is enforced; [evidence](evidence/version-bump-accompanies-wire-change.md)
-- **Existing check:** none.
+- **Required faults and enabling state:** Synthetic unchanged, changed-without-bump, changed-with-bump, bootstrap, and unrelated-change cases; readable explicit event revisions for the actual Git comparison.
+- **Confidence:** high for represented fixture changes; low for unrepresented behavior and external compatibility; [evidence](evidence/version-bump-accompanies-wire-change.md)
+- **Existing check:** [`synthetic_version_gate_cases`](../../../crates/cortexkit-push-seal/tests/version_gate.rs) and [`actual_git_diff_requires_version_bump`](../../../crates/cortexkit-push-seal/tests/version_gate.rs); audited for represented fixture cases only.
 - **Impact:** The docs call the version the only notification channel for path consumers.
 - **Open questions:** Ownership and location of the cross-language wire corpus. `(needs human input)`
 
@@ -461,7 +463,7 @@ These findings are not active safety properties. A future sender-authentication 
 | KEM serialized-size or deserializer-semantics drift | `encapped-key-parse-failure-is-unreachable`, `envelope-layout-and-overhead-stay-fixed` | build-time only |
 | Low-order attacker-controlled `enc` | `low-order-encapsulation-aead-path-is-reachable` | yes with a fixed dependency-approved vector |
 | New in-range crypto dependency release | `byte-determining-dependency-closure-is-pinned` | yes for default CI through exact direct pins, tracked `Cargo.lock`, and `--locked`; broader identities remain unaudited |
-| Byte-affecting commit without version bump | `version-bump-accompanies-wire-change` | no qualifying historical commit yet |
+| Represented fixture change without version bump | `version-bump-accompanies-wire-change` | yes through synthetic policy cases and explicit-revision CI; no qualifying historical commit yet |
 
 ## Relationship map
 

@@ -1,0 +1,78 @@
+{
+  "schema_version": 1,
+  "provenance": {
+    "material": "Purpose-generated synthetic recipient and ephemeral bytes for tests only.",
+    "secret_source": "Generated from fixed public test bytes; no environment credentials or secret stores were read.",
+    "oracle_scope": "Local cortexkit-push-seal regression oracle, not independent opener evidence."
+  },
+  "build_identity": {
+    "package": "cortexkit-push-seal",
+    "package_version": "0.1.0",
+    "source_revision": "5564d42be70324d042efda4b08eb8d58d7245080",
+    "profile": "workspace default-CI dependency resolution",
+    "dependencies": {
+      "hpke": "0.14.0",
+      "getrandom": "0.4.3",
+      "x25519-dalek": "3.0.0"
+    }
+  },
+  "ciphersuite": {
+    "mode": "Base",
+    "kem": {
+      "name": "DHKEM(X25519, HKDF-SHA256)",
+      "codepoint": 32
+    },
+    "kdf": {
+      "name": "HKDF-SHA256",
+      "codepoint": 1
+    },
+    "aead": {
+      "name": "ChaCha20Poly1305",
+      "codepoint": 3
+    }
+  },
+  "inputs": {
+    "recipient_ikm_hex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+    "recipient_private_key_hex": "91f7a467df4ef97053ec2a47b6e619f632df9547bb009fd0bcc747909f1b7bd4",
+    "recipient_public_key_hex": "b1f1b840de7a3241b02748cf9b05b74dc8c5e8451298738817bd76aa8ebe8c2b",
+    "ephemeral_randomness_hex": "4242424242424242424242424242424242424242424242424242424242424242",
+    "info_hex": "",
+    "aad_hex": "01",
+    "plaintext_hex": "707573682d7365616c20776972652076312073796e746865746963207061796c6f6164"
+  },
+  "expected": {
+    "envelope_hex": "01ae3bf1cd87c2d2ed25af4a1a239eed04a990f00e7403e4c8065927de010fd17abf143a41edc65c3184eea3f6b0b4119c14462af2ce6ed266550acde2164a73d9f0b85b00a0c73ee480167b19ebdad301286e29",
+    "classifications": [
+      {
+        "name": "short envelope",
+        "recipient_private_key_hex": "",
+        "envelope_hex": "",
+        "error": "Malformed",
+        "observed": 0,
+        "wire_code": "malformed"
+      },
+      {
+        "name": "unsupported version",
+        "recipient_private_key_hex": "",
+        "envelope_hex": "02ae3bf1cd87c2d2ed25af4a1a239eed04a990f00e7403e4c8065927de010fd17abf143a41edc65c3184eea3f6b0b4119c14462af2ce6ed266550acde2164a73d9f0b85b00a0c73ee480167b19ebdad301286e29",
+        "error": "UnknownVersion",
+        "observed": 2,
+        "wire_code": "unsupported_version"
+      },
+      {
+        "name": "bad recipient key",
+        "recipient_private_key_hex": "",
+        "envelope_hex": "01ae3bf1cd87c2d2ed25af4a1a239eed04a990f00e7403e4c8065927de010fd17abf143a41edc65c3184eea3f6b0b4119c14462af2ce6ed266550acde2164a73d9f0b85b00a0c73ee480167b19ebdad301286e29",
+        "error": "BadRecipientKey",
+        "wire_code": "malformed"
+      },
+      {
+        "name": "authentication failure",
+        "recipient_private_key_hex": "91f7a467df4ef97053ec2a47b6e619f632df9547bb009fd0bcc747909f1b7bd4",
+        "envelope_hex": "01ae3bf1cd87c2d2ed25af4a1a239eed04a990f00e7403e4c8065927de010fd17abf143a41edc65c3184eea3f6b0b4119c14462af2ce6ed266550acde2164a73d9f0b85b00a0c73ee480167b19ebdad301286e28",
+        "error": "Aead",
+        "wire_code": "malformed"
+      }
+    ]
+  }
+}

@@ -164,6 +164,7 @@ dependencies = [
  "getrandom",
  "hex",
  "hpke",
+ "serde_json",
 ]
 
 [[package]]

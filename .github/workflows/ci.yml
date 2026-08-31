@@ -27,6 +27,8 @@ jobs:
         os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
       - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -40,6 +42,13 @@ jobs:
 
       - name: Test
         run: cargo test --locked --workspace --all-targets
+
+      - name: Require a push-seal version bump for represented wire changes
+        if: matrix.os == 'ubuntu-latest' && (github.event_name == 'pull_request' || github.event_name == 'push')
+        env:
+          PUSH_SEAL_BASE_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
+          PUSH_SEAL_HEAD_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+        run: cargo test --locked -p cortexkit-push-seal --test version_gate actual_git_diff_requires_version_bump -- --ignored --exact
 
   # GitHub service containers are Linux-only. Without a DSN, live PostgreSQL
   # tests skip on macOS and Windows. CORTEXKIT_REQUIRE_PG makes a missing DSN

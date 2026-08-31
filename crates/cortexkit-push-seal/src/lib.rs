@@ -205,6 +205,9 @@ mod tests {
     use super::*;
     use hpke::rand_core::{Infallible, TryCryptoRng, TryRng};
     use hpke::{aead::Aead, kdf::Kdf, Kem as KemTrait};
+    use serde_json::Value;
+
+    const WIRE_V1_FIXTURE: &str = include_str!("../tests/golden/push-seal-wire-v1.json");
 
     fn keypair() -> (Vec<u8>, Vec<u8>) {
         let (sk, pk) = X25519HkdfSha256::gen_keypair();
@@ -216,10 +219,105 @@ mod tests {
     /// Type names can remain stable while their codepoints change. The external
     /// opener agrees on codepoints.
     #[test]
-    fn the_pinned_suite_is_the_one_the_opener_agreed_to() {
+    fn the_pinned_suite_has_the_documented_codepoints() {
         assert_eq!(X25519HkdfSha256::KEM_ID, 0x0020, "KEM codepoint");
         assert_eq!(HkdfSha256::KDF_ID, 0x0001, "KDF codepoint");
         assert_eq!(ChaCha20Poly1305::AEAD_ID, 0x0003, "AEAD codepoint");
+    }
+
+    #[test]
+    fn wire_v1_fixture_matches_local_bytes_and_classifications() {
+        let fixture: Value = serde_json::from_str(WIRE_V1_FIXTURE).expect("parse wire fixture");
+        assert_eq!(fixture["schema_version"], 1);
+        assert_eq!(
+            fixture["build_identity"]["package_version"],
+            env!("CARGO_PKG_VERSION")
+        );
+        assert_eq!(fixture["ciphersuite"]["kem"]["codepoint"], 0x0020);
+        assert_eq!(fixture["ciphersuite"]["kdf"]["codepoint"], 0x0001);
+        assert_eq!(fixture["ciphersuite"]["aead"]["codepoint"], 0x0003);
+        assert_eq!(fixture["ciphersuite"]["mode"], "Base");
+        assert_eq!(fixture["inputs"]["info_hex"], "");
+        assert_eq!(fixture["inputs"]["aad_hex"], "01");
+
+        let input = |name: &str| {
+            hex::decode(
+                fixture["inputs"][name]
+                    .as_str()
+                    .unwrap_or_else(|| panic!("missing inputs.{name}")),
+            )
+            .unwrap_or_else(|_| panic!("invalid inputs.{name}"))
+        };
+        let ikm = input("recipient_ikm_hex");
+        let (sk, pk) = X25519HkdfSha256::derive_keypair(&ikm);
+        let sk = sk.to_bytes().to_vec();
+        let pk = pk.to_bytes().to_vec();
+        assert_eq!(sk, input("recipient_private_key_hex"));
+        assert_eq!(pk, input("recipient_public_key_hex"));
+
+        let ephemeral = input("ephemeral_randomness_hex");
+        assert_eq!(ephemeral.len(), 32);
+        assert!(ephemeral.iter().all(|byte| *byte == ephemeral[0]));
+        let mut rng = RecordingRng {
+            next: ephemeral[0],
+            repeat: true,
+            fills: Vec::new(),
+        };
+        let plaintext = input("plaintext_hex");
+        let envelope = seal_with_rng(&pk, &plaintext, &mut rng).expect("deterministic seal");
+        assert_eq!(rng.fills, [32]);
+        assert_eq!(
+            envelope,
+            hex::decode(
+                fixture["expected"]["envelope_hex"]
+                    .as_str()
+                    .expect("expected envelope"),
+            )
+            .expect("valid expected envelope")
+        );
+        assert_eq!(open(&sk, &envelope).expect("fixture opens"), plaintext);
+
+        let cases = fixture["expected"]["classifications"]
+            .as_array()
+            .expect("classification cases");
+        assert!(!cases.is_empty(), "classification cases must not be empty");
+        for case in cases {
+            let key = hex::decode(
+                case["recipient_private_key_hex"]
+                    .as_str()
+                    .expect("case key"),
+            )
+            .expect("valid case key");
+            let envelope = hex::decode(case["envelope_hex"].as_str().expect("case envelope"))
+                .expect("valid case envelope");
+            let error = open(&key, &envelope).expect_err("classification must fail");
+            if let Some(expected) = case["observed"].as_u64() {
+                match &error {
+                    OpenError::Malformed { observed } => {
+                        assert_eq!(*observed as u64, expected, "case {}", case["name"]);
+                    }
+                    OpenError::UnknownVersion { observed } => {
+                        assert_eq!(*observed as u64, expected, "case {}", case["name"]);
+                    }
+                    OpenError::BadRecipientKey | OpenError::Aead => {
+                        panic!("case {} has an inapplicable observed field", case["name"]);
+                    }
+                }
+            }
+            let classification = match &error {
+                OpenError::Malformed { .. } => "Malformed",
+                OpenError::UnknownVersion { .. } => "UnknownVersion",
+                OpenError::BadRecipientKey => "BadRecipientKey",
+                OpenError::Aead => "Aead",
+            };
+            assert_eq!(classification, case["error"], "case {}", case["name"]);
+            assert_eq!(
+                error.wire_code(),
+                case["wire_code"].as_str().expect("case wire code"),
+                "case {}",
+                case["name"]
+            );
+        }
     }
 
     #[test]
