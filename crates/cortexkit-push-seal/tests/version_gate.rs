@@ -13,12 +13,27 @@ fn package_version(manifest: &str) -> Result<String, String> {
     let document: toml::Table = manifest
         .parse()
         .map_err(|error| format!("unparseable manifest: {error}"))?;
-    document
+    let Some(version) = document
         .get("package")
         .and_then(|package| package.get("version"))
-        .and_then(|version| version.as_str())
+    else {
+        return Err("manifest has no [package] version".to_owned());
+    };
+    // Resolving `version.workspace = true` needs the root manifest at the same revision,
+    // which this gate does not read. Name the configuration instead of reporting a
+    // missing version.
+    // commentlint: allow(JUDGE)
+    if version.get("workspace").and_then(toml::Value::as_bool) == Some(true) {
+        return Err(
+            "[package] version is inherited from the workspace, which this gate does not \
+             resolve; give the crate manifest its own version"
+                .to_owned(),
+        );
+    }
+    version
+        .as_str()
         .map(str::to_owned)
-        .ok_or_else(|| "manifest has no [package] version".to_owned())
+        .ok_or_else(|| format!("[package] version is not a string: {version:?}"))
 }
 
 // A numeric identifier is held as digits rather than an integer: SemVer bounds neither
@@ -147,6 +162,14 @@ fn represented_wire_surface(fixture: &str) -> Result<Value, String> {
     }))
 }
 
+fn changed_sections(base: &Value, head: &Value) -> String {
+    let sections: Vec<&str> = ["schema_version", "ciphersuite", "inputs", "expected"]
+        .into_iter()
+        .filter(|section| base[section] != head[section])
+        .collect();
+    sections.join(", ")
+}
+
 // The head version must exceed every version in `prior_manifests`, not the merge base
 // alone. Two branches that independently bump to the same version both satisfy a
 // merge-base-only check, so one version ends up carrying two wire surfaces.
@@ -160,9 +183,12 @@ fn check_version_gate(
     let Some(base_fixture) = base_fixture else {
         return Ok(());
     };
-    if represented_wire_surface(base_fixture)? == represented_wire_surface(head_fixture)? {
+    let base_surface = represented_wire_surface(base_fixture)?;
+    let head_surface = represented_wire_surface(head_fixture)?;
+    if base_surface == head_surface {
         return Ok(());
     }
+    let changed = changed_sections(&base_surface, &head_surface);
     let head_version = package_version(head_manifest)?;
     let head = parse_version(&head_version)?;
     for manifest in prior_manifests {
@@ -170,13 +196,14 @@ fn check_version_gate(
         let prior = parse_version(&prior_version)?;
         if head == prior {
             return Err(format!(
-                "push-seal wire fixture changed without a package version bump ({head_version})"
+                "push-seal wire fixture changed without a package version bump \
+                 ({head_version}); changed: {changed}"
             ));
         }
         if head < prior {
             return Err(format!(
                 "push-seal wire fixture changed but the package version did not increase \
-                 ({prior_version} -> {head_version})"
+                 ({prior_version} -> {head_version}); changed: {changed}"
             ));
         }
     }
@@ -328,6 +355,60 @@ fn an_unreadable_manifest_fails_the_gate() {
             .unwrap_err()
             .contains("no [package] version")
     );
+}
+
+#[test]
+fn a_workspace_inherited_version_names_itself_in_the_failure() {
+    let unchanged = fixture_with("0.1.0", "01", "synthetic");
+    let wire_change = fixture_with("0.1.0", "02", "synthetic");
+    let base = "[package]\nversion = \"0.1.0\"\n";
+
+    let error = check_version_gate(
+        Some(&unchanged),
+        &wire_change,
+        &[base],
+        "[package]\nversion.workspace = true\n",
+    )
+    .unwrap_err();
+    assert!(error.contains("inherited from the workspace"), "{error}");
+    assert!(!error.contains("has no [package] version"), "{error}");
+
+    let error = check_version_gate(
+        Some(&unchanged),
+        &wire_change,
+        &[base],
+        "[package]\nversion = 1\n",
+    )
+    .unwrap_err();
+    assert!(error.contains("is not a string"), "{error}");
+}
+
+#[test]
+fn the_failure_names_the_section_that_changed() {
+    let unchanged = fixture_with("0.1.0", "01", "synthetic");
+    let manifest = "[package]\nversion = \"0.1.0\"\n";
+    let mut inputs_only: Value = serde_json::from_str(&unchanged).expect("fixture");
+    inputs_only["inputs"]["aad_hex"] = json!("02");
+    let mut expected_only: Value = serde_json::from_str(&unchanged).expect("fixture");
+    expected_only["expected"]["envelope_hex"] = json!("02");
+
+    let error = check_version_gate(
+        Some(&unchanged),
+        &inputs_only.to_string(),
+        &[manifest],
+        manifest,
+    )
+    .unwrap_err();
+    assert!(error.contains("changed: inputs"), "{error}");
+
+    let error = check_version_gate(
+        Some(&unchanged),
+        &expected_only.to_string(),
+        &[manifest],
+        manifest,
+    )
+    .unwrap_err();
+    assert!(error.contains("changed: expected"), "{error}");
 }
 
 #[test]

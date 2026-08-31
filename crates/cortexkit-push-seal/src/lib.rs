@@ -286,25 +286,41 @@ mod tests {
             .parse()
             .expect("Cargo.lock parses as TOML");
         let packages = lock["package"].as_array().expect("lock packages");
-        let entry = |name: &str, version: Option<&str>| {
+        let entry = |name: &str, version: Option<&str>, source: Option<&str>| {
             let mut matches = packages.iter().filter(|package| {
                 package["name"].as_str() == Some(name)
                     && version.is_none_or(|version| package["version"].as_str() == Some(version))
+                    && source.is_none_or(|source| {
+                        package.get("source").and_then(toml::Value::as_str) == Some(source)
+                    })
             });
             let found = matches
                 .next()
-                .unwrap_or_else(|| panic!("{name} {version:?} missing from Cargo.lock"));
+                .unwrap_or_else(|| panic!("{name} {version:?} {source:?} missing from Cargo.lock"));
             assert!(
                 matches.next().is_none(),
-                "{name} {version:?} is ambiguous in Cargo.lock"
+                "{name} {version:?} {source:?} is ambiguous in Cargo.lock"
             );
             found
         };
-        // A dependency entry is `name` when the lock holds one version of it and
-        // `name version` when it holds several.
+        // Cargo writes `name`, adds the version when the lock holds several of that
+        // name, and adds `(source)` when it holds several of that name and version.
+        // commentlint: allow(JUDGE)
+        fn split_id(dependency: &str) -> (&str, Option<&str>, Option<&str>) {
+            let mut fields = dependency.splitn(3, ' ');
+            let name = fields.next().expect("dependency name");
+            let version = fields.next();
+            let source = fields.next().map(|source| {
+                source
+                    .strip_prefix('(')
+                    .and_then(|source| source.strip_suffix(')'))
+                    .unwrap_or_else(|| panic!("unparseable dependency source in {dependency:?}"))
+            });
+            (name, version, source)
+        }
         let mut reachable: std::collections::BTreeMap<&str, std::collections::BTreeSet<&str>> =
             std::collections::BTreeMap::new();
-        let root = entry("cortexkit-push-seal", None);
+        let root = entry("cortexkit-push-seal", None, None);
         let mut queue = vec![root];
         while let Some(package) = queue.pop() {
             let name = package["name"].as_str().expect("package name");
@@ -316,12 +332,8 @@ mod tests {
                 continue;
             };
             for dependency in dependencies.as_array().expect("dependency list") {
-                let dependency = dependency.as_str().expect("dependency entry");
-                let (name, version) = match dependency.split_once(' ') {
-                    Some((name, version)) => (name, Some(version)),
-                    None => (dependency, None),
-                };
-                queue.push(entry(name, version));
+                let (name, version, source) = split_id(dependency.as_str().expect("dependency"));
+                queue.push(entry(name, version, source));
             }
         }
         let recorded_dependencies = fixture["build_identity"]["dependencies"]
