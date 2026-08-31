@@ -235,6 +235,7 @@ mod tests {
     // commentlint: allow(JUDGE)
     fn reachable_dependencies(
         lock: &str,
+        root_manifest: &str,
         root: &str,
     ) -> std::collections::BTreeMap<String, std::collections::BTreeSet<PackageIdentity>> {
         let lock: toml::Table = lock.parse().expect("Cargo.lock parses as TOML");
@@ -284,13 +285,33 @@ mod tests {
             });
             (name, version, source)
         }
+        // The lock records one resolve covering every target and feature selection, so
+        // this walk over-approximates the tested build. The root's dev-only edges are the
+        // part that can be excluded exactly, since nothing behind them links into the
+        // sealed bytes; dropping them takes this crate from 56 reachable packages to 39
+        // and removes the only name the lock resolves at two versions.
+        // commentlint: allow(JUDGE)
+        let manifest: toml::Table = root_manifest.parse().expect("root manifest parses");
+        let names = |table: &str| -> std::collections::BTreeSet<String> {
+            manifest
+                .get(table)
+                .and_then(toml::Value::as_table)
+                .map(|table| table.keys().cloned().collect())
+                .unwrap_or_default()
+        };
+        let linked = names("dependencies");
+        let dev_only: std::collections::BTreeSet<String> = names("dev-dependencies")
+            .difference(&linked)
+            .cloned()
+            .collect();
+
         let mut visited = std::collections::BTreeSet::new();
         let mut reachable: std::collections::BTreeMap<
             String,
             std::collections::BTreeSet<PackageIdentity>,
         > = std::collections::BTreeMap::new();
-        let mut queue = vec![entry(root, None, None)];
-        while let Some(package) = queue.pop() {
+        let mut queue = vec![(entry(root, None, None), true)];
+        while let Some((package, is_root)) = queue.pop() {
             let (name, version, source) = identity(package);
             if !visited.insert((name.clone(), version.clone(), source.clone())) {
                 continue;
@@ -301,7 +322,10 @@ mod tests {
             };
             for dependency in dependencies.as_array().expect("dependency list") {
                 let (name, version, source) = split_id(dependency.as_str().expect("dependency"));
-                queue.push(entry(name, version, source));
+                if is_root && dev_only.contains(name) {
+                    continue;
+                }
+                queue.push((entry(name, version, source), false));
             }
         }
         reachable
@@ -342,7 +366,7 @@ name = "hpke"
 version = "0.15.0"
 source = "registry+https://example.com/r"
 "#;
-        let reachable = reachable_dependencies(lock, "root");
+        let reachable = reachable_dependencies(lock, "[package]\nname = \"root\"\n", "root");
         let shared = &reachable["shared"];
         assert_eq!(shared.len(), 2, "both sources must be visited: {shared:?}");
         let hpke: Vec<&str> = reachable["hpke"]
@@ -350,6 +374,64 @@ source = "registry+https://example.com/r"
             .map(|(version, _)| version.as_str())
             .collect();
         assert_eq!(hpke, ["0.14.0", "0.15.0"], "a subtree was skipped");
+    }
+
+    #[test]
+    fn root_dev_only_edges_are_not_traversed() {
+        // `shared` is both a dependency and a dev-dependency, so it stays; `harness` is
+        // dev-only, and the second `hpke` behind it must not appear.
+        // commentlint: allow(JUDGE)
+        let manifest = r#"
+[package]
+name = "root"
+
+[dependencies]
+shared = "1"
+
+[dev-dependencies]
+shared = "1"
+harness = "1"
+"#;
+        let lock = r#"
+version = 4
+
+[[package]]
+name = "root"
+version = "0.1.0"
+dependencies = ["harness", "shared"]
+
+[[package]]
+name = "shared"
+version = "1.0.0"
+dependencies = ["hpke 0.14.0"]
+
+[[package]]
+name = "harness"
+version = "1.0.0"
+dependencies = ["hpke 0.15.0"]
+
+[[package]]
+name = "hpke"
+version = "0.14.0"
+
+[[package]]
+name = "hpke"
+version = "0.15.0"
+"#;
+        let reachable = reachable_dependencies(lock, manifest, "root");
+        let hpke: Vec<&str> = reachable["hpke"]
+            .iter()
+            .map(|(version, _)| version.as_str())
+            .collect();
+        assert_eq!(hpke, ["0.14.0"], "a dev-only edge was traversed");
+        assert!(
+            reachable.contains_key("shared"),
+            "a linked edge was dropped"
+        );
+        assert!(
+            !reachable.contains_key("harness"),
+            "a dev-only edge was traversed"
+        );
     }
 
     #[test]
@@ -404,8 +486,11 @@ source = "registry+https://example.com/r"
         );
         assert_eq!(open(&sk, &envelope).expect("fixture opens"), plaintext);
 
-        let reachable =
-            reachable_dependencies(include_str!("../../../Cargo.lock"), "cortexkit-push-seal");
+        let reachable = reachable_dependencies(
+            include_str!("../../../Cargo.lock"),
+            include_str!("../Cargo.toml"),
+            "cortexkit-push-seal",
+        );
         let recorded_dependencies = fixture["build_identity"]["dependencies"]
             .as_object()
             .expect("recorded dependencies");
@@ -418,7 +503,9 @@ source = "registry+https://example.com/r"
                 resolved.len(),
                 1,
                 "this crate reaches several {name} packages: {resolved:?}; \
-                 build_identity records one"
+                 build_identity records one. The lock graph covers every target and \
+                 feature selection, so confirm an active edge reaches each before \
+                 changing the fixture"
             );
             let (version, _source) = resolved.iter().next().expect("resolved package");
             assert_eq!(
