@@ -1,10 +1,9 @@
 //!
-//! A module that owns a database must never have two live writers on the same
+//! At most one live writer may hold a lease per logical store.
 //!
-//! - **Liveness** comes from the OS advisory lock in the file implementation. The
-//! - **Fencing** comes from the nondecreasing `epoch` stored in the
-//!
-//! [`LeaseStore`] returns boxed [`LeaseHandle`] values for implementation-neutral
+//! Liveness uses an OS advisory lock. Kernel releases the lock on process death.
+//! Fencing uses persisted, monotonically increasing epochs to distinguish writer
+//! incarnations.
 //!
 //! ## Key namespacing
 //!
@@ -22,7 +21,6 @@ use std::{
 
 /// Protects an existing Unix regular file with mode `0600`. Missing paths succeed;
 /// on non-Unix targets, the function does nothing.
-///
 /// # Errors
 ///
 /// Returns filesystem errors or `InvalidInput` for a non-regular Unix path.
@@ -53,7 +51,9 @@ pub fn protect_file(path: &std::path::Path) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Shared lease roots require namespaced keys.
 ///
+/// `module_id` and `backend` namespace `scope_key` so shared lease roots cannot collide across modules.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LeaseKey {
     pub module_id: String,
@@ -74,7 +74,7 @@ impl LeaseKey {
         }
     }
 
-    ///
+    /// Field order and separators are stable because they determine lock identity.
     pub fn identity(&self) -> String {
         format!(
             "{}\u{1f}{}\u{1f}{}",
@@ -83,8 +83,9 @@ impl LeaseKey {
     }
 }
 
+/// A held lease keeps its backend-specific lock or ownership record alive.
 ///
-/// Exclusive handles expose a writer epoch. Shared handles expose the last
+/// Exclusive handles expose writer epochs. Shared handles expose the last persisted writer epoch for observation; shared epochs are not write fences.
 pub trait LeaseHandle: Send + Sync + std::fmt::Debug {
     fn epoch(&self) -> u64;
 
@@ -116,6 +117,7 @@ impl std::fmt::Display for LeaseError {
 impl std::error::Error for LeaseError {}
 
 pub trait LeaseStore: Send + Sync {
+    /// Dropping [`LeaseHandle`] releases exclusive ownership.
     fn acquire(&self, key: &LeaseKey) -> Result<Box<dyn LeaseHandle>, LeaseError>;
 
     /// A shared holder blocks [`LeaseStore::acquire`] (exclusive).
@@ -253,7 +255,7 @@ impl LeaseStore for FileLeaseStore {
     }
 }
 
-/// Callers hold a shared lock while reading.
+/// Shared holders do not modify persisted epoch.
 fn read_epoch(file: &mut File) -> std::io::Result<u64> {
     let mut buf = String::new();
     file.seek(SeekFrom::Start(0))?;
@@ -261,6 +263,7 @@ fn read_epoch(file: &mut File) -> std::io::Result<u64> {
     Ok(buf.trim().parse().unwrap_or(0))
 }
 
+/// Caller holds an exclusive lock while incrementing persisted epoch.
 fn bump_epoch(file: &mut File) -> std::io::Result<u64> {
     let mut buf = String::new();
     file.seek(SeekFrom::Start(0))?;

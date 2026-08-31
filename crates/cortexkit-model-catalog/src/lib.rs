@@ -40,10 +40,8 @@ pub enum CatalogParseError {
         field: &'static str,
         value: String,
     },
-    /// A pricing tier whose dimension cannot be verified as context-based, or
-    /// a context tier without a `tier.size` threshold. A tier whose floor
-    /// cannot be read must not default to 0: that would apply the
-    /// over-threshold rate to every request, which is a silent repricing.
+    /// Covers non-context tiers and context tiers without `tier.size`.
+    /// Missing thresholds must not default to 0 because that would apply over-threshold rates to every request.
     /// Carries the row so an operator diagnoses a rejected snapshot without
     /// bisecting the payload.
     MissingTierThreshold { provider: String, model: String },
@@ -161,7 +159,7 @@ impl CatalogDoc {
     ///
     /// # Errors
     ///
-    /// Returns [`CatalogParseError::Json`] for invalid JSON or a non-object top-level value, [`CatalogParseError::InexactRate`] for an inexact rate, [`CatalogParseError::NegativeRate`] for a negative rate, or [`CatalogParseError::MissingTierThreshold`] for an incomplete tier.
+    /// Returns [`CatalogParseError::Json`] for invalid JSON or a non-object top-level value, [`CatalogParseError::InexactRate`] for an inexact rate, [`CatalogParseError::NegativeRate`] for a negative rate, or [`CatalogParseError::MissingTierThreshold`] when a tier is not context-based or lacks a readable threshold.
     pub fn parse(json: &str) -> Result<Self, CatalogParseError> {
         let root: Value =
             serde_json::from_str(json).map_err(|e| CatalogParseError::Json(e.to_string()))?;
