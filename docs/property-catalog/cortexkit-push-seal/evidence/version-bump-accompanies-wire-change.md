@@ -2,7 +2,7 @@
 
 - Discovery lenses: lifecycle transitions, version compatibility, bug history.
 - Trigger: docs call the crate version the only signal a path consumer receives.
-- Code trail: claim at `src/lib.rs:13-20`; version at `Cargo.toml:3`; publication choice at `Cargo.toml:10-12`; workspace rule at `README.md:42-51`.
+- Code trail: the module docs state the bump rule; `[package] version` and `publish = false` in `Cargo.toml`; the workspace publishing rule in `README.md`.
 - Implemented mechanism: human process only. CI runs formatting, Clippy, and tests but no wire-corpus/version-diff gate.
 - Failure scenario: source or dependency changes emitted bytes or acceptance behavior while self-roundtrip tests stay green and version remains `0.1.0`.
 - Timing/configuration: commit and release boundary, not runtime.

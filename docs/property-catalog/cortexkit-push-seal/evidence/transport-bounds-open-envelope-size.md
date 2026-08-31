@@ -2,7 +2,7 @@
 
 - Discovery lenses: resource boundaries, dependencies, unproven assumptions.
 - Trigger: `open` explicitly omits a cap because transport is said to own it.
-- Code trail: delegation at `src/lib.rs:156-160`; only minimum-length gate at `:162`; dependency allocates plaintext proportional to ciphertext length.
+- Code trail: `open`'s doc comment delegates the size bound to transport; its only size gate is the `1 + ENC_LEN` minimum; the dependency allocates plaintext proportional to ciphertext length.
 - Competing explanation: the cap may exist in a caller outside this repository. That cannot be confirmed or rejected with supplied evidence.
 - Failure scenario: oversized untrusted envelope reaches `open` and causes large allocation and linear cryptographic work.
 - Timing/configuration: memory pressure and caller admission policy matter.

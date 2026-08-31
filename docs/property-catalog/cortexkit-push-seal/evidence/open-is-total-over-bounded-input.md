@@ -2,7 +2,7 @@
 
 - Discovery lenses: failure recovery, resource boundaries, security boundaries.
 - Trigger: `open` parses caller-provided byte slices and uses fixed offsets.
-- Code trail: precondition gates at `src/lib.rs:162-171`; guarded slicing at `:175` and `:184`; result mapping at `:187`; sampled campaign at `:421-462`.
+- Code trail: `open`'s minimum-length and version gates precede its slicing of `enc` and the ciphertext tail, and every dependency failure maps to `OpenError::Aead`; `sampled_malformed_bytes_are_total_through_the_local_envelope_bound` runs the sampled campaign.
 - Implemented mechanism: the 33-byte length guard precedes every index and slice requiring that minimum.
 - Failure scenario: malformed lengths or key bytes within the caller-owned size bound panic, read out of bounds, or escape the documented error taxonomy. Arbitrarily large valid-shaped input can trigger proportional allocation and is outside this totality claim.
 - Timing/configuration: no concurrency timing. Focused lengths are 0, 32, 33, 48, and 49, plus large values.

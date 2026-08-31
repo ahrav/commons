@@ -2,7 +2,7 @@
 
 - Discovery lenses: protocol contracts, lifecycle transitions, version compatibility.
 - Trigger: `VERSION` is both an emitted field and the only accepted version.
-- Code trail: version definition, emission, and gate in [`src/lib.rs`](../../../../crates/cortexkit-push-seal/src/lib.rs); [`the_envelope_has_version_one_and_fixed_overhead`](../../../../crates/cortexkit-push-seal/src/lib.rs#L228) and [`open_error_precedence_is_stable`](../../../../crates/cortexkit-push-seal/src/lib.rs#L284).
+- Code trail: version definition, emission, and gate in [`src/lib.rs`](../../../../crates/cortexkit-push-seal/src/lib.rs); [`the_envelope_has_version_one_and_fixed_overhead`](../../../../crates/cortexkit-push-seal/src/lib.rs) and [`open_error_precedence_is_stable`](../../../../crates/cortexkit-push-seal/src/lib.rs).
 - Implemented mechanism: equality against one compile-time constant; no negotiation or dual-read window.
 - Failure scenario: a constant edit keeps symbolic self-tests green but diverges from the external opener.
 - Timing/configuration: rollout order matters only when a second version is introduced; no such protocol exists today.
