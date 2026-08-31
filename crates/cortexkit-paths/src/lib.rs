@@ -37,6 +37,8 @@ impl ProjectRootId {
     /// Resolve a path into a project-root id even when the path no longer exists.
     ///
     /// The resolver canonicalizes the existing prefix and follows symlinks in the missing suffix.
+    /// Use only to read or finish work admitted while the root existed.
+    /// Missing components may later resolve through new symlinks, changing identity.
     pub fn from_path_allowing_missing(path: impl AsRef<Path>) -> Result<Self, IdentityError> {
         let resolved = resolve_allowing_missing(path.as_ref(), 0)?;
         Ok(Self(platform_project_root_path(resolved)))
