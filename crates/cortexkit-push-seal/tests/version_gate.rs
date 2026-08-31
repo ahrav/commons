@@ -151,9 +151,19 @@ fn identifier_of(version: &str, identifier: &str) -> Result<Identifier, String> 
 }
 
 // `provenance` and `build_identity` are recording metadata, not wire data or classification; changing them does not require a version bump.
+//
+// Every wire-surface section must be present and non-null: serde_json indexing
+// maps an absent key to `Null`, so two fixtures that both lack a section would
+// otherwise project equal and the gate would pass vacuously after a fixture
+// shape change.
 fn represented_wire_surface(fixture: &str) -> Result<Value, String> {
     let value: Value =
         serde_json::from_str(fixture).map_err(|error| format!("unparseable fixture: {error}"))?;
+    for section in WIRE_SURFACE_SECTIONS {
+        if value.get(section).is_none_or(Value::is_null) {
+            return Err(format!("fixture is missing wire-surface section {section}"));
+        }
+    }
     Ok(json!({
         "schema_version": value["schema_version"],
         "ciphersuite": value["ciphersuite"],
@@ -162,8 +172,10 @@ fn represented_wire_surface(fixture: &str) -> Result<Value, String> {
     }))
 }
 
+const WIRE_SURFACE_SECTIONS: [&str; 4] = ["schema_version", "ciphersuite", "inputs", "expected"];
+
 fn changed_sections(base: &Value, head: &Value) -> String {
-    let sections: Vec<&str> = ["schema_version", "ciphersuite", "inputs", "expected"]
+    let sections: Vec<&str> = WIRE_SURFACE_SECTIONS
         .into_iter()
         .filter(|section| base[section] != head[section])
         .collect();
@@ -318,6 +330,47 @@ fn synthetic_version_gate_cases() {
     )
     .unwrap_err()
     .contains("unparseable fixture"));
+}
+
+// Valid JSON that lacks a wire-surface section must fail loudly on either
+// side of the comparison; two hollow fixtures projecting `Null == Null`
+// would otherwise pass the gate vacuously.
+#[test]
+fn a_fixture_missing_a_wire_surface_section_fails_the_gate() {
+    let manifest = "[package]\nname = \"cortexkit-push-seal\"\nversion = \"0.1.0\"\n";
+    let unchanged = fixture_with("0.1.0", "01", "synthetic");
+
+    for section in WIRE_SURFACE_SECTIONS {
+        let mut hollow: Value = serde_json::from_str(&unchanged).expect("fixture");
+        hollow.as_object_mut().expect("object").remove(section);
+        let hollow = hollow.to_string();
+
+        for (base, head) in [
+            (&unchanged, &hollow),
+            (&hollow, &unchanged),
+            (&hollow, &hollow),
+        ] {
+            let error =
+                check_version_gate(&[at(Some(base), manifest)], head, manifest).unwrap_err();
+            assert!(
+                error.contains("missing wire-surface section"),
+                "removing {section} passed the gate: {error}"
+            );
+        }
+
+        let mut nulled: Value = serde_json::from_str(&unchanged).expect("fixture");
+        nulled[section] = Value::Null;
+        assert!(
+            check_version_gate(
+                &[at(Some(&unchanged), manifest)],
+                &nulled.to_string(),
+                manifest
+            )
+            .unwrap_err()
+            .contains("missing wire-surface section"),
+            "nulling {section} passed the gate"
+        );
+    }
 }
 
 #[test]

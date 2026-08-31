@@ -438,6 +438,7 @@ version = "0.15.0"
     fn wire_v1_fixture_matches_local_bytes_and_classifications() {
         let fixture: Value = serde_json::from_str(WIRE_V1_FIXTURE).expect("parse wire fixture");
         assert_eq!(fixture["schema_version"], 1);
+        assert_eq!(fixture["build_identity"]["package"], "cortexkit-push-seal");
         assert_eq!(
             fixture["build_identity"]["package_version"],
             env!("CARGO_PKG_VERSION")
@@ -518,10 +519,17 @@ version = "0.15.0"
         let cases = fixture["expected"]["classifications"]
             .as_array()
             .expect("classification cases");
-        assert!(!cases.is_empty(), "classification cases must not be empty");
+        let expected_cases = [
+            "short envelope",
+            "unsupported version",
+            "bad recipient key",
+            "authentication failure",
+        ];
+        assert_eq!(cases.len(), expected_cases.len(), "classification count");
         let mut covered = std::collections::BTreeSet::new();
-        for case in cases {
+        for (case, expected_name) in cases.iter().zip(expected_cases) {
             let name = case["name"].as_str().expect("case name");
+            assert_eq!(name, expected_name);
             let key = hex::decode(
                 case["recipient_private_key_hex"]
                     .as_str()
@@ -635,15 +643,11 @@ version = "0.15.0"
         type Error = Infallible;
 
         fn try_next_u32(&mut self) -> Result<u32, Self::Error> {
-            let mut bytes = [0; 4];
-            self.try_fill_bytes(&mut bytes)?;
-            Ok(u32::from_le_bytes(bytes))
+            hpke::rand_core::utils::next_word_via_fill(self)
         }
 
         fn try_next_u64(&mut self) -> Result<u64, Self::Error> {
-            let mut bytes = [0; 8];
-            self.try_fill_bytes(&mut bytes)?;
-            Ok(u64::from_le_bytes(bytes))
+            hpke::rand_core::utils::next_word_via_fill(self)
         }
 
         fn try_fill_bytes(&mut self, dst: &mut [u8]) -> Result<(), Self::Error> {
@@ -822,7 +826,6 @@ version = "0.15.0"
         for byte in 1..1 + ENC_LEN {
             for bit in 0..8 {
                 let mut mutated = sealed.clone();
-                mutated[0] = VERSION;
                 mutated[byte] ^= 1 << bit;
                 assert_eq!(open(&sk, &mutated), Err(OpenError::Aead));
                 encapsulation_rejections += 1;
@@ -835,7 +838,6 @@ version = "0.15.0"
         for byte in 1 + ENC_LEN..sealed.len() {
             for bit in 0..8 {
                 let mut mutated = sealed.clone();
-                mutated[0] = VERSION;
                 mutated[byte] ^= 1 << bit;
                 assert_eq!(open(&sk, &mutated), Err(OpenError::Aead));
                 if byte < tag_start {
@@ -902,6 +904,18 @@ version = "0.15.0"
             reached[1..].iter().all(|count| *count > 0),
             "every public error class reached: {reached:?}"
         );
+
+        for len in [33, 34, 48, 49, 50, 256, 1024, 2097] {
+            let mut envelope = sealed[..1 + ENC_LEN].to_vec();
+            envelope.resize(len, 0xa5);
+            let result = std::panic::catch_unwind(|| open(&sk, &envelope));
+            assert!(result.is_ok(), "deep sample length {len} must not unwind");
+            assert_eq!(
+                result.unwrap(),
+                Err(OpenError::Aead),
+                "deep sample length {len}"
+            );
+        }
     }
 
     /// Pins the complete local error enum to the two-string wire vocabulary.
@@ -953,6 +967,7 @@ version = "0.15.0"
             direct_open(&[], &[VERSION]).expect("direct correct open"),
             b"q"
         );
+        assert_eq!(open(&sk, &sealed).expect("public correct open"), b"q");
 
         for aad in [&[][..], &[0][..], &[VERSION, 0][..]] {
             assert_eq!(
