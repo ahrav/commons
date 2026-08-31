@@ -355,6 +355,19 @@ mod tests {
             "length must win before version and key parsing"
         );
 
+        // 33 bytes is the smallest envelope with a valid version and encapsulated key but no ciphertext.
+        let empty_ciphertext = &sealed[..33];
+        assert_eq!(
+            open(&sk, empty_ciphertext),
+            Err(OpenError::Aead),
+            "the minimum-length envelope must clear the length gate"
+        );
+        assert_eq!(
+            open(&sk, empty_ciphertext).unwrap_err().wire_code(),
+            "malformed",
+            "an empty ciphertext reports as an unusable envelope"
+        );
+
         for version in u8::MIN..=u8::MAX {
             if version == 0x01 {
                 continue;
@@ -485,7 +498,12 @@ mod tests {
             } else if len % 2 == 0 {
                 envelope[0] = VERSION.wrapping_add(1);
                 reached[1] += 1;
-                (&[][..], OpenError::UnknownVersion { observed: 2 })
+                (
+                    &[][..],
+                    OpenError::UnknownVersion {
+                        observed: VERSION.wrapping_add(1),
+                    },
+                )
             } else {
                 envelope[0] = VERSION;
                 reached[2] += 1;

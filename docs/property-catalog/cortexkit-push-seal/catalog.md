@@ -198,13 +198,13 @@ No production `assert!`, `debug_assert!`, or equivalent invariant assertion was 
 
 - **Type:** safety
 - **Status:** active
-- **Exercised:** yes and locally audited for every proper prefix and every single-bit field mutation of one valid anchor
+- **Exercised:** yes and locally audited for every proper prefix and every single-bit field mutation of one valid anchor, plus every unsupported version byte and the 33-byte minimum-length envelope
 - **Guarantee:** For the finite anchor campaign, every proper prefix and every single-bit version, encapsulated-key, ciphertext, and tag mutation is rejected.
 - **Check:** For one valid anchor, require exact `Malformed` or `Aead` errors at every proper-prefix length and exact `UnknownVersion` or `Aead` errors for each field mutation. The finite campaign is empirical evidence, not universal mutation coverage or proof of zero forgery probability.
 - **Fault/timing angle:** Short read, partial write, transport corruption, or active tampering in the version, `enc`, ciphertext, or tag.
 - **Required faults and enabling state:** A valid envelope that first opens successfully, all proper-prefix lengths, and every single-bit position across every field.
 - **Confidence:** high for the finite local campaign; [evidence](evidence/tampered-or-truncated-envelope-never-opens.md)
-- **Existing check:** [`every_proper_prefix_of_a_valid_envelope_is_rejected`](../../../crates/cortexkit-push-seal/src/lib.rs#L321) and [`single_bit_mutations_have_field_specific_outcomes`](../../../crates/cortexkit-push-seal/src/lib.rs#L346); audited for one generated anchor with field reach counters. This is not cross-implementation evidence.
+- **Existing check:** [`every_proper_prefix_of_a_valid_envelope_is_rejected`](../../../crates/cortexkit-push-seal/src/lib.rs#L334) and [`single_bit_mutations_have_field_specific_outcomes`](../../../crates/cortexkit-push-seal/src/lib.rs#L359); audited for one generated anchor with field reach counters. [`open_error_precedence_is_stable`](../../../crates/cortexkit-push-seal/src/lib.rs#L284) additionally rejects every non-`0x01` version byte and the 33-byte gate boundary. This is not cross-implementation evidence.
 - **Impact:** Acceptance would expose attacker-controlled or partial notification content.
 - **Open questions:** None.
 
@@ -218,7 +218,7 @@ No production `assert!`, `debug_assert!`, or equivalent invariant assertion was 
 - **Fault/timing angle:** Key selection or environment mix-up.
 - **Required faults and enabling state:** Two generated keypairs with asserted-distinct public keys and a non-empty plaintext.
 - **Confidence:** high; [evidence](evidence/wrong-recipient-never-opens.md)
-- **Existing check:** [`the_wrong_recipient_cannot_open`](../../../crates/cortexkit-push-seal/src/lib.rs#L338); audited for the sampled local pair after asserting distinct public keys. The cryptographic guarantee and external key-selection paths are not universally audited.
+- **Existing check:** [`the_wrong_recipient_cannot_open`](../../../crates/cortexkit-push-seal/src/lib.rs#L482); audited for the sampled local pair after asserting distinct public keys. The cryptographic guarantee and external key-selection paths are not universally audited.
 - **Impact:** Violation breaks recipient confidentiality.
 - **Open questions:** None.
 
@@ -246,7 +246,7 @@ No production `assert!`, `debug_assert!`, or equivalent invariant assertion was 
 - **Fault/timing angle:** New error variant, string rename, or reclassification.
 - **Required faults and enabling state:** Construct all variants, including a wrong-length private key.
 - **Confidence:** high; [evidence](evidence/wire-error-vocabulary-is-stable.md)
-- **Existing check:** [`every_open_failure_maps_to_the_wire_vocabulary`](../../../crates/cortexkit-push-seal/src/lib.rs#L322), with `BadRecipientKey` reached through [`open_error_precedence_is_stable`](../../../crates/cortexkit-push-seal/src/lib.rs#L284); audited for the local enum and exact literals. External vocabulary agreement remains unaudited.
+- **Existing check:** [`every_open_failure_maps_to_the_wire_vocabulary`](../../../crates/cortexkit-push-seal/src/lib.rs#L466), with `BadRecipientKey` reached through [`open_error_precedence_is_stable`](../../../crates/cortexkit-push-seal/src/lib.rs#L284); audited for the local enum and exact literals. External vocabulary agreement remains unaudited.
 - **Impact:** Drift breaks the cross-language conformance vocabulary.
 - **Open questions:** Whether opener-side key misconfiguration should intentionally collapse to `malformed`.
 
@@ -254,13 +254,13 @@ No production `assert!`, `debug_assert!`, or equivalent invariant assertion was 
 
 - **Type:** safety
 - **Status:** active
-- **Exercised:** yes and locally audited through the shared RNG-injected sealing path
+- **Exercised:** yes and locally audited through both the RNG-injected sealing path and two calls to the public `seal`
 - **Guarantee:** Every successful `seal` after the plaintext and key gates uses a newly generated ephemeral and a newly constructed sender context.
 - **Check:** A test-only RNG records exactly one fresh draw per successful call and supplies distinct fixed draw bytes; each call constructs a new sender context. A negative-control RNG repeats draw bytes and must produce repeated `enc`, proving the no-repeat canary detects degraded entropy. Production no-repeat campaigns remain statistical evidence, not proof. `always` applies to the per-successful-call draw/context obligation.
 - **Fault/timing angle:** Degraded or accidental deterministic custom RNG, or cached sender context. The resolved default `SysRng` obtains OS bytes per call; fork duplication is not asserted for that backend.
 - **Required faults and enabling state:** Two successful seals with identical valid recipient and accepted plaintext under distinct deterministic draws, plus two seals under a repeated-draw negative control.
 - **Confidence:** high for intended behavior; [evidence](evidence/each-seal-uses-fresh-ephemeral.md)
-- **Existing check:** [`each_seal_uses_a_fresh_ephemeral`](../../../crates/cortexkit-push-seal/src/lib.rs); audited for one 32-byte draw per successful seal, distinct deterministic draws producing distinct encapsulations, and repeated draws producing repeated encapsulations. Production entropy quality remains outside this check.
+- **Existing check:** [`each_seal_uses_a_fresh_ephemeral`](../../../crates/cortexkit-push-seal/src/lib.rs); audited for one 32-byte draw per successful `seal_with_rng` call, distinct deterministic draws producing distinct encapsulations, and repeated draws producing repeated encapsulations. The same test also calls the public `seal` twice and requires distinct encapsulations, so an ambient RNG replaced by a fixed or seeded source fails the suite. Production entropy quality remains outside this check.
 - **Impact:** Reuse can repeat the AEAD key/nonce pair and break confidentiality.
 - **Open questions:** Whether production build flags can select a custom entropy backend and how that configuration is controlled.
 
@@ -274,7 +274,7 @@ No production `assert!`, `debug_assert!`, or equivalent invariant assertion was 
 - **Fault/timing angle:** Boundary slicing and malformed authenticated data.
 - **Required faults and enabling state:** Arbitrary key and envelope bytes within the caller-owned bound, including very short inputs. The exact bound is unresolved.
 - **Confidence:** medium by code inspection because the caller bound is unavailable; [evidence](evidence/open-is-total-over-bounded-input.md)
-- **Existing check:** [`sampled_malformed_bytes_are_total_through_the_local_envelope_bound`](../../../crates/cortexkit-push-seal/src/lib.rs#L423); sampled evidence only. It reaches every length through the largest locally emitted envelope and every public error class, but not every byte string, transport resource safety, or a caller-owned bound. Status remains unaudited.
+- **Existing check:** [`sampled_malformed_bytes_are_total_through_the_local_envelope_bound`](../../../crates/cortexkit-push-seal/src/lib.rs#L421); sampled evidence only. It reaches every length through the largest locally emitted envelope and every public error class, but not every byte string, transport resource safety, or a caller-owned bound. Status remains unaudited.
 - **Impact:** Panic would turn malformed input into denial of service for any caller exposing `open`.
 - **Open questions:** Whether untrusted input reaches this helper outside corpus generation.
 
