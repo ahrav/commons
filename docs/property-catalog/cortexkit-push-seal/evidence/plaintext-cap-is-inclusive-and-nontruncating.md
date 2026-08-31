@@ -2,7 +2,7 @@
 
 - Discovery lenses: resource boundaries, data integrity, failure recovery.
 - Trigger: `MAX_PLAINTEXT_BYTES` is documented as normative and pre-seal.
-- Code trail: constant, guard, and error fields in [`src/lib.rs`](../../../../crates/cortexkit-push-seal/src/lib.rs); [`an_oversized_plaintext_is_refused_with_both_numbers`](../../../../crates/cortexkit-push-seal/src/lib.rs#L262) and [`a_sealed_payload_opens_to_the_same_plaintext`](../../../../crates/cortexkit-push-seal/src/lib.rs#L212).
+- Code trail: constant, guard, and error fields in [`src/lib.rs`](../../../../crates/cortexkit-push-seal/src/lib.rs); [`an_oversized_plaintext_is_refused_with_both_numbers`](../../../../crates/cortexkit-push-seal/src/lib.rs) and [`a_sealed_payload_opens_to_the_same_plaintext`](../../../../crates/cortexkit-push-seal/src/lib.rs).
 - Implemented mechanism: size is checked before key parsing, RNG use, allocation of the envelope, or HPKE work.
 - Failure scenario: off-by-one rejection at 2048, acceptance at 2049, truncation, or loss of the observed-size diagnostic.
 - Timing/configuration: no timing dependence.

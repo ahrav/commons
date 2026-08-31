@@ -363,15 +363,11 @@ mod tests {
         type Error = Infallible;
 
         fn try_next_u32(&mut self) -> Result<u32, Self::Error> {
-            let mut bytes = [0; 4];
-            self.try_fill_bytes(&mut bytes)?;
-            Ok(u32::from_le_bytes(bytes))
+            hpke::rand_core::utils::next_word_via_fill(self)
         }
 
         fn try_next_u64(&mut self) -> Result<u64, Self::Error> {
-            let mut bytes = [0; 8];
-            self.try_fill_bytes(&mut bytes)?;
-            Ok(u64::from_le_bytes(bytes))
+            hpke::rand_core::utils::next_word_via_fill(self)
         }
 
         fn try_fill_bytes(&mut self, dst: &mut [u8]) -> Result<(), Self::Error> {
@@ -526,7 +522,6 @@ mod tests {
         for byte in 1..1 + ENC_LEN {
             for bit in 0..8 {
                 let mut mutated = sealed.clone();
-                mutated[0] = VERSION;
                 mutated[byte] ^= 1 << bit;
                 assert_eq!(open(&sk, &mutated), Err(OpenError::Aead));
                 encapsulation_rejections += 1;
@@ -539,7 +534,6 @@ mod tests {
         for byte in 1 + ENC_LEN..sealed.len() {
             for bit in 0..8 {
                 let mut mutated = sealed.clone();
-                mutated[0] = VERSION;
                 mutated[byte] ^= 1 << bit;
                 assert_eq!(open(&sk, &mutated), Err(OpenError::Aead));
                 if byte < tag_start {
@@ -601,6 +595,18 @@ mod tests {
             reached[1..].iter().all(|count| *count > 0),
             "every public error class reached: {reached:?}"
         );
+
+        for len in [33, 34, 48, 49, 50, 256, 1024, 2097] {
+            let mut envelope = sealed[..1 + ENC_LEN].to_vec();
+            envelope.resize(len, 0xa5);
+            let result = std::panic::catch_unwind(|| open(&sk, &envelope));
+            assert!(result.is_ok(), "deep sample length {len} must not unwind");
+            assert_eq!(
+                result.unwrap(),
+                Err(OpenError::Aead),
+                "deep sample length {len}"
+            );
+        }
     }
 
     /// Pins the complete local error enum to the two-string wire vocabulary.
