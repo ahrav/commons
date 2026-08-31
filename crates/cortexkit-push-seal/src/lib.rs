@@ -225,6 +225,215 @@ mod tests {
         assert_eq!(ChaCha20Poly1305::AEAD_ID, 0x0003, "AEAD codepoint");
     }
 
+    type PackageIdentity = (String, Option<String>);
+
+    // Resolving a name against the whole lock file picks whichever `[[package]]` sorts
+    // first, which is a different version than the root builds against as soon as any
+    // workspace crate pulls in a second one. Walk the root's own dependency edges. A
+    // package is identified by name, version, and source together, so two packages that
+    // share a name and version across sources each contribute their own subtree.
+    // commentlint: allow(JUDGE)
+    fn reachable_dependencies(
+        lock: &str,
+        root_manifest: &str,
+        root: &str,
+    ) -> std::collections::BTreeMap<String, std::collections::BTreeSet<PackageIdentity>> {
+        let lock: toml::Table = lock.parse().expect("Cargo.lock parses as TOML");
+        let packages = lock["package"].as_array().expect("lock packages");
+        let identity = |package: &toml::Value| {
+            (
+                package["name"].as_str().expect("package name").to_owned(),
+                package["version"]
+                    .as_str()
+                    .expect("package version")
+                    .to_owned(),
+                package
+                    .get("source")
+                    .and_then(toml::Value::as_str)
+                    .map(str::to_owned),
+            )
+        };
+        let entry = |name: &str, version: Option<&str>, source: Option<&str>| {
+            let mut matches = packages.iter().filter(|package| {
+                package["name"].as_str() == Some(name)
+                    && version.is_none_or(|version| package["version"].as_str() == Some(version))
+                    && source.is_none_or(|source| {
+                        package.get("source").and_then(toml::Value::as_str) == Some(source)
+                    })
+            });
+            let found = matches
+                .next()
+                .unwrap_or_else(|| panic!("{name} {version:?} {source:?} missing from Cargo.lock"));
+            assert!(
+                matches.next().is_none(),
+                "{name} {version:?} {source:?} is ambiguous in Cargo.lock"
+            );
+            found
+        };
+        // Cargo writes `name`, adds the version when the lock holds several of that
+        // name, and adds `(source)` when it holds several of that name and version.
+        // commentlint: allow(JUDGE)
+        fn split_id(dependency: &str) -> (&str, Option<&str>, Option<&str>) {
+            let mut fields = dependency.splitn(3, ' ');
+            let name = fields.next().expect("dependency name");
+            let version = fields.next();
+            let source = fields.next().map(|source| {
+                source
+                    .strip_prefix('(')
+                    .and_then(|source| source.strip_suffix(')'))
+                    .unwrap_or_else(|| panic!("unparseable dependency source in {dependency:?}"))
+            });
+            (name, version, source)
+        }
+        // The lock records one resolve covering every target and feature selection, so
+        // this walk over-approximates the tested build. The root's dev-only edges are the
+        // part that can be excluded exactly, since nothing behind them links into the
+        // sealed bytes; dropping them takes this crate from 56 reachable packages to 39
+        // and removes the only name the lock resolves at two versions.
+        // commentlint: allow(JUDGE)
+        let manifest: toml::Table = root_manifest.parse().expect("root manifest parses");
+        let names = |table: &str| -> std::collections::BTreeSet<String> {
+            manifest
+                .get(table)
+                .and_then(toml::Value::as_table)
+                .map(|table| table.keys().cloned().collect())
+                .unwrap_or_default()
+        };
+        let linked = names("dependencies");
+        let dev_only: std::collections::BTreeSet<String> = names("dev-dependencies")
+            .difference(&linked)
+            .cloned()
+            .collect();
+
+        let mut visited = std::collections::BTreeSet::new();
+        let mut reachable: std::collections::BTreeMap<
+            String,
+            std::collections::BTreeSet<PackageIdentity>,
+        > = std::collections::BTreeMap::new();
+        let mut queue = vec![(entry(root, None, None), true)];
+        while let Some((package, is_root)) = queue.pop() {
+            let (name, version, source) = identity(package);
+            if !visited.insert((name.clone(), version.clone(), source.clone())) {
+                continue;
+            }
+            reachable.entry(name).or_default().insert((version, source));
+            let Some(dependencies) = package.get("dependencies") else {
+                continue;
+            };
+            for dependency in dependencies.as_array().expect("dependency list") {
+                let (name, version, source) = split_id(dependency.as_str().expect("dependency"));
+                if is_root && dev_only.contains(name) {
+                    continue;
+                }
+                queue.push((entry(name, version, source), false));
+            }
+        }
+        reachable
+    }
+
+    #[test]
+    fn a_dependency_reached_through_two_sources_is_not_collapsed() {
+        // `left` and `right` share a name and version across sources, so a visited check
+        // keyed on name and version alone drops one subtree and hides its `hpke`.
+        // commentlint: allow(JUDGE)
+        let lock = r#"
+version = 4
+
+[[package]]
+name = "root"
+version = "0.1.0"
+dependencies = ["shared 1.0.0 (registry+https://example.com/r)", "shared 1.0.0 (git+https://example.com/s)"]
+
+[[package]]
+name = "shared"
+version = "1.0.0"
+source = "registry+https://example.com/r"
+dependencies = ["hpke 0.14.0"]
+
+[[package]]
+name = "shared"
+version = "1.0.0"
+source = "git+https://example.com/s"
+dependencies = ["hpke 0.15.0"]
+
+[[package]]
+name = "hpke"
+version = "0.14.0"
+source = "registry+https://example.com/r"
+
+[[package]]
+name = "hpke"
+version = "0.15.0"
+source = "registry+https://example.com/r"
+"#;
+        let reachable = reachable_dependencies(lock, "[package]\nname = \"root\"\n", "root");
+        let shared = &reachable["shared"];
+        assert_eq!(shared.len(), 2, "both sources must be visited: {shared:?}");
+        let hpke: Vec<&str> = reachable["hpke"]
+            .iter()
+            .map(|(version, _)| version.as_str())
+            .collect();
+        assert_eq!(hpke, ["0.14.0", "0.15.0"], "a subtree was skipped");
+    }
+
+    #[test]
+    fn root_dev_only_edges_are_not_traversed() {
+        // `shared` is both a dependency and a dev-dependency, so it stays; `harness` is
+        // dev-only, and the second `hpke` behind it must not appear.
+        // commentlint: allow(JUDGE)
+        let manifest = r#"
+[package]
+name = "root"
+
+[dependencies]
+shared = "1"
+
+[dev-dependencies]
+shared = "1"
+harness = "1"
+"#;
+        let lock = r#"
+version = 4
+
+[[package]]
+name = "root"
+version = "0.1.0"
+dependencies = ["harness", "shared"]
+
+[[package]]
+name = "shared"
+version = "1.0.0"
+dependencies = ["hpke 0.14.0"]
+
+[[package]]
+name = "harness"
+version = "1.0.0"
+dependencies = ["hpke 0.15.0"]
+
+[[package]]
+name = "hpke"
+version = "0.14.0"
+
+[[package]]
+name = "hpke"
+version = "0.15.0"
+"#;
+        let reachable = reachable_dependencies(lock, manifest, "root");
+        let hpke: Vec<&str> = reachable["hpke"]
+            .iter()
+            .map(|(version, _)| version.as_str())
+            .collect();
+        assert_eq!(hpke, ["0.14.0"], "a dev-only edge was traversed");
+        assert!(
+            reachable.contains_key("shared"),
+            "a linked edge was dropped"
+        );
+        assert!(
+            !reachable.contains_key("harness"),
+            "a dev-only edge was traversed"
+        );
+    }
+
     #[test]
     fn wire_v1_fixture_matches_local_bytes_and_classifications() {
         let fixture: Value = serde_json::from_str(WIRE_V1_FIXTURE).expect("parse wire fixture");
@@ -278,6 +487,35 @@ mod tests {
         );
         assert_eq!(open(&sk, &envelope).expect("fixture opens"), plaintext);
 
+        let reachable = reachable_dependencies(
+            include_str!("../../../Cargo.lock"),
+            include_str!("../Cargo.toml"),
+            "cortexkit-push-seal",
+        );
+        let recorded_dependencies = fixture["build_identity"]["dependencies"]
+            .as_object()
+            .expect("recorded dependencies");
+        assert!(!recorded_dependencies.is_empty());
+        for (name, recorded) in recorded_dependencies {
+            let resolved = reachable
+                .get(name.as_str())
+                .unwrap_or_else(|| panic!("{name} is not a dependency of this crate"));
+            assert_eq!(
+                resolved.len(),
+                1,
+                "this crate reaches several {name} packages: {resolved:?}; \
+                 build_identity records one. The lock graph covers every target and \
+                 feature selection, so confirm an active edge reaches each before \
+                 changing the fixture"
+            );
+            let (version, _source) = resolved.iter().next().expect("resolved package");
+            assert_eq!(
+                recorded.as_str().expect("recorded dependency version"),
+                version,
+                "fixture build_identity.dependencies.{name} must match Cargo.lock"
+            );
+        }
+
         let cases = fixture["expected"]["classifications"]
             .as_array()
             .expect("classification cases");
@@ -288,27 +526,54 @@ mod tests {
             "authentication failure",
         ];
         assert_eq!(cases.len(), expected_cases.len(), "classification count");
+        let mut covered = std::collections::BTreeSet::new();
         for (case, expected_name) in cases.iter().zip(expected_cases) {
-            assert_eq!(case["name"], expected_name);
+            let name = case["name"].as_str().expect("case name");
+            assert_eq!(name, expected_name);
             let key = hex::decode(
                 case["recipient_private_key_hex"]
                     .as_str()
                     .expect("case key"),
             )
             .expect("valid case key");
-            let envelope = hex::decode(case["envelope_hex"].as_str().expect("case envelope"))
+            let case_envelope = hex::decode(case["envelope_hex"].as_str().expect("case envelope"))
                 .expect("valid case envelope");
-            let error = open(&key, &envelope).expect_err("classification must fail");
+            // Anchoring each case to the verified seal keeps a fixture
+            // regeneration from detaching a case from the envelope it claims
+            // to mutate.
+            match name {
+                "short envelope" => {
+                    assert!(key.is_empty(), "case {name}");
+                    assert!(case_envelope.is_empty(), "case {name}");
+                }
+                "unsupported version" => {
+                    let mut expected_envelope = envelope.clone();
+                    expected_envelope[0] = 0x02;
+                    assert_eq!(case_envelope, expected_envelope, "case {name}");
+                }
+                "bad recipient key" => {
+                    assert!(key.is_empty(), "case {name}");
+                    assert_eq!(case_envelope, envelope, "case {name}");
+                }
+                "authentication failure" => {
+                    assert_eq!(key, sk, "case {name}");
+                    let mut tampered = envelope.clone();
+                    *tampered.last_mut().expect("nonempty envelope") ^= 0x01;
+                    assert_eq!(case_envelope, tampered, "case {name}");
+                }
+                other => panic!("unanchored classification case {other}"),
+            }
+            let error = open(&key, &case_envelope).expect_err("classification must fail");
             if let Some(expected) = case["observed"].as_u64() {
                 match &error {
                     OpenError::Malformed { observed } => {
-                        assert_eq!(*observed as u64, expected, "case {}", case["name"]);
+                        assert_eq!(*observed as u64, expected, "case {name}");
                     }
                     OpenError::UnknownVersion { observed } => {
-                        assert_eq!(*observed as u64, expected, "case {}", case["name"]);
+                        assert_eq!(*observed as u64, expected, "case {name}");
                     }
                     OpenError::BadRecipientKey | OpenError::Aead => {
-                        panic!("case {} has an inapplicable observed field", case["name"]);
+                        panic!("case {name} has an inapplicable observed field");
                     }
                 }
             }
@@ -318,14 +583,21 @@ mod tests {
                 OpenError::BadRecipientKey => "BadRecipientKey",
                 OpenError::Aead => "Aead",
             };
-            assert_eq!(classification, case["error"], "case {}", case["name"]);
+            covered.insert(classification);
+            assert_eq!(classification, case["error"], "case {name}");
             assert_eq!(
                 error.wire_code(),
                 case["wire_code"].as_str().expect("case wire code"),
-                "case {}",
-                case["name"]
+                "case {name}",
             );
         }
+        assert_eq!(
+            covered,
+            ["Aead", "BadRecipientKey", "Malformed", "UnknownVersion"]
+                .into_iter()
+                .collect(),
+            "fixture must represent every public OpenError classification"
+        );
     }
 
     #[test]
@@ -393,6 +665,17 @@ mod tests {
     #[test]
     fn each_seal_uses_a_fresh_ephemeral() {
         let (_, pk) = keypair();
+
+        // A `seal_with_rng` draw cannot observe which RNG `seal` selects.
+        // Matching 32-byte encapsulated keys is negligibly likely.
+        let ambient_a = seal(&pk, b"same").expect("first ambient seal");
+        let ambient_b = seal(&pk, b"same").expect("second ambient seal");
+        assert_ne!(
+            ambient_a[1..1 + ENC_LEN],
+            ambient_b[1..1 + ENC_LEN],
+            "the ambient RNG must not repeat the encapsulated key"
+        );
+
         let mut fresh = RecordingRng {
             next: 1,
             repeat: false,
@@ -455,6 +738,19 @@ mod tests {
             open(&[], &short),
             Err(OpenError::Malformed { observed: 32 }),
             "length must win before version and key parsing"
+        );
+
+        // 33 bytes is the smallest envelope with a valid version and encapsulated key but no ciphertext.
+        let empty_ciphertext = &sealed[..33];
+        assert_eq!(
+            open(&sk, empty_ciphertext),
+            Err(OpenError::Aead),
+            "the minimum-length envelope must clear the length gate"
+        );
+        assert_eq!(
+            open(&sk, empty_ciphertext).unwrap_err().wire_code(),
+            "malformed",
+            "an empty ciphertext reports as an unusable envelope"
         );
 
         for version in u8::MIN..=u8::MAX {
@@ -585,7 +881,12 @@ mod tests {
             } else if len % 2 == 0 {
                 envelope[0] = VERSION.wrapping_add(1);
                 reached[1] += 1;
-                (&[][..], OpenError::UnknownVersion { observed: 2 })
+                (
+                    &[][..],
+                    OpenError::UnknownVersion {
+                        observed: VERSION.wrapping_add(1),
+                    },
+                )
             } else {
                 envelope[0] = VERSION;
                 reached[2] += 1;

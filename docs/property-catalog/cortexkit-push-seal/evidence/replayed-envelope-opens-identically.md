@@ -2,7 +2,7 @@
 
 - Discovery lenses: idempotency and replay, state and persistence.
 - Trigger: the crate adds no framing field for a message identifier, counter, timestamp, or expiry and has no consumed-state store. Arbitrary encrypted plaintext may contain such metadata.
-- Code trail: layout at `src/lib.rs:97-102,126-130`; stateless `open` at `:161-188`.
+- Code trail: `seal` documents the layout and `seal_with_rng` assembles `version || enc || ciphertext`; `open` holds no state across calls.
 - Implemented mechanism: pure deterministic open over private-key and envelope bytes.
 - Failure scenario: transport duplicates or delays a valid notification and no payload or device layer rejects stale content.
 - Timing/configuration: duplicate delivery and arbitrary delay are the relevant conditions.

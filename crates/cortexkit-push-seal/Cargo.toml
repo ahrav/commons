@@ -12,9 +12,17 @@ description = "Seals push-notification payloads with HPKE so only the recipient 
 publish = false
 
 [dependencies]
-getrandom = { version = "=0.4.3", default-features = false, features = ["sys_rng"] }
-hpke = { version = "=0.14.0", default-features = false, features = ["alloc", "getrandom", "x25519", "chacha"] }
+getrandom = { version = "0.4", default-features = false, features = ["sys_rng"] }
+# `single_shot_seal_with_rng` and `single_shot_open` are `alloc`-gated in hpke
+# 0.14, so the library builds without hpke's `getrandom` feature.
+# commentlint: allow(JUDGE)
+hpke = { version = "0.14", default-features = false, features = ["alloc", "x25519", "chacha"] }
 
 [dev-dependencies]
 hex = "0.4"
+# `gen_keypair` sits behind hpke's `getrandom` feature. Only tests and examples
+# call it.
+# commentlint: allow(JUDGE)
+hpke = { version = "0.14", default-features = false, features = ["getrandom"] }
 serde_json = "1"
+toml = { version = "1.1.4", default-features = false, features = ["parse", "serde", "std"] }
