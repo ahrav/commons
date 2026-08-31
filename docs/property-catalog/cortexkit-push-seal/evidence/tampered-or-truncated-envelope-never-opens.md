@@ -2,7 +2,7 @@
 
 - Discovery lenses: data integrity, failure recovery, security boundaries.
 - Trigger: docs state truncation cannot yield a plaintext fragment and AAD binds the cleartext version.
-- Code trail: truncation rationale at `src/lib.rs:65-70`; length gate at `:162-166`; AEAD open at `:175-187`; campaigns at `:334-418`; precedence and version sweep at `:284-331`.
+- Code trail: the `SealError::PlaintextTooLarge` docs carry the truncation rationale; `open` gates on minimum length before the authenticated open; `every_proper_prefix_of_a_valid_envelope_is_rejected` and `single_bit_mutations_have_field_specific_outcomes` run the campaigns, and `open_error_precedence_is_stable` runs the version sweep.
 - Implemented mechanism: inputs below 33 bytes fail structurally; longer corrupt inputs fail version or AEAD authentication except with negligible forgery probability under the primitive's security assumptions. HPKE binds the serialized encapsulated key into the KEM context, so even an X25519 DH-equivalent masked-bit mutation changes authentication keys.
 - Failure scenario: short read, partial write, field mutation, or tag mutation produces accepted bytes.
 - Timing/configuration: no timing dependence. Every envelope field and every proper-prefix length is relevant.

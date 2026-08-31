@@ -291,6 +291,17 @@ mod tests {
     #[test]
     fn each_seal_uses_a_fresh_ephemeral() {
         let (_, pk) = keypair();
+
+        // A `seal_with_rng` draw cannot observe which RNG `seal` selects.
+        // Matching 32-byte encapsulated keys is negligibly likely.
+        let ambient_a = seal(&pk, b"same").expect("first ambient seal");
+        let ambient_b = seal(&pk, b"same").expect("second ambient seal");
+        assert_ne!(
+            ambient_a[1..1 + ENC_LEN],
+            ambient_b[1..1 + ENC_LEN],
+            "the ambient RNG must not repeat the encapsulated key"
+        );
+
         let mut fresh = RecordingRng {
             next: 1,
             repeat: false,

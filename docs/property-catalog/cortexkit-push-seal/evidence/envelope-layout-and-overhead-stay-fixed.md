@@ -2,7 +2,7 @@
 
 - Discovery lenses: architecture, data integrity, protocol contracts, version compatibility.
 - Trigger: layout is a cross-repository byte contract and `open` hardcodes a split offset.
-- Code trail: `ENC_LEN`, assembly, and parsing in [`src/lib.rs`](../../../../crates/cortexkit-push-seal/src/lib.rs); [`the_envelope_has_version_one_and_fixed_overhead`](../../../../crates/cortexkit-push-seal/src/lib.rs#L228).
+- Code trail: `ENC_LEN`, assembly, and parsing in [`src/lib.rs`](../../../../crates/cortexkit-push-seal/src/lib.rs); [`the_envelope_has_version_one_and_fixed_overhead`](../../../../crates/cortexkit-push-seal/src/lib.rs).
 - Implemented mechanism: one version byte, serialized X25519 encapsulated key, then ChaCha20-Poly1305 ciphertext and tag.
 - Failure scenario: field reorder, changed KEM size, changed tag size, or stale `ENC_LEN` would cause the separately documented opener to reject envelopes if it retains the old contract.
 - Timing/configuration: no timing dependence. Boundary plaintext lengths matter for size arithmetic.
