@@ -225,6 +225,133 @@ mod tests {
         assert_eq!(ChaCha20Poly1305::AEAD_ID, 0x0003, "AEAD codepoint");
     }
 
+    type PackageIdentity = (String, Option<String>);
+
+    // Resolving a name against the whole lock file picks whichever `[[package]]` sorts
+    // first, which is a different version than the root builds against as soon as any
+    // workspace crate pulls in a second one. Walk the root's own dependency edges. A
+    // package is identified by name, version, and source together, so two packages that
+    // share a name and version across sources each contribute their own subtree.
+    // commentlint: allow(JUDGE)
+    fn reachable_dependencies(
+        lock: &str,
+        root: &str,
+    ) -> std::collections::BTreeMap<String, std::collections::BTreeSet<PackageIdentity>> {
+        let lock: toml::Table = lock.parse().expect("Cargo.lock parses as TOML");
+        let packages = lock["package"].as_array().expect("lock packages");
+        let identity = |package: &toml::Value| {
+            (
+                package["name"].as_str().expect("package name").to_owned(),
+                package["version"]
+                    .as_str()
+                    .expect("package version")
+                    .to_owned(),
+                package
+                    .get("source")
+                    .and_then(toml::Value::as_str)
+                    .map(str::to_owned),
+            )
+        };
+        let entry = |name: &str, version: Option<&str>, source: Option<&str>| {
+            let mut matches = packages.iter().filter(|package| {
+                package["name"].as_str() == Some(name)
+                    && version.is_none_or(|version| package["version"].as_str() == Some(version))
+                    && source.is_none_or(|source| {
+                        package.get("source").and_then(toml::Value::as_str) == Some(source)
+                    })
+            });
+            let found = matches
+                .next()
+                .unwrap_or_else(|| panic!("{name} {version:?} {source:?} missing from Cargo.lock"));
+            assert!(
+                matches.next().is_none(),
+                "{name} {version:?} {source:?} is ambiguous in Cargo.lock"
+            );
+            found
+        };
+        // Cargo writes `name`, adds the version when the lock holds several of that
+        // name, and adds `(source)` when it holds several of that name and version.
+        // commentlint: allow(JUDGE)
+        fn split_id(dependency: &str) -> (&str, Option<&str>, Option<&str>) {
+            let mut fields = dependency.splitn(3, ' ');
+            let name = fields.next().expect("dependency name");
+            let version = fields.next();
+            let source = fields.next().map(|source| {
+                source
+                    .strip_prefix('(')
+                    .and_then(|source| source.strip_suffix(')'))
+                    .unwrap_or_else(|| panic!("unparseable dependency source in {dependency:?}"))
+            });
+            (name, version, source)
+        }
+        let mut visited = std::collections::BTreeSet::new();
+        let mut reachable: std::collections::BTreeMap<
+            String,
+            std::collections::BTreeSet<PackageIdentity>,
+        > = std::collections::BTreeMap::new();
+        let mut queue = vec![entry(root, None, None)];
+        while let Some(package) = queue.pop() {
+            let (name, version, source) = identity(package);
+            if !visited.insert((name.clone(), version.clone(), source.clone())) {
+                continue;
+            }
+            reachable.entry(name).or_default().insert((version, source));
+            let Some(dependencies) = package.get("dependencies") else {
+                continue;
+            };
+            for dependency in dependencies.as_array().expect("dependency list") {
+                let (name, version, source) = split_id(dependency.as_str().expect("dependency"));
+                queue.push(entry(name, version, source));
+            }
+        }
+        reachable
+    }
+
+    #[test]
+    fn a_dependency_reached_through_two_sources_is_not_collapsed() {
+        // `left` and `right` share a name and version across sources, so a visited check
+        // keyed on name and version alone drops one subtree and hides its `hpke`.
+        // commentlint: allow(JUDGE)
+        let lock = r#"
+version = 4
+
+[[package]]
+name = "root"
+version = "0.1.0"
+dependencies = ["shared 1.0.0 (registry+https://example.com/r)", "shared 1.0.0 (git+https://example.com/s)"]
+
+[[package]]
+name = "shared"
+version = "1.0.0"
+source = "registry+https://example.com/r"
+dependencies = ["hpke 0.14.0"]
+
+[[package]]
+name = "shared"
+version = "1.0.0"
+source = "git+https://example.com/s"
+dependencies = ["hpke 0.15.0"]
+
+[[package]]
+name = "hpke"
+version = "0.14.0"
+source = "registry+https://example.com/r"
+
+[[package]]
+name = "hpke"
+version = "0.15.0"
+source = "registry+https://example.com/r"
+"#;
+        let reachable = reachable_dependencies(lock, "root");
+        let shared = &reachable["shared"];
+        assert_eq!(shared.len(), 2, "both sources must be visited: {shared:?}");
+        let hpke: Vec<&str> = reachable["hpke"]
+            .iter()
+            .map(|(version, _)| version.as_str())
+            .collect();
+        assert_eq!(hpke, ["0.14.0", "0.15.0"], "a subtree was skipped");
+    }
+
     #[test]
     fn wire_v1_fixture_matches_local_bytes_and_classifications() {
         let fixture: Value = serde_json::from_str(WIRE_V1_FIXTURE).expect("parse wire fixture");
@@ -277,65 +404,8 @@ mod tests {
         );
         assert_eq!(open(&sk, &envelope).expect("fixture opens"), plaintext);
 
-        // Resolving a name against the whole lock file picks whichever `[[package]]`
-        // sorts first, which is a different version than this crate builds against as
-        // soon as any workspace crate pulls in a second one. Walk this crate's own
-        // dependency edges instead.
-        // commentlint: allow(JUDGE)
-        let lock: toml::Table = include_str!("../../../Cargo.lock")
-            .parse()
-            .expect("Cargo.lock parses as TOML");
-        let packages = lock["package"].as_array().expect("lock packages");
-        let entry = |name: &str, version: Option<&str>, source: Option<&str>| {
-            let mut matches = packages.iter().filter(|package| {
-                package["name"].as_str() == Some(name)
-                    && version.is_none_or(|version| package["version"].as_str() == Some(version))
-                    && source.is_none_or(|source| {
-                        package.get("source").and_then(toml::Value::as_str) == Some(source)
-                    })
-            });
-            let found = matches
-                .next()
-                .unwrap_or_else(|| panic!("{name} {version:?} {source:?} missing from Cargo.lock"));
-            assert!(
-                matches.next().is_none(),
-                "{name} {version:?} {source:?} is ambiguous in Cargo.lock"
-            );
-            found
-        };
-        // Cargo writes `name`, adds the version when the lock holds several of that
-        // name, and adds `(source)` when it holds several of that name and version.
-        // commentlint: allow(JUDGE)
-        fn split_id(dependency: &str) -> (&str, Option<&str>, Option<&str>) {
-            let mut fields = dependency.splitn(3, ' ');
-            let name = fields.next().expect("dependency name");
-            let version = fields.next();
-            let source = fields.next().map(|source| {
-                source
-                    .strip_prefix('(')
-                    .and_then(|source| source.strip_suffix(')'))
-                    .unwrap_or_else(|| panic!("unparseable dependency source in {dependency:?}"))
-            });
-            (name, version, source)
-        }
-        let mut reachable: std::collections::BTreeMap<&str, std::collections::BTreeSet<&str>> =
-            std::collections::BTreeMap::new();
-        let root = entry("cortexkit-push-seal", None, None);
-        let mut queue = vec![root];
-        while let Some(package) = queue.pop() {
-            let name = package["name"].as_str().expect("package name");
-            let version = package["version"].as_str().expect("package version");
-            if !reachable.entry(name).or_default().insert(version) {
-                continue;
-            }
-            let Some(dependencies) = package.get("dependencies") else {
-                continue;
-            };
-            for dependency in dependencies.as_array().expect("dependency list") {
-                let (name, version, source) = split_id(dependency.as_str().expect("dependency"));
-                queue.push(entry(name, version, source));
-            }
-        }
+        let reachable =
+            reachable_dependencies(include_str!("../../../Cargo.lock"), "cortexkit-push-seal");
         let recorded_dependencies = fixture["build_identity"]["dependencies"]
             .as_object()
             .expect("recorded dependencies");
@@ -347,12 +417,13 @@ mod tests {
             assert_eq!(
                 resolved.len(),
                 1,
-                "this crate reaches several versions of {name}: {resolved:?}; \
+                "this crate reaches several {name} packages: {resolved:?}; \
                  build_identity records one"
             );
+            let (version, _source) = resolved.iter().next().expect("resolved package");
             assert_eq!(
                 recorded.as_str().expect("recorded dependency version"),
-                *resolved.iter().next().expect("resolved version"),
+                version,
                 "fixture build_identity.dependencies.{name} must match Cargo.lock"
             );
         }
