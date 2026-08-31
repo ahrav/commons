@@ -245,7 +245,6 @@ mod tests {
     // workspace crate pulls in a second one. Walk the root's own dependency edges. A
     // package is identified by name, version, and source together, so two packages that
     // share a name and version across sources each contribute their own subtree.
-    // commentlint: allow(JUDGE)
     fn reachable_dependencies(
         lock: &str,
         root_manifest: &str,
@@ -285,7 +284,6 @@ mod tests {
         };
         // Cargo writes `name`, adds the version when the lock holds several of that
         // name, and adds `(source)` when it holds several of that name and version.
-        // commentlint: allow(JUDGE)
         fn split_id(dependency: &str) -> (&str, Option<&str>, Option<&str>) {
             let mut fields = dependency.splitn(3, ' ');
             let name = fields.next().expect("dependency name");
@@ -303,7 +301,6 @@ mod tests {
         // part that can be excluded exactly, since nothing behind them links into the
         // sealed bytes; dropping them takes this crate from 56 reachable packages to 39
         // and removes the only name the lock resolves at two versions.
-        // commentlint: allow(JUDGE)
         let manifest: toml::Table = root_manifest.parse().expect("root manifest parses");
         let names = |table: &str| -> std::collections::BTreeSet<String> {
             manifest
@@ -348,7 +345,6 @@ mod tests {
     fn a_dependency_reached_through_two_sources_is_not_collapsed() {
         // `left` and `right` share a name and version across sources, so a visited check
         // keyed on name and version alone drops one subtree and hides its `hpke`.
-        // commentlint: allow(JUDGE)
         let lock = r#"
 version = 4
 
@@ -393,7 +389,6 @@ source = "registry+https://example.com/r"
     fn root_dev_only_edges_are_not_traversed() {
         // `shared` is both a dependency and a dev-dependency, so it stays; `harness` is
         // dev-only, and the second `hpke` behind it must not appear.
-        // commentlint: allow(JUDGE)
         let manifest = r#"
 [package]
 name = "root"

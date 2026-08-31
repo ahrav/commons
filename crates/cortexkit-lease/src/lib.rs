@@ -1,16 +1,10 @@
-//! The single-writer lease for CortexKit modules. // commentlint: allow(JUDGE)
 //!
 //! A module that owns a database must never have two live writers on the same
-//! logical store. Acquisition fails when another live holder owns the key. // commentlint: allow(JUDGE)
 //!
-//! Two layers provide the contract: // commentlint: allow(JUDGE)
 //! - **Liveness** comes from the OS advisory lock in the file implementation. The
-//!   kernel releases it when its owning process exits. // commentlint: allow(JUDGE)
 //! - **Fencing** comes from the nondecreasing `epoch` stored in the
-//!   lease file. Backends that accept durable writes must reject stale epochs. // commentlint: allow(JUDGE)
 //!
 //! [`LeaseStore`] returns boxed [`LeaseHandle`] values for implementation-neutral
-//! callers. // commentlint: allow(JUDGE)
 //!
 //! ## Key namespacing
 //!
@@ -59,9 +53,7 @@ pub fn protect_file(path: &std::path::Path) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Identifies one storage scope within a lease directory. // commentlint: allow(JUDGE)
 ///
-/// `module_id`, `backend`, and `scope_key` all participate in the lock identity. // commentlint: allow(JUDGE)
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LeaseKey {
     pub module_id: String,
@@ -82,9 +74,7 @@ impl LeaseKey {
         }
     }
 
-    /// Returns the delimiter-separated identity used for lock derivation. // commentlint: allow(JUDGE)
     ///
-    /// Changing this format changes the lock-file mapping for existing keys. // commentlint: allow(JUDGE)
     pub fn identity(&self) -> String {
         format!(
             "{}\u{1f}{}\u{1f}{}",
@@ -93,24 +83,20 @@ impl LeaseKey {
     }
 }
 
-/// Represents a held lease and releases its lock when dropped. // commentlint: allow(JUDGE)
 ///
 /// Exclusive handles expose a writer epoch. Shared handles expose the last
-/// persisted epoch for observation and must not use it as a write fence. // commentlint: allow(JUDGE)
 pub trait LeaseHandle: Send + Sync + std::fmt::Debug {
-    /// Returns the epoch observed when this handle was acquired. // commentlint: allow(JUDGE)
     fn epoch(&self) -> u64;
 
-    /// Returns the identity guarded by this handle. // commentlint: allow(JUDGE)
     fn key(&self) -> &LeaseKey;
 }
 
-/// Reports lease contention or an I/O failure during acquisition. // commentlint: allow(JUDGE)
 #[derive(Debug)]
 pub enum LeaseError {
     /// A live writer already holds the lease for this key.
-    Held { key: LeaseKey },
-    /// An I/O operation failed. // commentlint: allow(JUDGE)
+    Held {
+        key: LeaseKey,
+    },
     Io(std::io::Error),
 }
 
@@ -129,12 +115,9 @@ impl std::fmt::Display for LeaseError {
 
 impl std::error::Error for LeaseError {}
 
-/// Acquires a single-writer lease for a [`LeaseKey`]. // commentlint: allow(JUDGE)
 pub trait LeaseStore: Send + Sync {
-    /// Acquires an exclusive lease or returns `Held` while another holder owns it. // commentlint: allow(JUDGE)
     fn acquire(&self, key: &LeaseKey) -> Result<Box<dyn LeaseHandle>, LeaseError>;
 
-    /// Acquires a shared lease. Shared holders coexist; an exclusive holder blocks acquisition. // commentlint: allow(JUDGE)
     /// A shared holder blocks [`LeaseStore::acquire`] (exclusive).
     ///
     /// Use for reader-side protection of shared resources: e.g. a model-cache
@@ -150,7 +133,6 @@ pub trait LeaseStore: Send + Sync {
     fn acquire_shared(&self, key: &LeaseKey) -> Result<Box<dyn LeaseHandle>, LeaseError>;
 }
 
-/// Stores one OS advisory lock file per key under `base_dir`. // commentlint: allow(JUDGE)
 pub struct FileLeaseStore {
     base_dir: PathBuf,
 }
@@ -162,7 +144,6 @@ impl FileLeaseStore {
         }
     }
 
-    /// Returns the deterministic lock-file path derived from the namespaced identity. // commentlint: allow(JUDGE)
     fn lease_path(&self, key: &LeaseKey) -> PathBuf {
         self.base_dir
             .join(format!("{}.lease", fnv1a_hex(&key.identity())))
@@ -272,7 +253,6 @@ impl LeaseStore for FileLeaseStore {
     }
 }
 
-/// Reads the epoch without modifying the file. Malformed or empty contents yield `0`. // commentlint: allow(JUDGE)
 /// Callers hold a shared lock while reading.
 fn read_epoch(file: &mut File) -> std::io::Result<u64> {
     let mut buf = String::new();

@@ -6,7 +6,6 @@ const FIXTURE_PATH: &str = "crates/cortexkit-push-seal/tests/golden/push-seal-wi
 const MANIFEST_PATH: &str = "crates/cortexkit-push-seal/Cargo.toml";
 
 // Parse TOML keys because quoted keys and escapes can encode `version`.
-// commentlint: allow(JUDGE)
 fn package_version(manifest: &str) -> Result<String, String> {
     let document: toml::Table = manifest
         .parse()
@@ -20,7 +19,6 @@ fn package_version(manifest: &str) -> Result<String, String> {
     // Resolving `version.workspace = true` needs the root manifest at the same revision,
     // which this gate does not read. Name the configuration instead of reporting a
     // missing version.
-    // commentlint: allow(JUDGE)
     if version.get("workspace").and_then(toml::Value::as_bool) == Some(true) {
         return Err(
             "[package] version is inherited from the workspace, which this gate does not \
@@ -35,7 +33,6 @@ fn package_version(manifest: &str) -> Result<String, String> {
 }
 
 // Keep numeric identifiers as digit strings because SemVer does not bound their width.
-// commentlint: allow(JUDGE)
 #[derive(Debug, PartialEq, Eq)]
 enum Identifier {
     Numeric(String),
@@ -93,7 +90,6 @@ impl PartialOrd for Version {
 
 // Drop build metadata before comparison because it does not affect SemVer precedence.
 // Reject unparseable versions so an unknown spelling cannot let a wire change pass.
-// commentlint: allow(JUDGE)
 fn parse_version(version: &str) -> Result<Version, String> {
     let without_build = version.split('+').next().unwrap_or(version);
     let (core, prerelease) = match without_build.split_once('-') {
@@ -126,7 +122,6 @@ fn parse_version(version: &str) -> Result<Version, String> {
 
 // An empty or leading-zero identifier is not a version Cargo accepts, so it is reported
 // rather than ordered under a guess.
-// commentlint: allow(JUDGE)
 fn identifier_of(version: &str, identifier: &str) -> Result<Identifier, String> {
     if identifier.is_empty() {
         return Err(format!(
@@ -187,7 +182,6 @@ fn at<'a>(fixture: Option<&'a str>, manifest: &'a str) -> Revision<'a> {
 // A prior constrains the head only when their represented wire surfaces differ.
 // A missing fixture predates the surface; an equal surface describes the same bytes.
 // The merge base detects branch changes; the base tip prevents version reuse.
-// commentlint: allow(JUDGE)
 fn check_version_gate(
     priors: &[Revision],
     head_fixture: &str,
@@ -756,7 +750,6 @@ fn actual_git_diff_requires_version_bump() {
     // branch changed the surface at all, and the base tip answers whether the version is
     // already taken there. A revision without the fixture predates it and constrains
     // nothing, so its manifest is never read.
-    // commentlint: allow(JUDGE)
     let merge_base = git(&["merge-base", &base, &head])
         .unwrap_or_else(|error| panic!("no merge base between {base} and {head}: {error}"));
     let merge_base = merge_base.trim();
