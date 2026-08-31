@@ -70,12 +70,17 @@ No production `assert!`, `debug_assert!`, or equivalent invariant assertion was 
 | `synthetic_version_gate_cases` and `actual_git_diff_requires_version_bump`, `tests/version_gate.rs` | Exercise fixture/version policy in memory and compare explicitly named Git revisions only when both event SHAs are present. | audited for represented fixture changes; unrepresented behavior remains unaudited |
 | [`a_sealed_payload_opens_to_the_same_plaintext`](../../../crates/cortexkit-push-seal/src/lib.rs) | Exact byte round trips at lengths 0, 2047, and 2048 with non-UTF-8 fixtures. | audited for these local boundaries |
 | [`the_envelope_has_version_one_and_fixed_overhead`](../../../crates/cortexkit-push-seal/src/lib.rs) | Pins literal version 1, 32-byte encapsulation, 49-byte overhead, and 2097-byte maximum at lengths 0, 1, and 2048. | audited for the leading version and local size literals |
-| `each_seal_uses_a_fresh_ephemeral`, `:232-242` | Two sequential seals must have different `enc`; message: `encapsulated key must not repeat across messages`. | unaudited |
+| [`each_seal_uses_a_fresh_ephemeral`](../../../crates/cortexkit-push-seal/src/lib.rs) | Records one 32-byte draw per seal; distinct draws produce distinct `enc`, and repeated draws repeat it. | audited for local draw/context behavior |
 | [`an_oversized_plaintext_is_refused_with_both_numbers`](../../../crates/cortexkit-push-seal/src/lib.rs) | Invalid key plus length 2049 returns literal cap fields; a matching-key 2048-byte round trip is the positive control. | audited for the local cap boundary and guard order |
 | [`open_error_precedence_is_stable`](../../../crates/cortexkit-push-seal/src/lib.rs) | Multi-defect inputs pin length, every unsupported version byte, private-key parsing, and authenticated-open order with exact variants and a valid control. | audited for local precedence |
 | [`every_open_failure_maps_to_the_wire_vocabulary`](../../../crates/cortexkit-push-seal/src/lib.rs) | A finite table pins both literals for every `OpenError` variant, including `BadRecipientKey`. | audited for the local enum mapping |
 | [`the_wrong_recipient_cannot_open`](../../../crates/cortexkit-push-seal/src/lib.rs) | Asserts generated public keys differ before the second private key returns `Aead`. | audited for the sampled local keypairs |
-| `the_version_byte_is_authenticated_not_merely_present`, `:330-356` | Empty AAD fails; correct AAD succeeds as a positive control. | unaudited |
+| [`every_proper_prefix_of_a_valid_envelope_is_rejected`](../../../crates/cortexkit-push-seal/src/lib.rs) | Every proper prefix returns exact `Malformed` or `Aead` with a valid anchor control. | audited for one generated anchor |
+| [`single_bit_mutations_have_field_specific_outcomes`](../../../crates/cortexkit-push-seal/src/lib.rs) | Every bit in version, `enc`, ciphertext, and tag reaches its exact local rejection. | audited for one generated anchor |
+| [`sampled_malformed_bytes_are_total_through_the_local_envelope_bound`](../../../crates/cortexkit-push-seal/src/lib.rs) | Samples every length through 2097 and exercises focused deep HPKE lengths without unwinding. | sampled evidence; universal totality unaudited |
+| [`aad_and_info_are_exact`](../../../crates/cortexkit-push-seal/src/lib.rs) | Direct and public correct opens succeed; altered AAD or `info` fails. | audited for local HPKE semantics |
+| [`key_deserialization_and_degenerate_public_key_paths_are_reachable`](../../../crates/cortexkit-push-seal/src/lib.rs) | Exercises sampled accepted/rejected key lengths and one degenerate public key. | audited for the sampled inputs |
+| [`low_order_encapsulation_reaches_decap_error`](../../../crates/cortexkit-push-seal/src/lib.rs) | Observes direct `DecapError` before the public `Aead` collapse. | audited for one fixed low-order input |
 
 ## Property catalog
 
@@ -349,13 +354,13 @@ No production `assert!`, `debug_assert!`, or equivalent invariant assertion was 
 
 - **Type:** safety
 - **Status:** active
-- **Exercised:** yes and locally audited against the resolved HPKE deserializers
+- **Exercised:** sampled at rejected lengths 31 and 33 plus generated accepted 32-byte keys
 - **Guarantee:** After earlier gates pass, each API returns `BadRecipientKey` exactly when the resolved HPKE public/private-key deserializer rejects the supplied bytes.
 - **Check:** With accepted plaintext for `seal` and a current-version full-length envelope for `open`, `always((from_bytes(key).is_err()) == (result == BadRecipientKey))` for the respective resolved key type.
 - **Fault/timing angle:** Dependency deserializer changes from length-only behavior to same-size semantic validation, or local error mapping drifts.
 - **Required faults and enabling state:** Inputs accepted and rejected by each resolved deserializer while all earlier API gates pass.
 - **Confidence:** high for current control flow; [evidence](evidence/bad-recipient-key-follows-resolved-deserializer.md)
-- **Existing check:** [`key_deserialization_and_degenerate_public_key_paths_are_reachable`](../../../crates/cortexkit-push-seal/src/lib.rs); audited for rejected lengths 31 and 33 and valid generated 32-byte controls. It does not define an independent X25519 validity policy.
+- **Existing check:** [`key_deserialization_and_degenerate_public_key_paths_are_reachable`](../../../crates/cortexkit-push-seal/src/lib.rs); sampled evidence for rejected lengths 31 and 33 and generated accepted 32-byte controls. The universal mapping remains source-backed and unaudited.
 - **Impact:** Preserves the documented error classification without pretending this repository has independently defined X25519 point/scalar validity.
 - **Open questions:** Whether public docs should describe the resolved length-only behavior or the API should impose a stricter independent validity contract.
 
@@ -421,7 +426,7 @@ No production `assert!`, `debug_assert!`, or equivalent invariant assertion was 
 - **Status:** active
 - **Exercised:** yes for synthetic represented-fixture changes; no committed historical wire change exists
 - **Guarantee:** Every change to emitted bytes, accepted bytes, error classification, or wire-code strings includes a crate-version bump; prose-only and test-only changes do not.
-- **Check:** When the committed deterministic fixture differs between explicit base and head revisions, require the package version to differ. The fixture covers one exact local envelope and all four current public classifications. Source-only and unrepresented behavior changes remain outside this gate.
+- **Check:** When the represented `ciphersuite`, `inputs`, or `expected` projection differs between explicit base and head revisions, require the package version to differ. Formatting, provenance, and build-identity prose are excluded. The fixture covers one exact local envelope and all four current public classifications. Source-only and unrepresented behavior changes remain outside this gate.
 - **Fault/timing angle:** Source or dependency change that keeps self-roundtrip tests green while breaking the external opener.
 - **Required faults and enabling state:** Synthetic unchanged, changed-without-bump, changed-with-bump, bootstrap, and unrelated-change cases; readable explicit event revisions for the actual Git comparison.
 - **Confidence:** high for represented fixture changes; low for unrepresented behavior and external compatibility; [evidence](evidence/version-bump-accompanies-wire-change.md)

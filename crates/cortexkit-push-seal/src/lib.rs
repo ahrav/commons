@@ -229,6 +229,7 @@ mod tests {
     fn wire_v1_fixture_matches_local_bytes_and_classifications() {
         let fixture: Value = serde_json::from_str(WIRE_V1_FIXTURE).expect("parse wire fixture");
         assert_eq!(fixture["schema_version"], 1);
+        assert_eq!(fixture["build_identity"]["package"], "cortexkit-push-seal");
         assert_eq!(
             fixture["build_identity"]["package_version"],
             env!("CARGO_PKG_VERSION")
@@ -280,8 +281,15 @@ mod tests {
         let cases = fixture["expected"]["classifications"]
             .as_array()
             .expect("classification cases");
-        assert!(!cases.is_empty(), "classification cases must not be empty");
-        for case in cases {
+        let expected_cases = [
+            "short envelope",
+            "unsupported version",
+            "bad recipient key",
+            "authentication failure",
+        ];
+        assert_eq!(cases.len(), expected_cases.len(), "classification count");
+        for (case, expected_name) in cases.iter().zip(expected_cases) {
+            assert_eq!(case["name"], expected_name);
             let key = hex::decode(
                 case["recipient_private_key_hex"]
                     .as_str()
@@ -658,6 +666,7 @@ mod tests {
             direct_open(&[], &[VERSION]).expect("direct correct open"),
             b"q"
         );
+        assert_eq!(open(&sk, &sealed).expect("public correct open"), b"q");
 
         for aad in [&[][..], &[0][..], &[VERSION, 0][..]] {
             assert_eq!(

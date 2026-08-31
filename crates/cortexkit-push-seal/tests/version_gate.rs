@@ -1,5 +1,7 @@
 use std::process::Command;
 
+use serde_json::{json, Value};
+
 const FIXTURE_PATH: &str = "crates/cortexkit-push-seal/tests/golden/push-seal-wire-v1.json";
 const MANIFEST_PATH: &str = "crates/cortexkit-push-seal/Cargo.toml";
 
@@ -29,7 +31,7 @@ fn check_version_gate(
     let Some(base_fixture) = base_fixture else {
         return Ok(());
     };
-    if base_fixture != head_fixture
+    if represented_contract(base_fixture)? != represented_contract(head_fixture)?
         && package_version(base_manifest) == package_version(head_manifest)
     {
         return Err("push-seal fixture changed without a package version bump");
@@ -37,31 +39,57 @@ fn check_version_gate(
     Ok(())
 }
 
+fn represented_contract(fixture: &str) -> Result<Value, &'static str> {
+    let fixture: Value =
+        serde_json::from_str(fixture).map_err(|_| "push-seal fixture is not valid JSON")?;
+    Ok(json!({
+        "ciphersuite": {
+            "mode": fixture["ciphersuite"]["mode"],
+            "kem": fixture["ciphersuite"]["kem"]["codepoint"],
+            "kdf": fixture["ciphersuite"]["kdf"]["codepoint"],
+            "aead": fixture["ciphersuite"]["aead"]["codepoint"],
+        },
+        "inputs": fixture["inputs"],
+        "expected": fixture["expected"],
+    }))
+}
+
 #[test]
 fn synthetic_version_gate_cases() {
     let manifest_v1 = "[package]\nname = \"cortexkit-push-seal\"\nversion = \"0.1.0\"\n";
     let manifest_v2 = "[package]\nname = \"cortexkit-push-seal\"\nversion = \"0.2.0\"\n";
+    let contract_v1 =
+        r#"{"ciphersuite":{"mode":"Base"},"inputs":{"aad":"01"},"expected":{"wire":"aa"}}"#;
+    let contract_v1_with_new_prose = r#"{
+        "provenance": {"note": "updated test prose"},
+        "build_identity": {"source_revision": "different"},
+        "ciphersuite": {"mode": "Base"},
+        "inputs": {"aad": "01"},
+        "expected": {"wire": "aa"}
+    }"#;
+    let contract_v2 =
+        r#"{"ciphersuite":{"mode":"Base"},"inputs":{"aad":"01"},"expected":{"wire":"bb"}}"#;
 
     assert_eq!(
-        check_version_gate(Some("same"), "same", manifest_v1, manifest_v1),
+        check_version_gate(Some(contract_v1), contract_v1, manifest_v1, manifest_v1),
         Ok(())
     );
     assert_eq!(
-        check_version_gate(Some("old"), "new", manifest_v1, manifest_v1),
+        check_version_gate(Some(contract_v1), contract_v2, manifest_v1, manifest_v1),
         Err("push-seal fixture changed without a package version bump")
     );
     assert_eq!(
-        check_version_gate(Some("old"), "new", manifest_v1, manifest_v2),
+        check_version_gate(Some(contract_v1), contract_v2, manifest_v1, manifest_v2),
         Ok(())
     );
     assert_eq!(
-        check_version_gate(None, "new", manifest_v1, manifest_v1),
+        check_version_gate(None, contract_v1, manifest_v1, manifest_v1),
         Ok(())
     );
     assert_eq!(
         check_version_gate(
-            Some("same"),
-            "same",
+            Some(contract_v1),
+            contract_v1_with_new_prose,
             manifest_v1,
             "unrelated prose or tests"
         ),

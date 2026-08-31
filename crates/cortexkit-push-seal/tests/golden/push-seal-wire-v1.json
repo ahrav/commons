@@ -7,27 +7,17 @@
   },
   "build_identity": {
     "package": "cortexkit-push-seal",
-    "package_version": "0.1.0",
-    "source_revision": "5564d42be70324d042efda4b08eb8d58d7245080",
-    "profile": "workspace default-CI dependency resolution",
-    "dependencies": {
-      "hpke": "0.14.0",
-      "getrandom": "0.4.3",
-      "x25519-dalek": "3.0.0"
-    }
+    "package_version": "0.1.0"
   },
   "ciphersuite": {
     "mode": "Base",
     "kem": {
-      "name": "DHKEM(X25519, HKDF-SHA256)",
       "codepoint": 32
     },
     "kdf": {
-      "name": "HKDF-SHA256",
       "codepoint": 1
     },
     "aead": {
-      "name": "ChaCha20Poly1305",
       "codepoint": 3
     }
   },
