@@ -36,10 +36,10 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
 
       - name: Test
-        run: cargo test --workspace --all-targets
+        run: cargo test --locked --workspace --all-targets
 
   # GitHub service containers are Linux-only. Without a DSN, live PostgreSQL
   # tests skip on macOS and Windows. CORTEXKIT_REQUIRE_PG makes a missing DSN
@@ -70,4 +70,4 @@ jobs:
         env:
           CORTEXKIT_TEST_PG_DSN: postgresql://ck:ckpw@127.0.0.1:5432/ckstore
           CORTEXKIT_REQUIRE_PG: "1"
-        run: cargo test -p cortexkit-store-postgres -- --nocapture
+        run: cargo test --locked -p cortexkit-store-postgres -- --nocapture
