@@ -5,9 +5,7 @@ use serde_json::{json, Value};
 const FIXTURE_PATH: &str = "crates/cortexkit-push-seal/tests/golden/push-seal-wire-v1.json";
 const MANIFEST_PATH: &str = "crates/cortexkit-push-seal/Cargo.toml";
 
-// Cargo reads the manifest as TOML, so quoted keys, escape sequences, dotted keys, and
-// either string style all name the same field. Approximating that grammar by hand read
-// some of those spellings wrongly.
+// Parse TOML keys because quoted keys and escapes can encode `version`.
 // commentlint: allow(JUDGE)
 fn package_version(manifest: &str) -> Result<String, String> {
     let document: toml::Table = manifest
@@ -36,9 +34,7 @@ fn package_version(manifest: &str) -> Result<String, String> {
         .ok_or_else(|| format!("[package] version is not a string: {version:?}"))
 }
 
-// A numeric identifier is held as digits rather than an integer: SemVer bounds neither
-// its width nor its value, and any fixed-width fallback to lexical comparison inverts
-// the order of two identifiers whose digit counts differ.
+// Keep numeric identifiers as digit strings because SemVer does not bound their width.
 // commentlint: allow(JUDGE)
 #[derive(Debug, PartialEq, Eq)]
 enum Identifier {
@@ -50,8 +46,8 @@ impl Ord for Identifier {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         use std::cmp::Ordering;
         match (self, other) {
-            // Digits carry no leading zero, so more digits means a larger value and
-            // equal digit counts order lexically.
+            // Numeric identifiers without leading zeroes sort by length before
+            // lexicographic order.
             (Identifier::Numeric(left), Identifier::Numeric(right)) => {
                 left.len().cmp(&right.len()).then_with(|| left.cmp(right))
             }
@@ -95,9 +91,8 @@ impl PartialOrd for Version {
     }
 }
 
-// Build metadata carries no precedence, so it is dropped before comparison. An
-// unparseable version is an error: returning a pass here would let a wire change
-// through whenever the version is spelled in a way this parser does not recognize.
+// Drop build metadata before comparison because it does not affect SemVer precedence.
+// Reject unparseable versions so an unknown spelling cannot let a wire change pass.
 // commentlint: allow(JUDGE)
 fn parse_version(version: &str) -> Result<Version, String> {
     let without_build = version.split('+').next().unwrap_or(version);
@@ -150,12 +145,9 @@ fn identifier_of(version: &str, identifier: &str) -> Result<Identifier, String> 
     Ok(Identifier::Numeric(identifier.to_owned()))
 }
 
-// `provenance` and `build_identity` are recording metadata, not wire data or classification; changing them does not require a version bump.
+// `provenance` and `build_identity` are recording metadata, not wire data.
 //
-// Every wire-surface section must be present and non-null: serde_json indexing
-// maps an absent key to `Null`, so two fixtures that both lack a section would
-// otherwise project equal and the gate would pass vacuously after a fixture
-// shape change.
+// Wire-surface validation requires every section to be present and non-null.
 fn represented_wire_surface(fixture: &str) -> Result<Value, String> {
     let value: Value =
         serde_json::from_str(fixture).map_err(|error| format!("unparseable fixture: {error}"))?;
@@ -192,12 +184,9 @@ fn at<'a>(fixture: Option<&'a str>, manifest: &'a str) -> Revision<'a> {
     Revision { fixture, manifest }
 }
 
-// One rule covers every revision the head could land beside: a prior constrains the
-// version only when its represented wire surface differs from the head's. A prior with
-// no fixture predates the surface, and a prior sharing the head's surface describes the
-// same bytes, so neither is a version the head must clear. The merge base answers
-// "did this branch change anything" and the base tip answers "is this version already
-// taken", and both follow from that one rule.
+// A prior constrains the head only when their represented wire surfaces differ.
+// A missing fixture predates the surface; an equal surface describes the same bytes.
+// The merge base detects branch changes; the base tip prevents version reuse.
 // commentlint: allow(JUDGE)
 fn check_version_gate(
     priors: &[Revision],

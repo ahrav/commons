@@ -29,7 +29,8 @@ fn helpers_reproduce_the_golden_vectors() {
             "sqlite_store_path drift for module_id {id}"
         );
 
-        // The descriptor shape (field names + tags) is part of the wire contract.
+        // Serde field names and enum tags define the wire contract; serialization
+        // must preserve the fixture after parsing.
         let descriptor: StorageDescriptor =
             serde_json::from_value(v["sqlite_descriptor"].clone()).expect("descriptor parses");
         let reserialized = serde_json::to_value(&descriptor).unwrap();

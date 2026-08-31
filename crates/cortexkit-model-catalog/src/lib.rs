@@ -7,36 +7,33 @@
 //! drift cannot make them disagree silently. This crate is that shape.
 //! Consumers bring their own snapshot bytes and own their derived stores.
 //!
-//! Money discipline: models.dev publishes dollar-per-million-token rates as
-//! JSON decimal numbers. This crate converts them ONCE, at the parse
-//! boundary, into exact integer NANODOLLARS per million tokens
-//! ([`RateNanosPerMtok`]) via decimal string scaling — no float ever reaches
-//! a consumer's money path. A rate the decimal cannot represent exactly in
-//! nanodollars is a parse error, never a rounded guess. `None` = "no
-//! published rate", which is NOT zero (free) — consumers must distinguish
-//! them.
+//! The catalog stores rates as dollars per million tokens in JSON.
+//! Sub-nanodollar values round half-even; nonzero values that round to zero,
+//! negative rates, and values outside `i64` are parse errors. `None` means no
+//! published rate, not zero; consumers must distinguish them.
 
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-/// Integer nanodollars per million tokens. $3/M tokens = 3_000_000_000.
+/// Stores a rate in integer nanodollars per million tokens.
+///
+/// `$3` per million tokens is `3_000_000_000` nanodollars per million tokens.
 pub type RateNanosPerMtok = i64;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CatalogParseError {
+    /// The snapshot is invalid JSON or its top-level value is not an object.
     Json(String),
-    /// A cost number that cannot scale exactly to integer nanodollars
-    /// (more than 9 fractional digits, out of range, or not a plain decimal).
+    /// A cost number that cannot produce an integer nanodollar rate.
     InexactRate {
         provider: String,
         model: String,
         field: &'static str,
         value: String,
     },
-    /// A NEGATIVE rate. No catalog publishes one; a corrupted snapshot must
-    /// fail loud here rather than flow into consumers' signed money paths.
+    /// A negative rate rejected before it reaches a consumer.
     NegativeRate {
         provider: String,
         model: String,
@@ -49,10 +46,7 @@ pub enum CatalogParseError {
     /// over-threshold rate to every request, which is a silent repricing.
     /// Carries the row so an operator diagnoses a rejected snapshot without
     /// bisecting the payload.
-    MissingTierThreshold {
-        provider: String,
-        model: String,
-    },
+    MissingTierThreshold { provider: String, model: String },
 }
 
 impl std::fmt::Display for CatalogParseError {
@@ -78,7 +72,7 @@ impl std::fmt::Display for CatalogParseError {
 
 impl std::error::Error for CatalogParseError {}
 
-/// The parsed catalog: provider id → provider entry.
+/// Retains provider and model entries parsed from one catalog snapshot.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct CatalogDoc {
     pub providers: BTreeMap<String, ProviderEntry>,
@@ -163,8 +157,11 @@ pub struct CostTier {
 }
 
 impl CatalogDoc {
-    /// Parse a models.dev snapshot (the top-level `{ provider_id: {...} }`
-    /// document). Unknown fields are preserved in `raw`, never dropped.
+    /// Parse a snapshot and preserve unknown fields in `raw`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CatalogParseError::Json`] for invalid JSON or a non-object top-level value, [`CatalogParseError::InexactRate`] for an inexact rate, [`CatalogParseError::NegativeRate`] for a negative rate, or [`CatalogParseError::MissingTierThreshold`] for an incomplete tier.
     pub fn parse(json: &str) -> Result<Self, CatalogParseError> {
         let root: Value =
             serde_json::from_str(json).map_err(|e| CatalogParseError::Json(e.to_string()))?;
@@ -325,8 +322,7 @@ fn parse_cost(
     })
 }
 
-/// Convert a catalog dollar rate (JSON number) to exact integer nanodollars
-/// via DECIMAL STRING scaling — floats never do money arithmetic.
+/// Convert a JSON number to integer nanodollars without floating-point arithmetic.
 ///
 /// The JSON number's shortest-roundtrip decimal form is scaled by 10^9
 /// exactly. Precision beyond nanodollars ROUNDS HALF-EVEN at this boundary:

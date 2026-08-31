@@ -18,15 +18,10 @@ pub use cortexkit_store_types::{
 
 use cortexkit_lease::{LeaseError, LeaseKey, LeaseStore};
 
-/// An ordered schema migration: DDL and/or seed `INSERT`s applied exactly once.
-///
-/// Migrations are applied in ascending `version` order; each runs once and is
-/// recorded, so seed data (for example a module's initial fact rows) belongs in a
-/// migration body and is inserted exactly once on first creation, never re-run on
-/// later opens.
+/// Migration statements and their version record commit together.
 #[derive(Debug, Clone, Copy)]
 pub struct Migration {
-    /// Strictly increasing version. Applied when greater than the recorded max.
+    /// Version applied when greater than the namespace's recorded maximum.
     pub version: u32,
     /// SQL executed as a batch (multiple statements allowed): DDL and/or seed rows.
     pub statements: &'static str,
@@ -111,8 +106,6 @@ mod sqlite_backend {
     }
 
     impl SqliteStore {
-        /// The fence epoch of the held lease, strictly greater than any superseded
-        /// writer's epoch.
         pub fn epoch(&self) -> u64 {
             self.epoch
         }
@@ -144,6 +137,10 @@ mod sqlite_backend {
 
         /// Run a closure against the connection under the store mutex. The module's
         /// domain trait implementation calls this for every query/transaction.
+        ///
+        /// # Errors
+        ///
+        /// Returns [`StoreError::Backend`] when the closure returns a SQLite error.
         pub fn with_conn<T>(
             &self,
             f: impl FnOnce(&Connection) -> rusqlite::Result<T>,
@@ -156,11 +153,8 @@ mod sqlite_backend {
         /// rejected ([`StoreError::Fenced`]) if a newer writer has taken over the
         /// database; otherwise it commits atomically.
         ///
-        /// Use this instead of [`with_conn`] for a durable write that cannot be
-        /// applied by a superseded writer. The OS advisory lock prevents concurrent
-        /// lease holders, but during a handover a stale instance can retain an open
-        /// connection after releasing the lock. The persisted epoch rejects its late
-        /// writes at the database layer.
+        /// The persisted epoch rejects late writes from an instance that has released
+        /// its lease.
         ///
         /// Mechanism: an IMMEDIATE transaction reads the database's stored fence
         /// epoch and, if it is greater than this store's lease epoch, rejects without
@@ -169,7 +163,10 @@ mod sqlite_backend {
         /// error from `f` rolls the transaction back.
         ///
         /// The fence table is created lazily on the first fenced write.
-        /// [`with_conn`]-only stores do not create it, and callers may use both paths.
+        ///
+        /// # Errors
+        ///
+        /// Returns [`StoreError::Fenced`] if the persisted database epoch exceeds the store epoch, or [`StoreError::Backend`] if transaction setup, SQL execution, the callback, or commit fails.
         pub fn with_conn_fenced<T>(
             &self,
             f: impl FnOnce(&rusqlite::Transaction) -> rusqlite::Result<T>,
@@ -223,6 +220,10 @@ mod sqlite_backend {
         /// domain's history is separate, and adding a domain later never re-runs or
         /// entangles another's migrations. A single-domain module just calls this
         /// once. Idempotent: only un-applied versions in this namespace run.
+        ///
+        /// # Errors
+        ///
+        /// Returns [`StoreError::Migration`] when schema-version setup, transaction setup, a migration statement, its version record, or transaction commit fails.
         pub fn migrate(&self, namespace: &str, migrations: &[Migration]) -> Result<(), StoreError> {
             let mut guard = self.conn.lock().unwrap_or_else(|p| p.into_inner());
             run_migrations(&mut guard, namespace, migrations)
@@ -245,6 +246,13 @@ mod sqlite_backend {
     /// shared lease directory at several distinct databases (which would falsely
     /// make them contend) or split one database across lease directories (which
     /// would break single-writer).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::UnsupportedBackend`] for non-SQLite descriptors,
+    /// [`StoreError::Io`] when the parent directory cannot be created, and
+    /// [`StoreError::Lease`] or [`StoreError::Backend`] when lease or SQLite setup
+    /// fails.
     pub fn open_sqlite(descriptor: &StorageDescriptor) -> Result<SqliteStore, StoreError> {
         let path = match &descriptor.backend {
             StorageBackend::Sqlite { path } => path.clone(),

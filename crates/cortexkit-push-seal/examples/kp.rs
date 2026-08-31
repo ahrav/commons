@@ -1,6 +1,6 @@
-// PK is the recipient key for `handseal`; SK is the matching secret for
-// `handopen`. Both have the same hex length, so swapping them seals to a keypair
-// nobody holds and fails silently on the device rather than here.
+// Pass the `PK` value to `handseal` and keep the `SK` value for `handopen`.
+// Both `PK` and `SK` are 64 hexadecimal characters, so command-line validation cannot detect a swap.
+// Sealing with `SK` produces an envelope that `handopen` cannot open.
 fn main() {
     use hpke::{Kem, Serializable};
     let (sk, pk) = hpke::kem::X25519HkdfSha256::gen_keypair();

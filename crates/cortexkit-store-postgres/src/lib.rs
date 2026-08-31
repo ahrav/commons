@@ -2,24 +2,11 @@
 //! postgres database from a [`StorageDescriptor`], guard it with a native
 //! single-writer lease, and apply versioned migrations once.
 //!
-//! This is the parallel of the sqlite backend in `cortexkit-store`: same
-//! descriptor in, same open/migrate/lease surface out, so a module's domain code
-//! is unchanged when the central storage policy switches sqlite to postgres. The
-//! module receives a `Postgres { dsn, database }` descriptor whose `dsn` is a
-//! scoped, least-privilege runtime credential reaching only its own database; the
-//! per-module database and role are provisioned out of band (this crate connects
-//! and migrates, it does not `CREATE DATABASE`).
+//! Database and role provisioning occurs outside the crate.
 //!
 //! ## Single-writer lease
 //!
-//! sqlite uses a file advisory lock for liveness; postgres cannot (a database
-//! client holds no file). Instead this uses a postgres SESSION advisory lock
-//! (`pg_advisory_lock`), which the server releases automatically when the
-//! connection drops, giving the same crash-releases-the-lock liveness across
-//! processes AND machines. The epoch fence is persisted in a small lease table in
-//! the module's own database, bumped under the advisory lock, matching the
-//! file-lease semantics so a distributed writer's durable writes can carry a
-//! monotonic fence token.
+//! PostgreSQL releases its session advisory lock when the connection closes.
 
 use cortexkit_lease::{fnv1a, LeaseError, LeaseKey};
 use cortexkit_store_types::{StorageBackend, StorageDescriptor};

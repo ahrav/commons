@@ -282,6 +282,7 @@ impl AccountInfo {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct CreditExpiry {
+    /// RFC 3339 timestamp when the saved reset credit expires.
     pub expires_at: String,
 }
 

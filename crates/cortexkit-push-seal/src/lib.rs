@@ -104,6 +104,12 @@ pub enum OpenError {
 /// # Panics
 ///
 /// Panics if `getrandom::SysRng` fails to generate random bytes.
+///
+/// # Errors
+///
+/// - Returns [`SealError::PlaintextTooLarge`] when `plaintext` exceeds [`MAX_PLAINTEXT_BYTES`]; this check precedes key validation.
+/// - Returns [`SealError::BadRecipientKey`] when `recipient_public_key` is not a 32-byte X25519 public key.
+/// - Returns [`SealError::Hpke`] when HPKE rejects the sealing operation.
 pub fn seal(recipient_public_key: &[u8], plaintext: &[u8]) -> Result<Vec<u8>, SealError> {
     seal_with_rng(
         recipient_public_key,
@@ -171,6 +177,13 @@ impl OpenError {
 /// This function has no size cap. `seal` enforces the plaintext cap; transport
 /// bounds the envelope before it reaches this code. A second opening cap could
 /// disagree with the transport limit.
+///
+/// # Errors
+///
+/// - Returns [`OpenError::Malformed`] when `envelope` is shorter than 33 bytes; this check precedes version and key validation.
+/// - Returns [`OpenError::UnknownVersion`] when the first envelope byte is not [`VERSION`].
+/// - Returns [`OpenError::BadRecipientKey`] when `recipient_private_key` is not a valid X25519 scalar.
+/// - Returns [`OpenError::Aead`] when the encapsulated key cannot be decoded or HPKE opening fails.
 pub fn open(recipient_private_key: &[u8], envelope: &[u8]) -> Result<Vec<u8>, OpenError> {
     if envelope.len() < 1 + ENC_LEN {
         return Err(OpenError::Malformed {

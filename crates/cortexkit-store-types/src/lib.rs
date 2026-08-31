@@ -80,9 +80,8 @@ pub struct StorageDescriptor {
 
 /// Build the per-module postgres database name: `cortexkit_<slug>_<16hex>`.
 ///
-/// The 16-hex suffix hashes the full `module_id`, preventing collisions between
-/// ids with the same slug, such as `a-b` and `a_b`. The slug is bounded so the
-/// whole name fits postgres' 63-byte identifier limit.
+/// The 16-hex suffix hashes `module_id`; `a-b` and `a_b` generate different names.
+/// The 36-character slug limit keeps generated names within 63 bytes.
 pub fn postgres_database_name(module_id: &str) -> String {
     const MAX_SLUG: usize = 36; // 63 - len("cortexkit_") - len("_") - 16
     let slug: String = module_id
@@ -99,9 +98,9 @@ pub fn postgres_database_name(module_id: &str) -> String {
     format!("cortexkit_{slug}_{}", fnv1a_hex(module_id))
 }
 
-/// The conventional sqlite store path for a module under a data-home root
-/// (`<data_home>/cortexkit/<module_id>/store.db`). subc uses this to resolve a
-/// sqlite descriptor; the resolved absolute path then travels in the descriptor.
+/// The conventional SQLite store path under a data-home root:
+/// `<data_home>/cortexkit/<module_id>/store.db`. Trailing `/` characters in
+/// `data_home` do not produce duplicate separators.
 pub fn sqlite_store_path(data_home: &str, module_id: &str) -> String {
     format!(
         "{}/cortexkit/{}/store.db",

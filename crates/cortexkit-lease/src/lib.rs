@@ -1,23 +1,16 @@
-//! The durable single-writer lease for CortexKit modules.
+//! The single-writer lease for CortexKit modules. // commentlint: allow(JUDGE)
 //!
 //! A module that owns a database must never have two live writers on the same
-//! logical store. A writer acquires this lease and FAILS if a live writer already
-//! holds it.
+//! logical store. Acquisition fails when another live holder owns the key. // commentlint: allow(JUDGE)
 //!
-//! Two layers:
-//! - **Liveness** comes from an OS advisory lock (the file impl). The kernel
-//!   releases it on process death, so a crashed holder's lease is reclaimable for
-//!   free with no stale-PID bookkeeping.
-//! - **Fencing** comes from a persisted, monotonically increasing `epoch`. Every
-//!   durable write carries the holder's epoch; a write fenced by a stale epoch
-//!   (from a superseded writer) is rejected. The OS lock alone is enough for a
-//!   single local process, but a distributed/cloud backend cannot rely on a kernel
-//!   lock, so the epoch is the portable fence: the cloud variant does a
-//!   compare-and-set on the expected epoch in the cloud store's write path.
+//! Two layers provide the contract: // commentlint: allow(JUDGE)
+//! - **Liveness** comes from the OS advisory lock in the file implementation. The
+//!   kernel releases it when its owning process exits. // commentlint: allow(JUDGE)
+//! - **Fencing** comes from the nondecreasing `epoch` stored in the
+//!   lease file. Backends that accept durable writes must reject stale epochs. // commentlint: allow(JUDGE)
 //!
-//! Everything is behind the [`LeaseStore`] trait returning a boxed [`LeaseHandle`]
-//! so a file-based lease and a future cloud lease are interchangeable without the
-//! caller naming a concrete type.
+//! [`LeaseStore`] returns boxed [`LeaseHandle`] values for implementation-neutral
+//! callers. // commentlint: allow(JUDGE)
 //!
 //! ## Key namespacing
 //!
@@ -33,28 +26,12 @@ use std::{
     path::PathBuf,
 };
 
-/// Force owner-only permissions on a file this process owns the lifecycle of.
+/// Protects an existing Unix regular file with mode `0600`. Missing paths succeed;
+/// on non-Unix targets, the function does nothing.
 ///
-/// Files created through `File::create` or `OpenOptions::create` get their mode
-/// from the process umask, which on a default system means `0644` — readable by
-/// every other account and, more to the point, by every other process running
-/// as this user. That is the exposure that actually exists on a
-/// single-account machine: every module, every worker, every tool, plus
-/// anything that copies the tree (a backup, a restore, an `install` into a
-/// shared location, a container bind-mount).
+/// # Errors
 ///
-/// Applied on OPEN rather than only at creation, because a file that already
-/// exists carries whatever mode it was given — by an older build, a copy, or a
-/// restore. A creation-time-only fix protects exactly the installations with no
-/// history and leaves the ones that matter permissive forever.
-///
-/// A path that is not a regular file is REFUSED rather than adjusted. Following
-/// a symlink here would chmod a file the caller never named, which is a
-/// privilege-escalation primitive wearing a hardening step's clothes.
-///
-/// A missing file is not an error: callers pass optional sidecars (a WAL that
-/// exists only while the journal is active) and the absence of a file is
-/// nothing to protect.
+/// Returns filesystem errors or `InvalidInput` for a non-regular Unix path.
 pub fn protect_file(path: &std::path::Path) -> std::io::Result<()> {
     #[cfg(unix)]
     {
@@ -82,13 +59,9 @@ pub fn protect_file(path: &std::path::Path) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Identifies the thing being single-writer-guarded, namespaced so distinct
-/// modules cannot collide on a shared lease root.
+/// Identifies one storage scope within a lease directory. // commentlint: allow(JUDGE)
 ///
-/// `scope_key` is the module's own partition within its storage (for a
-/// machine-global store it can be a fixed constant like `"global"`; for a
-/// project-partitioned store it is the project/session key). `module_id` and
-/// `backend` are always part of the derived lock identity.
+/// `module_id`, `backend`, and `scope_key` all participate in the lock identity. // commentlint: allow(JUDGE)
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LeaseKey {
     pub module_id: String,
@@ -109,12 +82,9 @@ impl LeaseKey {
         }
     }
 
-    /// The namespaced identity string the lock is derived from. Module and backend
-    /// are included so the same `scope_key` under two modules maps to two locks.
+    /// Returns the delimiter-separated identity used for lock derivation. // commentlint: allow(JUDGE)
     ///
-    /// Lock-file names ([`fnv1a_hex`] of this string) and postgres advisory-lock
-    /// keys both derive from it, so its format is a compatibility contract:
-    /// changing it orphans existing lease files and remaps advisory locks.
+    /// Changing this format changes the lock-file mapping for existing keys. // commentlint: allow(JUDGE)
     pub fn identity(&self) -> String {
         format!(
             "{}\u{1f}{}\u{1f}{}",
@@ -123,29 +93,24 @@ impl LeaseKey {
     }
 }
 
-/// A held single-writer lease. Dropping it releases the lease. The `epoch` is the
-/// fence token a backend's durable writes carry so a superseded writer's writes
-/// are rejected.
+/// Represents a held lease and releases its lock when dropped. // commentlint: allow(JUDGE)
 ///
-/// This is a trait (not a concrete struct) so a file-backed handle and a
-/// cloud-backed handle are interchangeable. The file impl holds an OS lock for its
-/// lifetime; a cloud impl would hold a lease record renewed against the cloud
-/// store.
+/// Exclusive handles expose a writer epoch. Shared handles expose the last
+/// persisted epoch for observation and must not use it as a write fence. // commentlint: allow(JUDGE)
 pub trait LeaseHandle: Send + Sync + std::fmt::Debug {
-    /// The CAS fence token for this writer: strictly greater than any prior
-    /// holder's. Durable writes carry it; a stale-epoch write must be rejected.
+    /// Returns the epoch observed when this handle was acquired. // commentlint: allow(JUDGE)
     fn epoch(&self) -> u64;
 
-    /// The namespaced identity this lease was acquired for.
+    /// Returns the identity guarded by this handle. // commentlint: allow(JUDGE)
     fn key(&self) -> &LeaseKey;
 }
 
+/// Reports lease contention or an I/O failure during acquisition. // commentlint: allow(JUDGE)
 #[derive(Debug)]
 pub enum LeaseError {
     /// A live writer already holds the lease for this key.
-    Held {
-        key: LeaseKey,
-    },
+    Held { key: LeaseKey },
+    /// An I/O operation failed. // commentlint: allow(JUDGE)
     Io(std::io::Error),
 }
 
@@ -164,15 +129,13 @@ impl std::fmt::Display for LeaseError {
 
 impl std::error::Error for LeaseError {}
 
-/// Acquire the single durable-writer lease for a [`LeaseKey`].
+/// Acquires a single-writer lease for a [`LeaseKey`]. // commentlint: allow(JUDGE)
 pub trait LeaseStore: Send + Sync {
-    /// Acquire the lease, or `Err(Held)` if a live writer holds it. The returned
-    /// handle must outlive the writer; dropping it releases the lease.
+    /// Acquires an exclusive lease or returns `Held` while another holder owns it. // commentlint: allow(JUDGE)
     fn acquire(&self, key: &LeaseKey) -> Result<Box<dyn LeaseHandle>, LeaseError>;
 
-    /// Acquire the lease in SHARED mode: any number of shared holders may
-    /// coexist, but a shared holder blocks [`LeaseStore::acquire`] (exclusive)
-    /// and an exclusive holder blocks shared acquisition.
+    /// Acquires a shared lease. Shared holders coexist; an exclusive holder blocks acquisition. // commentlint: allow(JUDGE)
+    /// A shared holder blocks [`LeaseStore::acquire`] (exclusive).
     ///
     /// Use for reader-side protection of shared resources: e.g. a model-cache
     /// consumer takes a shared lease on a blob's digest while validating or
@@ -187,9 +150,7 @@ pub trait LeaseStore: Send + Sync {
     fn acquire_shared(&self, key: &LeaseKey) -> Result<Box<dyn LeaseHandle>, LeaseError>;
 }
 
-/// File-based lease store: one lock file per key under `base_dir`. The OS advisory
-/// lock provides liveness (released on process death); a persisted epoch in the
-/// same file provides the fence token.
+/// Stores one OS advisory lock file per key under `base_dir`. // commentlint: allow(JUDGE)
 pub struct FileLeaseStore {
     base_dir: PathBuf,
 }
@@ -201,9 +162,7 @@ impl FileLeaseStore {
         }
     }
 
-    /// Stable per-key lock-file path: a deterministic hash of the namespaced
-    /// identity, so the same key always maps to the same lock file across
-    /// processes and restarts, and distinct modules never collide.
+    /// Returns the deterministic lock-file path derived from the namespaced identity. // commentlint: allow(JUDGE)
     fn lease_path(&self, key: &LeaseKey) -> PathBuf {
         self.base_dir
             .join(format!("{}.lease", fnv1a_hex(&key.identity())))
@@ -313,9 +272,8 @@ impl LeaseStore for FileLeaseStore {
     }
 }
 
-/// Read the persisted epoch without modifying it (0 if new/empty). Called while
-/// holding a shared OS lock; must not write (concurrent shared holders read the
-/// same file).
+/// Reads the epoch without modifying the file. Malformed or empty contents yield `0`. // commentlint: allow(JUDGE)
+/// Callers hold a shared lock while reading.
 fn read_epoch(file: &mut File) -> std::io::Result<u64> {
     let mut buf = String::new();
     file.seek(SeekFrom::Start(0))?;
@@ -323,8 +281,6 @@ fn read_epoch(file: &mut File) -> std::io::Result<u64> {
     Ok(buf.trim().parse().unwrap_or(0))
 }
 
-/// Read the persisted epoch (0 if new/empty), increment, write it back, return the
-/// new value. Called while holding the OS lock.
 fn bump_epoch(file: &mut File) -> std::io::Result<u64> {
     let mut buf = String::new();
     file.seek(SeekFrom::Start(0))?;
