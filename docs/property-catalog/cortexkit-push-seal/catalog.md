@@ -426,9 +426,9 @@ No production `assert!`, `debug_assert!`, or equivalent invariant assertion was 
 - **Status:** active
 - **Exercised:** yes for synthetic represented-fixture changes; no committed historical wire change exists
 - **Guarantee:** Every change to emitted bytes, accepted bytes, error classification, or wire-code strings includes a crate-version bump; prose-only and test-only changes do not.
-- **Check:** When the committed deterministic fixture differs between explicit base and head revisions, require the package version to differ. The fixture covers one exact local envelope and all four current public classifications. Source-only and unrepresented behavior changes remain outside this gate.
+- **Check:** When the fixture's represented wire surface (`schema_version`, `ciphersuite`, `inputs`, `expected`) differs between the merge base and the head revision, require the package version to increase. Provenance prose, build-identity metadata, and JSON formatting are excluded from the comparison. Source-only and unrepresented behavior changes remain outside this gate.
 - **Fault/timing angle:** Source or dependency change that keeps self-roundtrip tests green while breaking the external opener.
-- **Required faults and enabling state:** Synthetic unchanged, changed-without-bump, changed-with-bump, bootstrap, and unrelated-change cases; readable explicit event revisions for the actual Git comparison.
+- **Required faults and enabling state:** Synthetic unchanged, changed-without-bump, changed-with-bump, decreased-version, bootstrap, prose-only, reformatting, unrelated-change, and unparseable-fixture cases; readable pull-request base and head revisions for the actual Git comparison. Git failures other than proven path absence fail the gate rather than passing as bootstrap.
 - **Confidence:** high for represented fixture changes; low for unrepresented behavior and external compatibility; [evidence](evidence/version-bump-accompanies-wire-change.md)
 - **Existing check:** [`synthetic_version_gate_cases`](../../../crates/cortexkit-push-seal/tests/version_gate.rs) and [`actual_git_diff_requires_version_bump`](../../../crates/cortexkit-push-seal/tests/version_gate.rs); audited for represented fixture cases only.
 - **Impact:** The docs call the version the only notification channel for path consumers.
@@ -468,7 +468,7 @@ These findings are not active safety properties. A future sender-authentication 
 | KEM serialized-size or deserializer-semantics drift | `encapped-key-parse-failure-is-unreachable`, `envelope-layout-and-overhead-stay-fixed` | build-time only |
 | Low-order attacker-controlled `enc` | `low-order-encapsulation-aead-path-is-reachable` | yes with a fixed dependency-approved vector |
 | New in-range crypto dependency release | `byte-determining-dependency-closure-is-pinned` | yes for default CI through the tracked `Cargo.lock` and `--locked`; broader identities remain unaudited |
-| Represented fixture change without version bump | `version-bump-accompanies-wire-change` | yes through synthetic policy cases and explicit-revision CI; no qualifying historical commit yet |
+| Represented fixture change without version bump | `version-bump-accompanies-wire-change` | yes through synthetic policy cases and merge-base pull-request CI; no qualifying historical commit yet |
 
 ## Relationship map
 

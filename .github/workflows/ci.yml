@@ -28,7 +28,7 @@ jobs:
     steps:
       - uses: actions/checkout@v5
         with:
-          fetch-depth: 0
+          fetch-depth: ${{ matrix.os == 'ubuntu-latest' && '0' || '1' }}
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -43,12 +43,25 @@ jobs:
       - name: Test
         run: cargo test --locked --workspace --all-targets
 
+      # Runs only for pull requests: the gate compares the PR base and head
+      # SHAs, and push/tag events lack a reliably resolvable base.
+      # commentlint: allow(JUDGE)
       - name: Require a push-seal version bump for represented wire changes
-        if: matrix.os == 'ubuntu-latest' && (github.event_name == 'pull_request' || github.event_name == 'push')
+        if: matrix.os == 'ubuntu-latest' && github.event_name == 'pull_request'
         env:
-          PUSH_SEAL_BASE_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
-          PUSH_SEAL_HEAD_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
-        run: cargo test --locked -p cortexkit-push-seal --test version_gate actual_git_diff_requires_version_bump -- --ignored --exact
+          PUSH_SEAL_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PUSH_SEAL_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          output="$(cargo test --locked -p cortexkit-push-seal --test version_gate actual_git_diff_requires_version_bump -- --ignored --exact 2>&1)" || {
+            printf '%s\n' "$output"
+            exit 1
+          }
+          printf '%s\n' "$output"
+          # A name filter matching zero tests still exits 0. Require one passing test so a renamed test cannot silently disable the gate.
+          printf '%s\n' "$output" | grep -q 'test result: ok. 1 passed' || {
+            echo 'version gate test did not run; check the test name filter'
+            exit 1
+          }
 
   # GitHub service containers are Linux-only. Without a DSN, live PostgreSQL
   # tests skip on macOS and Windows. CORTEXKIT_REQUIRE_PG makes a missing DSN

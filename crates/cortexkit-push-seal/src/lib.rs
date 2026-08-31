@@ -277,30 +277,84 @@ mod tests {
         );
         assert_eq!(open(&sk, &envelope).expect("fixture opens"), plaintext);
 
+        let lock = include_str!("../../../Cargo.lock");
+        let locked_version = |name: &str| {
+            let marker = format!("name = \"{name}\"");
+            let mut lines = lock.lines();
+            for line in lines.by_ref() {
+                if line.trim() == marker {
+                    break;
+                }
+            }
+            lines
+                .next()
+                .and_then(|line| line.trim().strip_prefix("version = "))
+                .map(|version| version.trim_matches('"').to_owned())
+                .unwrap_or_else(|| panic!("{name} missing from Cargo.lock"))
+        };
+        let recorded_dependencies = fixture["build_identity"]["dependencies"]
+            .as_object()
+            .expect("recorded dependencies");
+        assert!(!recorded_dependencies.is_empty());
+        for (name, recorded) in recorded_dependencies {
+            assert_eq!(
+                recorded.as_str().expect("recorded dependency version"),
+                locked_version(name),
+                "fixture build_identity.dependencies.{name} must match Cargo.lock"
+            );
+        }
+
         let cases = fixture["expected"]["classifications"]
             .as_array()
             .expect("classification cases");
         assert!(!cases.is_empty(), "classification cases must not be empty");
+        let mut covered = std::collections::BTreeSet::new();
         for case in cases {
+            let name = case["name"].as_str().expect("case name");
             let key = hex::decode(
                 case["recipient_private_key_hex"]
                     .as_str()
                     .expect("case key"),
             )
             .expect("valid case key");
-            let envelope = hex::decode(case["envelope_hex"].as_str().expect("case envelope"))
+            let case_envelope = hex::decode(case["envelope_hex"].as_str().expect("case envelope"))
                 .expect("valid case envelope");
-            let error = open(&key, &envelope).expect_err("classification must fail");
+            // Anchoring each case to the verified seal keeps a fixture
+            // regeneration from detaching a case from the envelope it claims
+            // to mutate.
+            match name {
+                "short envelope" => {
+                    assert!(key.is_empty(), "case {name}");
+                    assert!(case_envelope.is_empty(), "case {name}");
+                }
+                "unsupported version" => {
+                    let mut expected_envelope = envelope.clone();
+                    expected_envelope[0] = 0x02;
+                    assert_eq!(case_envelope, expected_envelope, "case {name}");
+                }
+                "bad recipient key" => {
+                    assert!(key.is_empty(), "case {name}");
+                    assert_eq!(case_envelope, envelope, "case {name}");
+                }
+                "authentication failure" => {
+                    assert_eq!(key, sk, "case {name}");
+                    let mut tampered = envelope.clone();
+                    *tampered.last_mut().expect("nonempty envelope") ^= 0x01;
+                    assert_eq!(case_envelope, tampered, "case {name}");
+                }
+                other => panic!("unanchored classification case {other}"),
+            }
+            let error = open(&key, &case_envelope).expect_err("classification must fail");
             if let Some(expected) = case["observed"].as_u64() {
                 match &error {
                     OpenError::Malformed { observed } => {
-                        assert_eq!(*observed as u64, expected, "case {}", case["name"]);
+                        assert_eq!(*observed as u64, expected, "case {name}");
                     }
                     OpenError::UnknownVersion { observed } => {
-                        assert_eq!(*observed as u64, expected, "case {}", case["name"]);
+                        assert_eq!(*observed as u64, expected, "case {name}");
                     }
                     OpenError::BadRecipientKey | OpenError::Aead => {
-                        panic!("case {} has an inapplicable observed field", case["name"]);
+                        panic!("case {name} has an inapplicable observed field");
                     }
                 }
             }
@@ -310,14 +364,21 @@ mod tests {
                 OpenError::BadRecipientKey => "BadRecipientKey",
                 OpenError::Aead => "Aead",
             };
-            assert_eq!(classification, case["error"], "case {}", case["name"]);
+            covered.insert(classification);
+            assert_eq!(classification, case["error"], "case {name}");
             assert_eq!(
                 error.wire_code(),
                 case["wire_code"].as_str().expect("case wire code"),
-                "case {}",
-                case["name"]
+                "case {name}",
             );
         }
+        assert_eq!(
+            covered,
+            ["Aead", "BadRecipientKey", "Malformed", "UnknownVersion"]
+                .into_iter()
+                .collect(),
+            "fixture must represent every public OpenError classification"
+        );
     }
 
     #[test]
