@@ -211,17 +211,34 @@ mod tests {
     #[test]
     fn a_sealed_payload_opens_to_the_same_plaintext() {
         let (sk, pk) = keypair();
-        let sealed = seal(&pk, b"a question").expect("seal");
-        assert_eq!(open(&sk, &sealed).expect("open"), b"a question");
+        for len in [0, 2047, 2048] {
+            let plaintext = vec![0xff; len];
+            if !plaintext.is_empty() {
+                assert!(
+                    std::str::from_utf8(&plaintext).is_err(),
+                    "fixture must be non-UTF-8"
+                );
+            }
+            let sealed = seal(&pk, &plaintext).expect("seal");
+            assert_eq!(open(&sk, &sealed).expect("open"), plaintext);
+        }
     }
 
     #[test]
-    fn the_envelope_is_version_then_enc_then_ciphertext() {
+    fn the_envelope_has_version_one_and_fixed_overhead() {
         let (_, pk) = keypair();
-        let sealed = seal(&pk, b"x").expect("seal");
-        assert_eq!(sealed[0], VERSION, "version byte leads");
-        // ChaCha20Poly1305 adds a 16-byte authentication tag.
-        assert_eq!(sealed.len(), 1 + ENC_LEN + 1 + 16);
+        assert_eq!(VERSION, 0x01, "literal wire version");
+        assert_eq!(ENC_LEN, 32, "literal encapsulated-key length");
+
+        for plaintext_len in [0, 1, 2048] {
+            let sealed = seal(&pk, &vec![0u8; plaintext_len]).expect("seal");
+            assert_eq!(sealed[0], 0x01, "version byte leads");
+            assert_eq!(sealed.len(), plaintext_len + 49, "literal overhead");
+            assert!(sealed.len() <= 2097, "maximum local envelope length");
+            if plaintext_len == 2048 {
+                assert_eq!(sealed.len(), 2097, "maximum local envelope length");
+            }
+        }
     }
 
     /// Two seals of identical plaintext to one recipient must differ.
@@ -243,82 +260,98 @@ mod tests {
 
     #[test]
     fn an_oversized_plaintext_is_refused_with_both_numbers() {
-        let (_, pk) = keypair();
-        let too_big = vec![0u8; MAX_PLAINTEXT_BYTES + 1];
+        let (sk, pk) = keypair();
+        let too_big = vec![0u8; 2049];
         assert_eq!(
-            seal(&pk, &too_big),
+            seal(&[], &too_big),
             Err(SealError::PlaintextTooLarge {
-                limit: MAX_PLAINTEXT_BYTES,
-                observed: MAX_PLAINTEXT_BYTES + 1
-            })
+                limit: 2048,
+                observed: 2049
+            }),
+            "length must win before key parsing"
         );
         // Positive control: the boundary itself succeeds, so the refusal above
         // is not satisfied by an implementation that refuses everything.
-        let at_limit = vec![0u8; MAX_PLAINTEXT_BYTES];
-        assert!(seal(&pk, &at_limit).is_ok(), "the cap itself must seal");
-    }
-
-    #[test]
-    fn an_unknown_version_is_refused_as_a_version_rather_than_as_corruption() {
-        let (sk, pk) = keypair();
-        let mut sealed = seal(&pk, b"q").expect("seal");
-        sealed[0] = 0x02;
+        let at_limit = vec![0u8; 2048];
+        let sealed = seal(&pk, &at_limit).expect("the cap itself must seal");
         assert_eq!(
-            open(&sk, &sealed),
-            Err(OpenError::UnknownVersion { observed: 0x02 }),
-            "a format change must be distinguishable from a corrupt payload"
+            open(&sk, &sealed).expect("the cap itself must open"),
+            at_limit
         );
     }
 
     #[test]
-    fn a_truncated_envelope_is_malformed_rather_than_an_aead_failure() {
+    fn open_error_precedence_is_stable() {
         let (sk, pk) = keypair();
         let sealed = seal(&pk, b"q").expect("seal");
-        let short = &sealed[..ENC_LEN];
+
+        let mut short = sealed[..32].to_vec();
+        short[0] = 0x02;
         assert_eq!(
-            open(&sk, short),
-            Err(OpenError::Malformed { observed: ENC_LEN })
+            open(&[], &short),
+            Err(OpenError::Malformed { observed: 32 }),
+            "length must win before version and key parsing"
         );
+
+        // 33 bytes is the smallest envelope with a valid version and encapsulated key but no ciphertext.
+        let empty_ciphertext = &sealed[..33];
+        assert_eq!(
+            open(&sk, empty_ciphertext),
+            Err(OpenError::Aead),
+            "the minimum-length envelope must clear the length gate"
+        );
+        assert_eq!(
+            open(&sk, empty_ciphertext).unwrap_err().wire_code(),
+            "malformed",
+            "an empty ciphertext reports as an unusable envelope"
+        );
+
+        for version in u8::MIN..=u8::MAX {
+            if version == 0x01 {
+                continue;
+            }
+            let mut wrong_version = sealed.clone();
+            wrong_version[0] = version;
+            assert_eq!(
+                open(&[], &wrong_version),
+                Err(OpenError::UnknownVersion { observed: version }),
+                "version must win before key parsing"
+            );
+        }
+
+        let mut corrupt = sealed.clone();
+        *corrupt.last_mut().unwrap() ^= 1;
+        assert_eq!(
+            open(&[], &corrupt),
+            Err(OpenError::BadRecipientKey),
+            "key parsing must precede authenticated opening"
+        );
+        assert_eq!(open(&sk, &corrupt), Err(OpenError::Aead));
+        assert_eq!(open(&sk, &sealed).expect("valid neighboring control"), b"q");
     }
 
-    /// Empty ciphertext passes the 33-byte length gate, fails authentication,
-    /// and maps to `malformed`.
+    /// Pins the complete local error enum to the two-string wire vocabulary.
     #[test]
     fn every_open_failure_maps_to_the_wire_vocabulary() {
-        let (sk, pk) = keypair();
-        let sealed = seal(&pk, b"q").expect("seal");
-
-        let mut wrong_version = sealed.clone();
-        wrong_version[0] = 0x7f;
-        assert_eq!(
-            open(&sk, &wrong_version).unwrap_err().wire_code(),
-            "unsupported_version"
-        );
-
-        assert_eq!(
-            open(&sk, &sealed[..ENC_LEN]).unwrap_err().wire_code(),
-            "malformed",
-            "too short to split"
-        );
-
-        let empty_ct = &sealed[..1 + ENC_LEN];
-        assert_eq!(open(&sk, empty_ct).unwrap_err(), OpenError::Aead);
-        assert_eq!(open(&sk, empty_ct).unwrap_err().wire_code(), "malformed");
-
-        let (other_sk, _) = keypair();
-        assert_eq!(
-            open(&other_sk, &sealed).unwrap_err().wire_code(),
-            "malformed",
-            "a wrong key must not be distinguishable from other failures"
-        );
-
-        assert!(open(&sk, &sealed).is_ok());
+        let cases = [
+            (
+                OpenError::UnknownVersion { observed: 0x7f },
+                "unsupported_version",
+            ),
+            (OpenError::Malformed { observed: 32 }, "malformed"),
+            (OpenError::BadRecipientKey, "malformed"),
+            (OpenError::Aead, "malformed"),
+        ];
+        for (error, expected) in cases {
+            assert_eq!(error.wire_code(), expected);
+        }
     }
 
     #[test]
     fn the_wrong_recipient_cannot_open() {
         let (_, pk) = keypair();
-        let (other_sk, _) = keypair();
+        let (other_sk, other_pk) = keypair();
+        assert_ne!(pk, other_pk, "recipients must be distinct");
         let sealed = seal(&pk, b"q").expect("seal");
         assert_eq!(open(&other_sk, &sealed), Err(OpenError::Aead));
     }

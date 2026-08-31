@@ -2,10 +2,11 @@
 
 - Discovery lenses: protocol contracts, lifecycle transitions, version compatibility.
 - Trigger: `VERSION` is both an emitted field and the only accepted version.
-- Code trail: `VERSION = 0x01` at `src/lib.rs:49-50`; emit at `:127`; gate at `:167-171`; tests at `:261-271` and `:291-296`.
+- Code trail: version definition, emission, and gate in [`src/lib.rs`](../../../../crates/cortexkit-push-seal/src/lib.rs); [`the_envelope_has_version_one_and_fixed_overhead`](../../../../crates/cortexkit-push-seal/src/lib.rs#L228) and [`open_error_precedence_is_stable`](../../../../crates/cortexkit-push-seal/src/lib.rs#L284).
 - Implemented mechanism: equality against one compile-time constant; no negotiation or dual-read window.
 - Failure scenario: a constant edit keeps symbolic self-tests green but diverges from the external opener.
 - Timing/configuration: rollout order matters only when a second version is introduced; no such protocol exists today.
-- Existing evidence: `0x02` and `0x7f` are rejected on full-length envelopes. No test pins the public constant itself to literal `0x01`.
+- Existing evidence: the public constant and emitted byte are pinned to literal `0x01`. A finite loop checks every other byte on a full-length envelope and proves version rejection precedes private-key parsing.
+- Audit status: audited for local emission, exhaustive one-byte rejection, and local gate order. External opener behavior and future rollout remain unaudited.
 - Instrumentation: complete locally; opener rollout evidence is missing.
 - Investigation log: every current reference except the definition uses the symbol, so a one-line value change can preserve local round trips.
