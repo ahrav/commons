@@ -71,9 +71,9 @@ No production `assert!`, `debug_assert!`, or equivalent invariant assertion was 
 | [`each_seal_uses_a_fresh_ephemeral`](../../../crates/cortexkit-push-seal/src/lib.rs#L250) | Two sequential seals must have different `enc`; message: `encapsulated key must not repeat across messages`. | unaudited |
 | [`an_oversized_plaintext_is_refused_with_both_numbers`](../../../crates/cortexkit-push-seal/src/lib.rs#L262) | Invalid key plus length 2049 returns literal cap fields; a matching-key 2048-byte round trip is the positive control. | audited for the local cap boundary and guard order |
 | [`open_error_precedence_is_stable`](../../../crates/cortexkit-push-seal/src/lib.rs#L284) | Multi-defect inputs pin length, every unsupported version byte, private-key parsing, and authenticated-open order with exact variants and a valid control. | audited for local precedence |
-| [`every_open_failure_maps_to_the_wire_vocabulary`](../../../crates/cortexkit-push-seal/src/lib.rs#L461) | A finite table pins both literals for every `OpenError` variant, including `BadRecipientKey`. | audited for the local enum mapping |
-| [`the_wrong_recipient_cannot_open`](../../../crates/cortexkit-push-seal/src/lib.rs#L477) | Asserts generated public keys differ before the second private key returns `Aead`. | audited for the sampled local keypairs |
-| [`the_version_byte_is_authenticated_not_merely_present`](../../../crates/cortexkit-push-seal/src/lib.rs#L490) | Empty AAD fails; correct AAD succeeds as a positive control. | unaudited |
+| [`every_open_failure_maps_to_the_wire_vocabulary`](../../../crates/cortexkit-push-seal/src/lib.rs#L466) | A finite table pins both literals for every `OpenError` variant, including `BadRecipientKey`. | audited for the local enum mapping |
+| [`the_wrong_recipient_cannot_open`](../../../crates/cortexkit-push-seal/src/lib.rs#L482) | Asserts generated public keys differ before the second private key returns `Aead`. | audited for the sampled local keypairs |
+| [`the_version_byte_is_authenticated_not_merely_present`](../../../crates/cortexkit-push-seal/src/lib.rs#L495) | Empty AAD fails; correct AAD succeeds as a positive control. | unaudited |
 
 ## Property catalog
 
@@ -157,7 +157,7 @@ No production `assert!`, `debug_assert!`, or equivalent invariant assertion was 
 - **Fault/timing angle:** AAD refactor or multi-version acceptance while `open` continues using the build constant.
 - **Required faults and enabling state:** Valid envelope plus exact and altered AAD values.
 - **Confidence:** high for current code; [evidence](evidence/version-byte-is-exact-aad.md)
-- **Existing check:** `src/lib.rs:490-515`; status unaudited.
+- **Existing check:** `src/lib.rs:495-520`; status unaudited.
 - **Impact:** Unbound or mismatched version bytes permit parse confusion or cause opaque authentication failures.
 - **Open questions:** None at version 1; multi-version rollout remains unspecified.
 
@@ -213,7 +213,7 @@ No production `assert!`, `debug_assert!`, or equivalent invariant assertion was 
 - **Fault/timing angle:** Key selection or environment mix-up.
 - **Required faults and enabling state:** Two generated keypairs with asserted-distinct public keys and a non-empty plaintext.
 - **Confidence:** high; [evidence](evidence/wrong-recipient-never-opens.md)
-- **Existing check:** [`the_wrong_recipient_cannot_open`](../../../crates/cortexkit-push-seal/src/lib.rs#L477); audited for the sampled local pair after asserting distinct public keys. The cryptographic guarantee and external key-selection paths are not universally audited.
+- **Existing check:** [`the_wrong_recipient_cannot_open`](../../../crates/cortexkit-push-seal/src/lib.rs#L482); audited for the sampled local pair after asserting distinct public keys. The cryptographic guarantee and external key-selection paths are not universally audited.
 - **Impact:** Violation breaks recipient confidentiality.
 - **Open questions:** None.
 
@@ -241,7 +241,7 @@ No production `assert!`, `debug_assert!`, or equivalent invariant assertion was 
 - **Fault/timing angle:** New error variant, string rename, or reclassification.
 - **Required faults and enabling state:** Construct all variants, including a wrong-length private key.
 - **Confidence:** high; [evidence](evidence/wire-error-vocabulary-is-stable.md)
-- **Existing check:** [`every_open_failure_maps_to_the_wire_vocabulary`](../../../crates/cortexkit-push-seal/src/lib.rs#L461), with `BadRecipientKey` reached through [`open_error_precedence_is_stable`](../../../crates/cortexkit-push-seal/src/lib.rs#L284); audited for the local enum and exact literals. External vocabulary agreement remains unaudited.
+- **Existing check:** [`every_open_failure_maps_to_the_wire_vocabulary`](../../../crates/cortexkit-push-seal/src/lib.rs#L466), with `BadRecipientKey` reached through [`open_error_precedence_is_stable`](../../../crates/cortexkit-push-seal/src/lib.rs#L284); audited for the local enum and exact literals. External vocabulary agreement remains unaudited.
 - **Impact:** Drift breaks the cross-language conformance vocabulary.
 - **Open questions:** Whether opener-side key misconfiguration should intentionally collapse to `malformed`.
 
