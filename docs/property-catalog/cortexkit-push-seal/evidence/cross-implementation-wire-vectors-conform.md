@@ -2,7 +2,7 @@
 
 - Discovery lenses: architecture, protocol contracts, version compatibility.
 - Trigger: crate docs state that a separate implementation opens these bytes, while every repository test uses this implementation on both sides.
-- Code trail: boundary claim at `src/lib.rs:6-20`; wire constants at `:30-59`; sealing at `:103-131`; opening and wire mapping at `:133-188`.
+- Code trail: the module docs state the separate-opener boundary; `VERSION`, `MAX_PLAINTEXT_BYTES`, and `ENC_LEN` fix the wire constants; `seal` and `seal_with_rng` emit the envelope; `open` and `OpenError::wire_code` parse it and classify failures.
 - Failure scenario: both local functions change coherently, so self-roundtrip stays green while the external opener rejects the new bytes or classifies failures differently.
 - Timing/configuration: independent release and dependency schedules across repositories.
 - Existing evidence: no external opener, authoritative corpus, or cross-language vector exists in supplied evidence.

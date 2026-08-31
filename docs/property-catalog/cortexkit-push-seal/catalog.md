@@ -10,21 +10,21 @@
 - External evidence: none. The scope question was asked before analysis. No design docs, related repositories, issue trackers, incident reports, known failure modes, or earlier property artifacts were supplied.
 - Repository evidence consulted: crate source, examples, manifest, workspace README and CI, Git history for the crate, and the source of the resolved `hpke 0.14.0` dependency where this crate delegates parsing and RNG behavior.
 
-Documentation and commit messages are treated as claims or leads. Code resolves implemented behavior. The separate opener mentioned in `src/lib.rs:6-7` was not available, so cross-implementation agreement remains unverified.
+Documentation and commit messages are treated as claims or leads. Code resolves implemented behavior. The separate opener named in the module docs was not available, so cross-implementation agreement remains unverified.
 
 ## System model by discovery lens
 
 | Lens | Model |
 |---|---|
-| Architecture and data flow | `seal` checks the plaintext and public key, calls HPKE base mode, and emits `version \|\| enc \|\| ciphertext` (`src/lib.rs:103-131`). `open` checks length and version, parses the private and encapsulated keys, then opens the ciphertext (`src/lib.rs:161-188`). `wire_code` maps local open failures to a two-string external vocabulary (`src/lib.rs:133-154`). |
+| Architecture and data flow | `seal` checks the plaintext and public key, calls HPKE base mode, and emits `version \|\| enc \|\| ciphertext`. `open` checks length and version, parses the private and encapsulated keys, then opens the ciphertext. `wire_code` maps local open failures to a two-string external vocabulary. |
 | State and persistence | The crate source defines no retained state, persistence, cache, queue, or direct file I/O. `seal` enters the resolved OS entropy implementation, which may cache backend state and read `/dev/urandom` on Linux fallback paths. The envelope is the only artifact retained by this API. |
 | Concurrency | The crate source defines no threads, async work, locks, atomics, or shared mutable state. The resolved entropy implementation uses internal atomic/cache state, so concurrency-specific crate invariants are not inferred from the absence of local synchronization. |
-| Claimed safety | The docs claim a fixed suite, layout, version, AAD, empty `info`, inclusive plaintext cap, error vocabulary, recipient confidentiality, and version-bump discipline (`src/lib.rs:4-56,97-160`). |
+| Claimed safety | The docs claim a fixed suite, layout, version, AAD, empty `info`, inclusive plaintext cap, error vocabulary, recipient confidentiality, and version-bump discipline. |
 | Claimed liveness | No explicit liveness guarantee. The library has no convergence or eventual-completion protocol. `seal` also depends on the OS entropy path, which may block, retry, or fall back before returning or panicking. |
 | Bug history and density | Seven commits touch the crate. Three concentrate on selecting the correct operator-pasted key in `handseal`; no production incident or library regression is recorded. The library implementation has not changed since its initial commit. |
-| Existing test strategy | Ten in-module unit tests cover one round trip, suite IDs, one layout size, two random seals, cap boundaries, selected open failures, wrong recipient, and AAD presence. There is no cross-language corpus, integration test, property test, fuzz target, fault injection, or example test. |
-| Failure and degradation | The crate itself performs no retry or fallback. Its dependency may retry or fall back while obtaining entropy and panics if the ambient RNG ultimately fails. Crate documentation claims that a sealer/opener wire mismatch is silent locally and appears on the device as an undecryptable notification (`src/lib.rs:9-12`); the unavailable device path was not verified. |
-| Dependencies | Exact manifest pins select `hpke 0.14.0` and `getrandom 0.4.3` with explicit default-CI features. The tracked `Cargo.lock` records resolved versions and checksums, and CI uses `--locked`. Target-specific feature activation and entropy backends, alternate consumers, the external opener, and non-default build purposes remain unaudited. |
+| Existing test strategy | Fourteen in-module unit tests cover round trips, suite IDs, layout and overhead, ephemeral freshness on both the ambient and RNG-injected paths, cap boundaries, open-error precedence, prefix and single-bit campaigns, sampled totality, the wire vocabulary, wrong recipient, exact AAD and `info`, key-deserialization reachability, and low-order encapsulation. There is no cross-language corpus, integration test, property test, fuzz target, fault injection, or example test. |
+| Failure and degradation | The crate itself performs no retry or fallback. Its dependency may retry or fall back while obtaining entropy and panics if the ambient RNG ultimately fails. Crate documentation claims that a sealer/opener wire mismatch is silent locally and appears on the device as an undecryptable notification; the unavailable device path was not verified. |
+| Dependencies | `hpke 0.14` supplies all cryptographic behavior; direct `getrandom 0.4` supplies the ambient `SysRng` that `seal` passes to it. hpke's `getrandom` feature and `hex` are dev-only. The tracked `Cargo.lock` records the resolved version-and-checksum closure, and CI uses `--locked`. Target-specific feature activation and entropy backends, alternate consumers, the external opener, and non-default build purposes remain unaudited. See [`byte-determining-dependency-closure-is-pinned`](evidence/byte-determining-dependency-closure-is-pinned.md). |
 | Product context | This crate seals push-notification payloads. The actual opener is in another repository. The examples are operator tools for generating a keypair and hand-checking a round trip. |
 | Unproven assumptions | The transport bounds input before `open`; the recipient key is dedicated to this protocol; the external opener agrees on suite, layout, gate order, and wire codes; every byte-affecting change includes a crate-version bump. |
 | Wildcard | `open` hardcodes `ENC_LEN` while `seal` uses the serialized key length. The version value is not pinned to literal `0x01` by a test. The example label parser uses substring and first-match selection. Base-mode HPKE provides neither replay detection nor sender authentication. |
@@ -33,11 +33,11 @@ Documentation and commit messages are treated as claims or leads. Code resolves 
 
 These disagreements stay visible because code may be the defect.
 
-1. `BadRecipientKey` is documented as invalid X25519 point/scalar detection (`src/lib.rs:75-90`), but the resolved dependency checks only the 32-byte serialized length. A degenerate 32-byte public key can instead reach `SealError::Hpke`.
-2. The docs say sealing failures preserve their cause (`src/lib.rs:61-62`), but the dependency's ambient RNG wrapper panics on entropy failure.
-3. The docs delegate `open`'s size bound to transport (`src/lib.rs:156-160`), but no transport or bound exists in this repository.
-4. The docs require version bumps for emitted-byte or behavior changes (`src/lib.rs:13-20`), but no repository check enforces the rule.
-5. The docs say the recipient key is dedicated to this purpose (`src/lib.rs:39-42`), but this repository cannot inspect key use in the device or caller.
+1. `BadRecipientKey` is documented as invalid X25519 point/scalar detection in the `SealError` and `OpenError` variant docs, but the resolved dependency checks only the 32-byte serialized length. A degenerate 32-byte public key can instead reach `SealError::Hpke`.
+2. The docs say sealing failures preserve their cause in the `SealError` docs, but the dependency's ambient RNG wrapper panics on entropy failure.
+3. The docs delegate `open`'s size bound to transport in the `open` docs, but no transport or bound exists in this repository.
+4. The docs require version bumps for emitted-byte or behavior changes in the module docs, but no repository check enforces the rule.
+5. The docs say the recipient key is dedicated to this purpose in the module docs, but this repository cannot inspect key use in the device or caller.
 
 ## Existing-check inventory
 
@@ -47,11 +47,11 @@ U1 local boundary and classification checks are audited below. Other checks rema
 
 | Location | Semantics and message | Status |
 |---|---|---|
-| `src/lib.rs:104-109` | Rejects plaintext over 2048 bytes with `PlaintextTooLarge { limit, observed }`. | unaudited runtime guard |
-| `src/lib.rs:162-166` | Rejects envelopes shorter than 33 bytes with `Malformed { observed }`. | unaudited runtime guard |
-| `src/lib.rs:167-171` | Rejects any leading byte other than `VERSION` with `UnknownVersion { observed }`. | unaudited runtime guard |
-| `src/lib.rs:111-123` | Maps public-key deserialization to `BadRecipientKey` and HPKE sealing failure to `Hpke`. | unaudited runtime validation/error mapping |
-| `src/lib.rs:173-187` | Maps private-key deserialization to `BadRecipientKey`, encapsulated-key parsing and HPKE open failures to `Aead`. | unaudited runtime validation/error mapping |
+| `seal_with_rng` plaintext gate | Rejects plaintext over 2048 bytes with `PlaintextTooLarge { limit, observed }`. | unaudited runtime guard |
+| `open` length gate | Rejects envelopes shorter than 33 bytes with `Malformed { observed }`. | unaudited runtime guard |
+| `open` version gate | Rejects any leading byte other than `VERSION` with `UnknownVersion { observed }`. | unaudited runtime guard |
+| `seal_with_rng` key and HPKE mapping | Maps public-key deserialization to `BadRecipientKey` and HPKE sealing failure to `Hpke`. | unaudited runtime validation/error mapping |
+| `open` key and HPKE mapping | Maps private-key deserialization to `BadRecipientKey`, encapsulated-key parsing and HPKE open failures to `Aead`. | unaudited runtime validation/error mapping |
 | `examples/handseal.rs:20-31` | Requires two arguments; exits 2 with usage or parser error. | unaudited example guard |
 | `examples/handseal.rs:56-77` | Selects `push_seal_pubkey_hex`, accepts `:` or `=`, rejects a token-only labelled block. | unaudited example guard |
 | `examples/handseal.rs:81-99` | Rejects empty, non-hex, and non-64-character keys with operator-facing messages. | unaudited example guard |
@@ -65,15 +65,20 @@ No production `assert!`, `debug_assert!`, or equivalent invariant assertion was 
 
 | Test and location | Existing semantics | Status |
 |---|---|---|
-| `the_pinned_suite_is_the_one_the_opener_agreed_to`, `src/lib.rs:204-209` | Three literal codepoint equalities; messages name KEM, KDF, and AEAD. | unaudited |
-| [`a_sealed_payload_opens_to_the_same_plaintext`](../../../crates/cortexkit-push-seal/src/lib.rs#L212) | Exact byte round trips at lengths 0, 2047, and 2048 with non-UTF-8 fixtures. | audited for these local boundaries |
-| [`the_envelope_has_version_one_and_fixed_overhead`](../../../crates/cortexkit-push-seal/src/lib.rs#L228) | Pins literal version 1, 32-byte encapsulation, 49-byte overhead, and 2097-byte maximum at lengths 0, 1, and 2048. | audited for the leading version and local size literals |
-| `each_seal_uses_a_fresh_ephemeral`, `:232-242` | Two sequential seals must have different `enc`; message: `encapsulated key must not repeat across messages`. | unaudited |
-| [`an_oversized_plaintext_is_refused_with_both_numbers`](../../../crates/cortexkit-push-seal/src/lib.rs#L262) | Invalid key plus length 2049 returns literal cap fields; a matching-key 2048-byte round trip is the positive control. | audited for the local cap boundary and guard order |
-| [`open_error_precedence_is_stable`](../../../crates/cortexkit-push-seal/src/lib.rs#L284) | Multi-defect inputs pin length, every unsupported version byte, private-key parsing, and authenticated-open order with exact variants and a valid control. | audited for local precedence |
-| [`every_open_failure_maps_to_the_wire_vocabulary`](../../../crates/cortexkit-push-seal/src/lib.rs#L322) | A finite table pins both literals for every `OpenError` variant, including `BadRecipientKey`. | audited for the local enum mapping |
-| [`the_wrong_recipient_cannot_open`](../../../crates/cortexkit-push-seal/src/lib.rs#L338) | Asserts generated public keys differ before the second private key returns `Aead`. | audited for the sampled local keypairs |
-| `the_version_byte_is_authenticated_not_merely_present`, `:330-356` | Empty AAD fails; correct AAD succeeds as a positive control. | unaudited |
+| [`the_pinned_suite_is_the_one_the_opener_agreed_to`](../../../crates/cortexkit-push-seal/src/lib.rs) | Three literal codepoint equalities; messages name KEM, KDF, and AEAD. | unaudited |
+| [`a_sealed_payload_opens_to_the_same_plaintext`](../../../crates/cortexkit-push-seal/src/lib.rs) | Exact byte round trips at lengths 0, 2047, and 2048 with non-UTF-8 fixtures. | audited for these local boundaries |
+| [`the_envelope_has_version_one_and_fixed_overhead`](../../../crates/cortexkit-push-seal/src/lib.rs) | Pins literal version 1, 32-byte encapsulation, 49-byte overhead, and 2097-byte maximum at lengths 0, 1, and 2048. | audited for the leading version and local size literals |
+| [`each_seal_uses_a_fresh_ephemeral`](../../../crates/cortexkit-push-seal/src/lib.rs) | Records one 32-byte draw per seal; distinct draws produce distinct `enc`, and repeated draws repeat it. | audited for local draw/context behavior |
+| [`an_oversized_plaintext_is_refused_with_both_numbers`](../../../crates/cortexkit-push-seal/src/lib.rs) | Invalid key plus length 2049 returns literal cap fields; a matching-key 2048-byte round trip is the positive control. | audited for the local cap boundary and guard order |
+| [`open_error_precedence_is_stable`](../../../crates/cortexkit-push-seal/src/lib.rs) | Multi-defect inputs pin length, every unsupported version byte, private-key parsing, and authenticated-open order with exact variants and a valid control. | audited for local precedence |
+| [`every_proper_prefix_of_a_valid_envelope_is_rejected`](../../../crates/cortexkit-push-seal/src/lib.rs) | Every proper prefix returns exact `Malformed` or `Aead` with a valid anchor control. | audited for one generated anchor |
+| [`single_bit_mutations_have_field_specific_outcomes`](../../../crates/cortexkit-push-seal/src/lib.rs) | Every bit in version, `enc`, ciphertext, and tag reaches its exact local rejection. | audited for one generated anchor |
+| [`sampled_malformed_bytes_are_total_through_the_local_envelope_bound`](../../../crates/cortexkit-push-seal/src/lib.rs) | Samples every length through 2097 without unwinding. | sampled evidence; universal totality unaudited |
+| [`every_open_failure_maps_to_the_wire_vocabulary`](../../../crates/cortexkit-push-seal/src/lib.rs) | A finite table pins both literals for every `OpenError` variant, including `BadRecipientKey`. | audited for the local enum mapping |
+| [`the_wrong_recipient_cannot_open`](../../../crates/cortexkit-push-seal/src/lib.rs) | Asserts generated public keys differ before the second private key returns `Aead`. | audited for the sampled local keypairs |
+| [`aad_and_info_are_exact`](../../../crates/cortexkit-push-seal/src/lib.rs) | Direct correct open succeeds; altered AAD or `info` fails. | audited for local HPKE semantics |
+| [`key_deserialization_and_degenerate_public_key_paths_are_reachable`](../../../crates/cortexkit-push-seal/src/lib.rs) | Exercises sampled accepted/rejected key lengths and one degenerate public key. | audited for the sampled inputs |
+| [`low_order_encapsulation_reaches_decap_error`](../../../crates/cortexkit-push-seal/src/lib.rs) | Observes direct `DecapError` before the public `Aead` collapse. | audited for one fixed low-order input |
 
 ## Property catalog
 
@@ -87,7 +92,7 @@ No production `assert!`, `debug_assert!`, or equivalent invariant assertion was 
 - **Fault/timing angle:** Boundary lengths 0 and 2048; binary payloads; no injected fault.
 - **Required faults and enabling state:** Matching keypair and accepted plaintext. The workload must reach both length boundaries.
 - **Confidence:** high; [evidence](evidence/matching-key-roundtrip-preserves-plaintext.md)
-- **Existing check:** [`a_sealed_payload_opens_to_the_same_plaintext`](../../../crates/cortexkit-push-seal/src/lib.rs#L212); audited for the named finite boundaries, not a universal or external compatibility claim.
+- **Existing check:** [`a_sealed_payload_opens_to_the_same_plaintext`](../../../crates/cortexkit-push-seal/src/lib.rs); audited for the named finite boundaries, not a universal or external compatibility claim.
 - **Impact:** Failure destroys the crate's core function and, according to crate documentation, renders notifications undecryptable.
 - **Open questions:** None.
 
@@ -95,13 +100,13 @@ No production `assert!`, `debug_assert!`, or equivalent invariant assertion was 
 
 - **Type:** safety
 - **Status:** active
-- **Exercised:** yes; all three codepoints are asserted in `src/lib.rs:204-209`
+- **Exercised:** yes; all three codepoints are asserted in `the_pinned_suite_is_the_one_the_opener_agreed_to`
 - **Guarantee:** The suite remains KEM `0x0020`, KDF `0x0001`, and AEAD `0x0003`.
 - **Check:** `always(KEM_ID == 0x0020 && KDF_ID == 0x0001 && AEAD_ID == 0x0003)`. `always` fits because these are build-wide wire constants.
 - **Fault/timing angle:** Dependency upgrade or type substitution behind a stable name.
 - **Required faults and enabling state:** None; evaluate on every build.
 - **Confidence:** high; [evidence](evidence/pinned-ciphersuite-codepoints.md)
-- **Existing check:** `src/lib.rs:204-209`; status unaudited.
+- **Existing check:** [`the_pinned_suite_is_the_one_the_opener_agreed_to`](../../../crates/cortexkit-push-seal/src/lib.rs); status unaudited.
 - **Impact:** Mismatch causes cross-repository authentication failure with no local sealer error.
 - **Open questions:** Whether the unavailable opener asserts the same literals.
 
@@ -129,7 +134,7 @@ No production `assert!`, `debug_assert!`, or equivalent invariant assertion was 
 - **Fault/timing angle:** KEM or AEAD change, field insertion/reordering, stale `ENC_LEN`.
 - **Required faults and enabling state:** Accepted plaintexts at lengths 0, 1, 2048 and a matching keypair.
 - **Confidence:** high; [evidence](evidence/envelope-layout-and-overhead-stay-fixed.md)
-- **Existing check:** [`the_envelope_has_version_one_and_fixed_overhead`](../../../crates/cortexkit-push-seal/src/lib.rs#L228); audited for the leading version and local size literals. Field ordering beyond the version, external opener compatibility, and transport compatibility remain unaudited.
+- **Existing check:** [`the_envelope_has_version_one_and_fixed_overhead`](../../../crates/cortexkit-push-seal/src/lib.rs); audited for the leading version and local size literals. Field ordering beyond the version, external opener compatibility, and transport compatibility remain unaudited.
 - **Impact:** Wrong offsets or overhead break the external opener and downstream transport sizing.
 - **Open questions:** Transport encoding and byte limit are unavailable.
 
@@ -143,7 +148,7 @@ No production `assert!`, `debug_assert!`, or equivalent invariant assertion was 
 - **Fault/timing angle:** One-byte constant edit or rollout of a second format.
 - **Required faults and enabling state:** Full-length envelope with each non-`0x01` leading byte.
 - **Confidence:** high; [evidence](evidence/version-one-is-only-emitted-and-accepted-version.md)
-- **Existing check:** [`the_envelope_has_version_one_and_fixed_overhead`](../../../crates/cortexkit-push-seal/src/lib.rs#L228) and [`open_error_precedence_is_stable`](../../../crates/cortexkit-push-seal/src/lib.rs#L284); audited for local emission, acceptance, and precedence. Rollout and external opener agreement remain unaudited.
+- **Existing check:** [`the_envelope_has_version_one_and_fixed_overhead`](../../../crates/cortexkit-push-seal/src/lib.rs) and [`open_error_precedence_is_stable`](../../../crates/cortexkit-push-seal/src/lib.rs); audited for local emission, acceptance, and precedence. Rollout and external opener agreement remain unaudited.
 - **Impact:** A version drift is a silent cross-repository wire break.
 - **Open questions:** Whether future rollout requires dual-version acceptance.
 
@@ -185,7 +190,7 @@ No production `assert!`, `debug_assert!`, or equivalent invariant assertion was 
 - **Fault/timing angle:** Off-by-one errors and accidental truncation.
 - **Required faults and enabling state:** Plaintext lengths 2047, 2048, 2049, and a much larger value.
 - **Confidence:** high; [evidence](evidence/plaintext-cap-is-inclusive-and-nontruncating.md)
-- **Existing check:** [`a_sealed_payload_opens_to_the_same_plaintext`](../../../crates/cortexkit-push-seal/src/lib.rs#L212) and [`an_oversized_plaintext_is_refused_with_both_numbers`](../../../crates/cortexkit-push-seal/src/lib.rs#L262); audited for neighboring accepted lengths, exact 2049 error fields, guard order before key parsing, and an opened at-limit control.
+- **Existing check:** [`a_sealed_payload_opens_to_the_same_plaintext`](../../../crates/cortexkit-push-seal/src/lib.rs) and [`an_oversized_plaintext_is_refused_with_both_numbers`](../../../crates/cortexkit-push-seal/src/lib.rs); audited for neighboring accepted lengths, exact 2049 error fields, guard order before key parsing, and an opened at-limit control.
 - **Impact:** Truncation produces an authenticated blob that does not represent caller intent; rejecting everything would block notifications.
 - **Open questions:** Whether the composing caller also preflights the cap.
 
@@ -193,13 +198,13 @@ No production `assert!`, `debug_assert!`, or equivalent invariant assertion was 
 
 - **Type:** safety
 - **Status:** active
-- **Exercised:** yes and locally audited for every proper prefix and every single-bit field mutation of one valid anchor
+- **Exercised:** yes and locally audited for every proper prefix and every single-bit field mutation of one valid anchor, plus every unsupported version byte and the 33-byte minimum-length envelope
 - **Guarantee:** For the finite anchor campaign, every proper prefix and every single-bit version, encapsulated-key, ciphertext, and tag mutation is rejected.
 - **Check:** For one valid anchor, require exact `Malformed` or `Aead` errors at every proper-prefix length and exact `UnknownVersion` or `Aead` errors for each field mutation. The finite campaign is empirical evidence, not universal mutation coverage or proof of zero forgery probability.
 - **Fault/timing angle:** Short read, partial write, transport corruption, or active tampering in the version, `enc`, ciphertext, or tag.
 - **Required faults and enabling state:** A valid envelope that first opens successfully, all proper-prefix lengths, and every single-bit position across every field.
 - **Confidence:** high for the finite local campaign; [evidence](evidence/tampered-or-truncated-envelope-never-opens.md)
-- **Existing check:** [`every_proper_prefix_of_a_valid_envelope_is_rejected`](../../../crates/cortexkit-push-seal/src/lib.rs#L321) and [`single_bit_mutations_have_field_specific_outcomes`](../../../crates/cortexkit-push-seal/src/lib.rs#L346); audited for one generated anchor with field reach counters. This is not cross-implementation evidence.
+- **Existing check:** [`every_proper_prefix_of_a_valid_envelope_is_rejected`](../../../crates/cortexkit-push-seal/src/lib.rs) and [`single_bit_mutations_have_field_specific_outcomes`](../../../crates/cortexkit-push-seal/src/lib.rs); audited for one generated anchor with field reach counters. [`open_error_precedence_is_stable`](../../../crates/cortexkit-push-seal/src/lib.rs) additionally rejects every non-`0x01` version byte and the 33-byte gate boundary. This is not cross-implementation evidence.
 - **Impact:** Acceptance would expose attacker-controlled or partial notification content.
 - **Open questions:** None.
 
@@ -213,7 +218,7 @@ No production `assert!`, `debug_assert!`, or equivalent invariant assertion was 
 - **Fault/timing angle:** Key selection or environment mix-up.
 - **Required faults and enabling state:** Two generated keypairs with asserted-distinct public keys and a non-empty plaintext.
 - **Confidence:** high; [evidence](evidence/wrong-recipient-never-opens.md)
-- **Existing check:** [`the_wrong_recipient_cannot_open`](../../../crates/cortexkit-push-seal/src/lib.rs#L338); audited for the sampled local pair after asserting distinct public keys. The cryptographic guarantee and external key-selection paths are not universally audited.
+- **Existing check:** [`the_wrong_recipient_cannot_open`](../../../crates/cortexkit-push-seal/src/lib.rs); audited for the sampled local pair after asserting distinct public keys. The cryptographic guarantee and external key-selection paths are not universally audited.
 - **Impact:** Violation breaks recipient confidentiality.
 - **Open questions:** None.
 
@@ -227,7 +232,7 @@ No production `assert!`, `debug_assert!`, or equivalent invariant assertion was 
 - **Fault/timing angle:** Multi-defect envelope, especially a truncated future-version envelope.
 - **Required faults and enabling state:** Inputs with at least two defects at once; single-defect tests are vacuous for precedence.
 - **Confidence:** high for this implementation; cross-implementation agreement is unknown; [evidence](evidence/open-error-precedence-is-stable.md)
-- **Existing check:** [`open_error_precedence_is_stable`](../../../crates/cortexkit-push-seal/src/lib.rs#L284); audited for local length, exhaustive version-byte, private-key parsing, and authenticated-open precedence with exact errors and a valid control. External opener precedence remains unknown.
+- **Existing check:** [`open_error_precedence_is_stable`](../../../crates/cortexkit-push-seal/src/lib.rs); audited for local length, exhaustive version-byte, private-key parsing, and authenticated-open precedence with exact errors and a valid control. External opener precedence remains unknown.
 - **Impact:** If the unavailable opener uses different precedence, the implementations produce different corpus results and diagnosis.
 - **Open questions:** The unavailable opener's gate order.
 
@@ -241,7 +246,7 @@ No production `assert!`, `debug_assert!`, or equivalent invariant assertion was 
 - **Fault/timing angle:** New error variant, string rename, or reclassification.
 - **Required faults and enabling state:** Construct all variants, including a wrong-length private key.
 - **Confidence:** high; [evidence](evidence/wire-error-vocabulary-is-stable.md)
-- **Existing check:** [`every_open_failure_maps_to_the_wire_vocabulary`](../../../crates/cortexkit-push-seal/src/lib.rs#L322), with `BadRecipientKey` reached through [`open_error_precedence_is_stable`](../../../crates/cortexkit-push-seal/src/lib.rs#L284); audited for the local enum and exact literals. External vocabulary agreement remains unaudited.
+- **Existing check:** [`every_open_failure_maps_to_the_wire_vocabulary`](../../../crates/cortexkit-push-seal/src/lib.rs), with `BadRecipientKey` reached through [`open_error_precedence_is_stable`](../../../crates/cortexkit-push-seal/src/lib.rs); audited for the local enum and exact literals. External vocabulary agreement remains unaudited.
 - **Impact:** Drift breaks the cross-language conformance vocabulary.
 - **Open questions:** Whether opener-side key misconfiguration should intentionally collapse to `malformed`.
 
@@ -249,13 +254,13 @@ No production `assert!`, `debug_assert!`, or equivalent invariant assertion was 
 
 - **Type:** safety
 - **Status:** active
-- **Exercised:** yes and locally audited through the shared RNG-injected sealing path
+- **Exercised:** yes and locally audited through both the RNG-injected sealing path and two calls to the public `seal`
 - **Guarantee:** Every successful `seal` after the plaintext and key gates uses a newly generated ephemeral and a newly constructed sender context.
 - **Check:** A test-only RNG records exactly one fresh draw per successful call and supplies distinct fixed draw bytes; each call constructs a new sender context. A negative-control RNG repeats draw bytes and must produce repeated `enc`, proving the no-repeat canary detects degraded entropy. Production no-repeat campaigns remain statistical evidence, not proof. `always` applies to the per-successful-call draw/context obligation.
 - **Fault/timing angle:** Degraded or accidental deterministic custom RNG, or cached sender context. The resolved default `SysRng` obtains OS bytes per call; fork duplication is not asserted for that backend.
 - **Required faults and enabling state:** Two successful seals with identical valid recipient and accepted plaintext under distinct deterministic draws, plus two seals under a repeated-draw negative control.
 - **Confidence:** high for intended behavior; [evidence](evidence/each-seal-uses-fresh-ephemeral.md)
-- **Existing check:** [`each_seal_uses_a_fresh_ephemeral`](../../../crates/cortexkit-push-seal/src/lib.rs); audited for one 32-byte draw per successful seal, distinct deterministic draws producing distinct encapsulations, and repeated draws producing repeated encapsulations. Production entropy quality remains outside this check.
+- **Existing check:** [`each_seal_uses_a_fresh_ephemeral`](../../../crates/cortexkit-push-seal/src/lib.rs); audited for one 32-byte draw per successful `seal_with_rng` call, distinct deterministic draws producing distinct encapsulations, and repeated draws producing repeated encapsulations. The same test also calls the public `seal` twice and requires distinct encapsulations, so an ambient RNG replaced by a fixed or seeded source fails the suite. Production entropy quality remains outside this check.
 - **Impact:** Reuse can repeat the AEAD key/nonce pair and break confidentiality.
 - **Open questions:** Whether production build flags can select a custom entropy backend and how that configuration is controlled.
 
@@ -269,7 +274,7 @@ No production `assert!`, `debug_assert!`, or equivalent invariant assertion was 
 - **Fault/timing angle:** Boundary slicing and malformed authenticated data.
 - **Required faults and enabling state:** Arbitrary key and envelope bytes within the caller-owned bound, including very short inputs. The exact bound is unresolved.
 - **Confidence:** medium by code inspection because the caller bound is unavailable; [evidence](evidence/open-is-total-over-bounded-input.md)
-- **Existing check:** [`sampled_malformed_bytes_are_total_through_the_local_envelope_bound`](../../../crates/cortexkit-push-seal/src/lib.rs#L423); sampled evidence only. It reaches every length through the largest locally emitted envelope and every public error class, but not every byte string, transport resource safety, or a caller-owned bound. Status remains unaudited.
+- **Existing check:** [`sampled_malformed_bytes_are_total_through_the_local_envelope_bound`](../../../crates/cortexkit-push-seal/src/lib.rs); sampled evidence only. It reaches every length through the largest locally emitted envelope and every public error class, but not every byte string, transport resource safety, or a caller-owned bound. Status remains unaudited.
 - **Impact:** Panic would turn malformed input into denial of service for any caller exposing `open`.
 - **Open questions:** Whether untrusted input reaches this helper outside corpus generation.
 
@@ -376,7 +381,7 @@ No production `assert!`, `debug_assert!`, or equivalent invariant assertion was 
 - **Type:** reachability
 - **Status:** active
 - **Exercised:** partially; the dependency serialized size is pinned to the local split, but the error branch is not instrumented
-- **Guarantee:** Under the resolved X25519 deserializer contract, the `EncappedKey::from_bytes` error mapping at `src/lib.rs:176` is never entered.
+- **Guarantee:** Under the resolved X25519 deserializer contract, the `EncappedKey::from_bytes` error mapping in `open` is never entered.
 - **Check:** `unreachable(encapped_key_parse_error_branch)`. `unreachable` fits because this is a dedicated code point whose execution would mean `ENC_LEN` no longer matches the dependency's serialized key size.
 - **Fault/timing angle:** KEM or dependency change that alters serialized size or adds same-size semantic validation while local splitting remains unchanged.
 - **Required faults and enabling state:** None under the resolved dependency behavior; a future size or deserializer-semantics change can wake the branch.
@@ -403,13 +408,13 @@ No production `assert!`, `debug_assert!`, or equivalent invariant assertion was 
 
 - **Type:** safety
 - **Status:** active
-- **Exercised:** partially; default CI records exact direct versions, manifest features, and the resolved version-and-checksum closure, and rejects manifest/lock mismatch
+- **Exercised:** partially; default CI records direct version requirements, manifest features, and the resolved version-and-checksum closure, and rejects manifest/lock mismatch
 - **Guarantee:** Every supported target and build purpose that produces or verifies sealed bytes uses its approved enabled-feature set, entropy-backend configuration, command edge set, and version-and-checksum identity for the full transitive dependency graph.
 - **Check:** `always((enabled_features, getrandom_backend, cargo_edges, resolved_graph) == approved_build_identity[target, purpose])` for default verification, deterministic-vector generation, and entropy-failure testing on each supported target. `always` fits because one target can intentionally have several backend/configuration identities.
 - **Fault/timing angle:** A new in-range dependency release appears between developer, CI, consumer, or release builds.
 - **Required faults and enabling state:** The tracked lockfile plus a deliberate manifest/lock mismatch prove default-CI resolution drift is rejected. Deliberate target-feature, backend, consumer, opener, and build-purpose drift remain untested.
 - **Confidence:** high for the default-CI resolution and manifest feature set; low for the broader property; [evidence](evidence/byte-determining-dependency-closure-is-pinned.md)
-- **Existing check:** Exact direct dependency requirements in `crates/cortexkit-push-seal/Cargo.toml`, the tracked workspace `Cargo.lock`, and `--locked` on every CI Cargo build/lint/test command. The broad property remains unaudited.
+- **Existing check:** Direct dependency requirements and explicit features in `crates/cortexkit-push-seal/Cargo.toml`, the tracked workspace `Cargo.lock`, and `--locked` on every CI Cargo build/lint/test command. The broad property remains unaudited.
 - **Impact:** Dependency drift can change bytes or error behavior without a crate-source diff or version signal, and it makes revision-to-revision wire comparisons ambiguous.
 - **Open questions:** Target-specific activated features and entropy backends; identities for deterministic-vector and entropy-failure builds; alternate path consumers; whether the external opener pins its closure and where conformance vectors record build identity. `(needs human input)`
 
@@ -460,7 +465,7 @@ These findings are not active safety properties. A future sender-authentication 
 | Degenerate or low-order public value | `degenerate-public-key-hpke-error-is-reachable` | yes |
 | KEM serialized-size or deserializer-semantics drift | `encapped-key-parse-failure-is-unreachable`, `envelope-layout-and-overhead-stay-fixed` | build-time only |
 | Low-order attacker-controlled `enc` | `low-order-encapsulation-aead-path-is-reachable` | yes with a fixed dependency-approved vector |
-| New in-range crypto dependency release | `byte-determining-dependency-closure-is-pinned` | yes for default CI through exact direct pins, tracked `Cargo.lock`, and `--locked`; broader identities remain unaudited |
+| New in-range crypto dependency release | `byte-determining-dependency-closure-is-pinned` | yes for default CI through the tracked `Cargo.lock` and `--locked`; broader identities remain unaudited |
 | Byte-affecting commit without version bump | `version-bump-accompanies-wire-change` | no qualifying historical commit yet |
 
 ## Relationship map

@@ -2,7 +2,7 @@
 
 - Discovery lenses: architecture, data integrity, idempotency and replay.
 - Trigger: the crate's stated purpose and the one existing round-trip test.
-- Code trail: `seal` and `open` in [`src/lib.rs`](../../../../crates/cortexkit-push-seal/src/lib.rs); [`a_sealed_payload_opens_to_the_same_plaintext`](../../../../crates/cortexkit-push-seal/src/lib.rs#L212).
+- Code trail: `seal` and `open` in [`src/lib.rs`](../../../../crates/cortexkit-push-seal/src/lib.rs); [`a_sealed_payload_opens_to_the_same_plaintext`](../../../../crates/cortexkit-push-seal/src/lib.rs).
 - Implemented mechanism: matching HPKE base-mode contexts use the same suite, empty `info`, and `[VERSION]` AAD.
 - Failure scenario: a boundary length, binary payload, or dependency change causes self-produced bytes to open incorrectly.
 - Timing/configuration: no timing dependence. Accepted domain is `0..=2048` plaintext bytes.
