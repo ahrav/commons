@@ -5,17 +5,35 @@ use serde_json::{json, Value};
 const FIXTURE_PATH: &str = "crates/cortexkit-push-seal/tests/golden/push-seal-wire-v1.json";
 const MANIFEST_PATH: &str = "crates/cortexkit-push-seal/Cargo.toml";
 
+fn strip_comment(line: &str) -> &str {
+    let mut in_string = false;
+    for (index, byte) in line.bytes().enumerate() {
+        match byte {
+            b'"' => in_string = !in_string,
+            b'#' if !in_string => return &line[..index],
+            _ => {}
+        }
+    }
+    line
+}
+
 fn package_version(manifest: &str) -> &str {
     let mut in_package = false;
     for line in manifest.lines() {
-        let line = line.trim();
-        if line == "[package]" {
-            in_package = true;
-        } else if line.starts_with('[') {
-            in_package = false;
-        } else if in_package {
-            if let Some(version) = line.strip_prefix("version = ") {
-                return version.trim_matches('"');
+        let line = strip_comment(line).trim();
+        if let Some(header) = line
+            .strip_prefix('[')
+            .and_then(|rest| rest.strip_suffix(']'))
+        {
+            in_package = header.trim() == "package";
+            continue;
+        }
+        if !in_package {
+            continue;
+        }
+        if let Some((key, value)) = line.split_once('=') {
+            if key.trim() == "version" {
+                return value.trim().trim_matches('"');
             }
         }
     }
@@ -143,6 +161,46 @@ fn synthetic_version_gate_cases() {
     );
 }
 
+#[test]
+fn manifest_formatting_does_not_change_the_read_version() {
+    let canonical = "[package]\nname = \"cortexkit-push-seal\"\nversion = \"0.1.0\"\n";
+    for variant in [
+        "[ package ]\nversion = \"0.1.0\"\n",
+        "[package]\nversion=\"0.1.0\"\n",
+        "[package]\nversion  =   \"0.1.0\"   # pinned\n",
+        "[package] # metadata\nversion = \"0.1.0\"\n",
+        "[dependencies]\nversion = \"9.9.9\"\n[package]\nversion = \"0.1.0\"\n",
+        "[package]\nkeywords = [\n    \"push\",\n]\nversion = \"0.1.0\"\n",
+    ] {
+        assert_eq!(
+            package_version(variant),
+            package_version(canonical),
+            "variant read a different version: {variant:?}"
+        );
+    }
+}
+
+#[test]
+fn a_commented_version_still_gates_a_wire_change() {
+    let unchanged = fixture_with("0.1.0", "01", "synthetic");
+    let wire_change = fixture_with("0.1.0", "02", "synthetic");
+    let commented = "[package]\nversion = \"0.1.0\" # pinned until the wire settles\n";
+
+    assert!(
+        check_version_gate(Some(&unchanged), &wire_change, commented, commented)
+            .unwrap_err()
+            .contains("without a package version bump")
+    );
+    assert!(check_version_gate(
+        Some(&unchanged),
+        &wire_change,
+        commented,
+        "[package]\nversion = \"0.0.9\" # rolled back\n"
+    )
+    .unwrap_err()
+    .contains("did not increase"));
+}
+
 fn git(args: &[&str]) -> Result<String, String> {
     let output = Command::new("git")
         .args(args)
@@ -180,7 +238,11 @@ fn actual_git_diff_requires_version_bump() {
         .unwrap_or_else(|error| panic!("no merge base between {base} and {head}: {error}"));
     let merge_base = merge_base.trim();
 
-    let base_fixture = revision_file(merge_base, FIXTURE_PATH).unwrap();
+    // A merge base lacking the fixture may lack the manifest too, so reading the
+    // manifest first would panic on the bootstrap case this gate accepts.
+    let Some(base_fixture) = revision_file(merge_base, FIXTURE_PATH).unwrap() else {
+        return;
+    };
     let head_fixture = revision_file(&head, FIXTURE_PATH)
         .unwrap()
         .unwrap_or_else(|| panic!("{FIXTURE_PATH} missing at {head}"));
@@ -192,7 +254,7 @@ fn actual_git_diff_requires_version_bump() {
         .unwrap_or_else(|| panic!("{MANIFEST_PATH} missing at {head}"));
 
     check_version_gate(
-        base_fixture.as_deref(),
+        Some(&base_fixture),
         &head_fixture,
         &base_manifest,
         &head_manifest,
