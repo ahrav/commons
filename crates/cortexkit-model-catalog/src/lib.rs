@@ -26,7 +26,7 @@ pub type RateNanosPerMtok = i64;
 pub enum CatalogParseError {
     /// The snapshot is invalid JSON or its top-level value is not an object.
     Json(String),
-    /// A cost number that cannot produce an integer nanodollar rate.
+    /// A cost value that is nonnumeric, out of range, or rounds a nonzero value to zero.
     InexactRate {
         provider: String,
         model: String,
@@ -159,7 +159,7 @@ impl CatalogDoc {
     ///
     /// # Errors
     ///
-    /// Returns [`CatalogParseError::Json`] for invalid JSON or a non-object top-level value, [`CatalogParseError::InexactRate`] for an inexact rate, [`CatalogParseError::NegativeRate`] for a negative rate, or [`CatalogParseError::MissingTierThreshold`] when a tier is not context-based or lacks a readable threshold.
+    /// Returns [`CatalogParseError::Json`] for invalid JSON or a non-object top-level value, [`CatalogParseError::InexactRate`] for a nonnumeric, out-of-range, or nonzero rate that rounds to zero, [`CatalogParseError::NegativeRate`] for a negative rate, or [`CatalogParseError::MissingTierThreshold`] when a tier is not context-based or lacks a readable threshold.
     pub fn parse(json: &str) -> Result<Self, CatalogParseError> {
         let root: Value =
             serde_json::from_str(json).map_err(|e| CatalogParseError::Json(e.to_string()))?;

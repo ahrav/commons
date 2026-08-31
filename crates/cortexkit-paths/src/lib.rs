@@ -10,7 +10,7 @@ use std::{
 
 /// Stable canonical identity for a project root.
 ///
-/// Stores a platform-canonical filesystem path as a project-root identity.
+/// Canonical form is a cryptographic compatibility boundary.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct ProjectRootId(PathBuf);
 

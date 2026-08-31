@@ -21,7 +21,7 @@ use cortexkit_lease::{LeaseError, LeaseKey, LeaseStore};
 /// Migration statements and their version record commit together.
 #[derive(Debug, Clone, Copy)]
 pub struct Migration {
-    /// Version applied when greater than the namespace's recorded maximum.
+    /// Must be unique within a namespace and greater than its recorded maximum.
     pub version: u32,
     /// SQL executed as a batch (multiple statements allowed): DDL and/or seed rows.
     pub statements: &'static str,
