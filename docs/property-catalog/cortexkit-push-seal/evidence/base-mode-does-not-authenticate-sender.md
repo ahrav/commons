@@ -2,7 +2,7 @@
 
 - Discovery lenses: security boundaries, protocol contracts.
 - Trigger: the crate uses HPKE base mode on both sides.
-- Code trail: `OpModeS::Base` at `src/lib.rs:117`; `OpModeR::Base` at `:180`; no sender public key, PSK, or signature is carried in the API or envelope.
+- Code trail: `seal_with_rng` passes `OpModeS::Base` and `open` passes `OpModeR::Base`; no sender public key, PSK, or signature is carried in the API or envelope.
 - Implemented mechanism: possession of the recipient public key is sufficient to create a valid envelope; recipient private-key possession is required only to open it.
 - Failure scenario: a party that learns the public key injects notification content while a caller incorrectly treats successful open as sender authentication.
 - Timing/configuration: public-key disclosure or broad public-key distribution is the enabling state.

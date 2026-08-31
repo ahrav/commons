@@ -1,8 +1,8 @@
 # Evidence: `encapped-key-parse-failure-is-unreachable`
 
 - Discovery lenses: reachability, protocol contracts, version compatibility.
-- Trigger: fresh portfolio review found no `unreachable` record despite a dedicated impossible branch at `src/lib.rs:176`.
-- Code trail: minimum-length gate at `src/lib.rs:162`; exact slice at `:175`; error mapping at `:176`; `ENC_LEN = 32` at `:59`.
+- Trigger: fresh portfolio review found no `unreachable` record despite a dedicated impossible branch, the `EncappedKey::from_bytes` error mapping in `open`.
+- Code trail: `open`'s minimum-length gate admits only envelopes of at least `1 + ENC_LEN` bytes, so it always slices exactly `ENC_LEN = 32` bytes into `EncappedKey::from_bytes`, whose error arm maps to `OpenError::Aead`.
 - Dependency trail: `hpke 0.14.0/src/kem/dhkem.rs:62-68` delegates to X25519 public-key deserialization at `src/dhkex/x25519.rs:54-65`, whose only current failure is serialized length mismatch.
 - Competing explanation: the parser could reject non-canonical or low-order points. Dependency source says conversion is infallible once length is 32; low-order rejection occurs later during DH.
 - Failure scenario: a future KEM or dependency changes its serialized size or adds same-size semantic validation while local assumptions remain unchanged, waking the branch and mapping the new failure to `Aead`.
