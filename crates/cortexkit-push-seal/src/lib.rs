@@ -277,29 +277,70 @@ mod tests {
         );
         assert_eq!(open(&sk, &envelope).expect("fixture opens"), plaintext);
 
-        let lock = include_str!("../../../Cargo.lock");
-        let locked_version = |name: &str| {
-            let marker = format!("name = \"{name}\"");
-            let mut lines = lock.lines();
-            for line in lines.by_ref() {
-                if line.trim() == marker {
-                    break;
-                }
-            }
-            lines
+        // Resolving a name against the whole lock file picks whichever `[[package]]`
+        // sorts first, which is a different version than this crate builds against as
+        // soon as any workspace crate pulls in a second one. Walk this crate's own
+        // dependency edges instead.
+        // commentlint: allow(JUDGE)
+        let lock: toml::Table = include_str!("../../../Cargo.lock")
+            .parse()
+            .expect("Cargo.lock parses as TOML");
+        let packages = lock["package"].as_array().expect("lock packages");
+        let entry = |name: &str, version: Option<&str>| {
+            let mut matches = packages.iter().filter(|package| {
+                package["name"].as_str() == Some(name)
+                    && version.is_none_or(|version| package["version"].as_str() == Some(version))
+            });
+            let found = matches
                 .next()
-                .and_then(|line| line.trim().strip_prefix("version = "))
-                .map(|version| version.trim_matches('"').to_owned())
-                .unwrap_or_else(|| panic!("{name} missing from Cargo.lock"))
+                .unwrap_or_else(|| panic!("{name} {version:?} missing from Cargo.lock"));
+            assert!(
+                matches.next().is_none(),
+                "{name} {version:?} is ambiguous in Cargo.lock"
+            );
+            found
         };
+        // A dependency entry is `name` when the lock holds one version of it and
+        // `name version` when it holds several.
+        let mut reachable: std::collections::BTreeMap<&str, std::collections::BTreeSet<&str>> =
+            std::collections::BTreeMap::new();
+        let root = entry("cortexkit-push-seal", None);
+        let mut queue = vec![root];
+        while let Some(package) = queue.pop() {
+            let name = package["name"].as_str().expect("package name");
+            let version = package["version"].as_str().expect("package version");
+            if !reachable.entry(name).or_default().insert(version) {
+                continue;
+            }
+            let Some(dependencies) = package.get("dependencies") else {
+                continue;
+            };
+            for dependency in dependencies.as_array().expect("dependency list") {
+                let dependency = dependency.as_str().expect("dependency entry");
+                let (name, version) = match dependency.split_once(' ') {
+                    Some((name, version)) => (name, Some(version)),
+                    None => (dependency, None),
+                };
+                queue.push(entry(name, version));
+            }
+        }
         let recorded_dependencies = fixture["build_identity"]["dependencies"]
             .as_object()
             .expect("recorded dependencies");
         assert!(!recorded_dependencies.is_empty());
         for (name, recorded) in recorded_dependencies {
+            let resolved = reachable
+                .get(name.as_str())
+                .unwrap_or_else(|| panic!("{name} is not a dependency of this crate"));
+            assert_eq!(
+                resolved.len(),
+                1,
+                "this crate reaches several versions of {name}: {resolved:?}; \
+                 build_identity records one"
+            );
             assert_eq!(
                 recorded.as_str().expect("recorded dependency version"),
-                locked_version(name),
+                *resolved.iter().next().expect("resolved version"),
                 "fixture build_identity.dependencies.{name} must match Cargo.lock"
             );
         }

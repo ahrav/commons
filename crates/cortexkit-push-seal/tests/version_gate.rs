@@ -5,39 +5,20 @@ use serde_json::{json, Value};
 const FIXTURE_PATH: &str = "crates/cortexkit-push-seal/tests/golden/push-seal-wire-v1.json";
 const MANIFEST_PATH: &str = "crates/cortexkit-push-seal/Cargo.toml";
 
-fn strip_comment(line: &str) -> &str {
-    let mut in_string = false;
-    for (index, byte) in line.bytes().enumerate() {
-        match byte {
-            b'"' | b'\'' => in_string = !in_string,
-            b'#' if !in_string => return &line[..index],
-            _ => {}
-        }
-    }
-    line
-}
-
-fn package_version(manifest: &str) -> &str {
-    let mut in_package = false;
-    for line in manifest.lines() {
-        let line = strip_comment(line).trim();
-        if let Some(header) = line
-            .strip_prefix('[')
-            .and_then(|rest| rest.strip_suffix(']'))
-        {
-            in_package = header.trim() == "package";
-            continue;
-        }
-        if !in_package {
-            continue;
-        }
-        if let Some((key, value)) = line.split_once('=') {
-            if key.trim() == "version" {
-                return value.trim().trim_matches(['"', '\'']);
-            }
-        }
-    }
-    panic!("package version missing");
+// Cargo reads the manifest as TOML, so quoted keys, escape sequences, dotted keys, and
+// either string style all name the same field. Approximating that grammar by hand read
+// some of those spellings wrongly.
+// commentlint: allow(JUDGE)
+fn package_version(manifest: &str) -> Result<String, String> {
+    let document: toml::Table = manifest
+        .parse()
+        .map_err(|error| format!("unparseable manifest: {error}"))?;
+    document
+        .get("package")
+        .and_then(|package| package.get("version"))
+        .and_then(|version| version.as_str())
+        .map(str::to_owned)
+        .ok_or_else(|| "manifest has no [package] version".to_owned())
 }
 
 // A numeric identifier is held as digits rather than an integer: SemVer bounds neither
@@ -182,11 +163,11 @@ fn check_version_gate(
     if represented_wire_surface(base_fixture)? == represented_wire_surface(head_fixture)? {
         return Ok(());
     }
-    let head_version = package_version(head_manifest);
-    let head = parse_version(head_version)?;
+    let head_version = package_version(head_manifest)?;
+    let head = parse_version(&head_version)?;
     for manifest in prior_manifests {
-        let prior_version = package_version(manifest);
-        let prior = parse_version(prior_version)?;
+        let prior_version = package_version(manifest)?;
+        let prior = parse_version(&prior_version)?;
         if head == prior {
             return Err(format!(
                 "push-seal wire fixture changed without a package version bump ({head_version})"
@@ -279,8 +260,13 @@ fn manifest_formatting_does_not_change_the_read_version() {
         "[package]\nversion=\"0.1.0\"\n",
         "[package]\nversion  =   \"0.1.0\"   # pinned\n",
         "[package] # metadata\nversion = \"0.1.0\"\n",
-        "[dependencies]\nversion = \"9.9.9\"\n[package]\nversion = \"0.1.0\"\n",
+        "[dependencies]\nfoo = \"9.9.9\"\n[package]\nversion = \"0.1.0\"\n",
         "[package]\nkeywords = [\n    \"push\",\n]\nversion = \"0.1.0\"\n",
+        "[package]\n\"version\" = \"0.1.0\"\n",
+        "[package]\n'version' = \"0.1.0\"\n",
+        "[package]\nversion = \"0.\\u0031.0\"\n",
+        "package.version = \"0.1.0\"\n",
+        "[package]\ndescription = \"\"\"\n[package]\nversion = \"9.9.9\"\n\"\"\"\nversion = \"0.1.0\"\n",
     ] {
         assert_eq!(
             package_version(variant),
@@ -323,6 +309,24 @@ fn literal_string_quoting_reads_the_same_version() {
         check_version_gate(Some(&unchanged), &wire_change, &[double], literal)
             .unwrap_err()
             .contains("without a package version bump")
+    );
+}
+
+#[test]
+fn an_unreadable_manifest_fails_the_gate() {
+    let unchanged = fixture_with("0.1.0", "01", "synthetic");
+    let wire_change = fixture_with("0.1.0", "02", "synthetic");
+    let base = "[package]\nversion = \"0.1.0\"\n";
+
+    assert!(
+        check_version_gate(Some(&unchanged), &wire_change, &[base], "[package")
+            .unwrap_err()
+            .contains("unparseable manifest")
+    );
+    assert!(
+        check_version_gate(Some(&unchanged), &wire_change, &[base], "[workspace]\n")
+            .unwrap_err()
+            .contains("no [package] version")
     );
 }
 
