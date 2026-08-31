@@ -44,31 +44,55 @@ fn represented_contract(fixture: &str) -> Result<Value, &'static str> {
         serde_json::from_str(fixture).map_err(|_| "push-seal fixture is not valid JSON")?;
     Ok(json!({
         "ciphersuite": {
-            "mode": fixture["ciphersuite"]["mode"],
-            "kem": fixture["ciphersuite"]["kem"]["codepoint"],
-            "kdf": fixture["ciphersuite"]["kdf"]["codepoint"],
-            "aead": fixture["ciphersuite"]["aead"]["codepoint"],
+            "mode": required(&fixture, &["ciphersuite", "mode"])?,
+            "kem": required(&fixture, &["ciphersuite", "kem", "codepoint"])?,
+            "kdf": required(&fixture, &["ciphersuite", "kdf", "codepoint"])?,
+            "aead": required(&fixture, &["ciphersuite", "aead", "codepoint"])?,
         },
-        "inputs": fixture["inputs"],
-        "expected": fixture["expected"],
+        "inputs": required(&fixture, &["inputs"])?,
+        "expected": required(&fixture, &["expected"])?,
     }))
+}
+
+/// A structurally hollow fixture must fail loudly, not project `Null` and
+/// compare equal to another hollow fixture: absent or `Null` contract fields
+/// would otherwise make the version gate silently vacuous after a fixture
+/// shape change.
+fn required<'a>(fixture: &'a Value, path: &[&str]) -> Result<&'a Value, &'static str> {
+    let mut current = fixture;
+    for key in path {
+        current = current
+            .get(key)
+            .ok_or("push-seal fixture is missing a represented contract field")?;
+    }
+    if current.is_null() {
+        return Err("push-seal fixture is missing a represented contract field");
+    }
+    Ok(current)
 }
 
 #[test]
 fn synthetic_version_gate_cases() {
     let manifest_v1 = "[package]\nname = \"cortexkit-push-seal\"\nversion = \"0.1.0\"\n";
     let manifest_v2 = "[package]\nname = \"cortexkit-push-seal\"\nversion = \"0.2.0\"\n";
-    let contract_v1 =
-        r#"{"ciphersuite":{"mode":"Base"},"inputs":{"aad":"01"},"expected":{"wire":"aa"}}"#;
+    let contract_v1 = r#"{
+        "ciphersuite":{"mode":"Base","kem":{"codepoint":32},"kdf":{"codepoint":1},"aead":{"codepoint":3}},
+        "inputs":{"aad":"01"},
+        "expected":{"wire":"aa"}
+    }"#;
     let contract_v1_with_new_prose = r#"{
         "provenance": {"note": "updated test prose"},
         "build_identity": {"source_revision": "different"},
-        "ciphersuite": {"mode": "Base"},
+        "ciphersuite":{"mode":"Base","kem":{"codepoint":32},"kdf":{"codepoint":1},"aead":{"codepoint":3}},
         "inputs": {"aad": "01"},
         "expected": {"wire": "aa"}
     }"#;
-    let contract_v2 =
-        r#"{"ciphersuite":{"mode":"Base"},"inputs":{"aad":"01"},"expected":{"wire":"bb"}}"#;
+    let contract_v2 = r#"{
+        "ciphersuite":{"mode":"Base","kem":{"codepoint":32},"kdf":{"codepoint":1},"aead":{"codepoint":3}},
+        "inputs":{"aad":"01"},
+        "expected":{"wire":"bb"}
+    }"#;
+    let hollow_contract = r#"{"ciphersuite":{"mode":"Base"},"inputs":{"aad":"01"}}"#;
 
     assert_eq!(
         check_version_gate(Some(contract_v1), contract_v1, manifest_v1, manifest_v1),
@@ -95,6 +119,19 @@ fn synthetic_version_gate_cases() {
         ),
         Ok(())
     );
+    assert_eq!(
+        check_version_gate(Some(contract_v1), hollow_contract, manifest_v1, manifest_v1),
+        Err("push-seal fixture is missing a represented contract field")
+    );
+    assert_eq!(
+        check_version_gate(
+            Some(hollow_contract),
+            hollow_contract,
+            manifest_v1,
+            manifest_v1
+        ),
+        Err("push-seal fixture is missing a represented contract field")
+    );
 }
 
 fn git(args: &[&str]) -> Result<String, String> {
@@ -117,11 +154,24 @@ fn revision_file(revision: &str, path: &str) -> Result<Option<String>, String> {
     }
 }
 
+/// True when the revision resolves to a readable commit in this clone. Push
+/// events can name a base that is not fetchable (ref creation or a
+/// force-push); such a base identifies nothing to compare against, so the
+/// gate treats it like a missing base fixture instead of failing the run.
+fn revision_exists(revision: &str) -> bool {
+    git(&["cat-file", "-e", &format!("{revision}^{{commit}}")]).is_ok()
+}
+
 #[test]
 #[ignore = "requires PUSH_SEAL_BASE_SHA and PUSH_SEAL_HEAD_SHA"]
 fn actual_git_diff_requires_version_bump() {
     let base = std::env::var("PUSH_SEAL_BASE_SHA").expect("PUSH_SEAL_BASE_SHA must be set");
     let head = std::env::var("PUSH_SEAL_HEAD_SHA").expect("PUSH_SEAL_HEAD_SHA must be set");
+
+    if !revision_exists(&base) {
+        eprintln!("skipping version gate: base revision {base} is not a readable commit");
+        return;
+    }
 
     let base_fixture = revision_file(&base, FIXTURE_PATH).unwrap();
     let head_fixture = revision_file(&head, FIXTURE_PATH)

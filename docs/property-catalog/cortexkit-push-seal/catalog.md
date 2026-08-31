@@ -426,7 +426,7 @@ No production `assert!`, `debug_assert!`, or equivalent invariant assertion was 
 - **Status:** active
 - **Exercised:** yes for synthetic represented-fixture changes; no committed historical wire change exists
 - **Guarantee:** Every change to emitted bytes, accepted bytes, error classification, or wire-code strings includes a crate-version bump; prose-only and test-only changes do not.
-- **Check:** When the represented `ciphersuite`, `inputs`, or `expected` projection differs between explicit base and head revisions, require the package version to differ. Formatting, provenance, and build-identity prose are excluded. The fixture covers one exact local envelope and all four current public classifications. Source-only and unrepresented behavior changes remain outside this gate.
+- **Check:** When the represented `ciphersuite`, `inputs`, or `expected` projection differs between explicit base and head revisions, require the package version to differ. Formatting, provenance, and build-identity prose are excluded; a fixture missing any represented contract field fails the gate loudly. The fixture covers one exact local envelope and all four current public classifications. Source-only and unrepresented behavior changes remain outside this gate.
 - **Fault/timing angle:** Source or dependency change that keeps self-roundtrip tests green while breaking the external opener.
 - **Required faults and enabling state:** Synthetic unchanged, changed-without-bump, changed-with-bump, bootstrap, and unrelated-change cases; readable explicit event revisions for the actual Git comparison.
 - **Confidence:** high for represented fixture changes; low for unrepresented behavior and external compatibility; [evidence](evidence/version-bump-accompanies-wire-change.md)
