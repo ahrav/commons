@@ -12,8 +12,8 @@ description = "Seals push-notification payloads with HPKE so only the recipient 
 publish = false
 
 [dependencies]
-hpke = { version = "0.14", default-features = false, features = ["alloc", "getrandom", "x25519", "chacha"] }
-rand_core = "0.9"
+getrandom = { version = "=0.4.3", default-features = false, features = ["sys_rng"] }
+hpke = { version = "=0.14.0", default-features = false, features = ["alloc", "getrandom", "x25519", "chacha"] }
 
 [dev-dependencies]
 hex = "0.4"

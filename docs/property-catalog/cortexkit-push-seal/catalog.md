@@ -151,13 +151,13 @@ No production `assert!`, `debug_assert!`, or equivalent invariant assertion was 
 
 - **Type:** safety
 - **Status:** active
-- **Exercised:** yes, partially; empty AAD is rejected, but other wrong non-empty AAD values are not tested
+- **Exercised:** yes and locally audited with a direct HPKE differential oracle
 - **Guarantee:** The associated data used by both sides is exactly the envelope's one-byte version field.
 - **Check:** After the version gate establishes `envelope[0] == VERSION`, `always([VERSION] == [envelope[0]])`; direct HPKE open succeeds with computed AAD `[VERSION]` and fails with `[]`, `[0x00]`, and `[0x01, 0x00]`. `always` fits every accepted envelope and reflects what the code computes.
 - **Fault/timing angle:** AAD refactor or multi-version acceptance while `open` continues using the build constant.
 - **Required faults and enabling state:** Valid envelope plus exact and altered AAD values.
 - **Confidence:** high for current code; [evidence](evidence/version-byte-is-exact-aad.md)
-- **Existing check:** `src/lib.rs:330-356`; status unaudited.
+- **Existing check:** [`aad_and_info_are_exact`](../../../crates/cortexkit-push-seal/src/lib.rs); audited for direct correct open and empty, wrong, and extra AAD. External opener compatibility remains unaudited.
 - **Impact:** Unbound or mismatched version bytes permit parse confusion or cause opaque authentication failures.
 - **Open questions:** None at version 1; multi-version rollout remains unspecified.
 
@@ -165,13 +165,13 @@ No production `assert!`, `debug_assert!`, or equivalent invariant assertion was 
 
 - **Type:** safety
 - **Status:** active
-- **Exercised:** not yet; no check varies `info`
+- **Exercised:** yes and locally audited with a direct HPKE differential oracle
 - **Guarantee:** Both sealer and opener use an empty HPKE `info` value.
 - **Check:** Pin both call sites to `&[]`, then differentially open one sealed envelope with empty and fixed non-empty `info`; only empty succeeds. `always` fits because `info` is a build-wide wire constant. The durable compatibility oracle belongs in the external conformance corpus.
 - **Fault/timing angle:** Adding domain separation on only one implementation.
 - **Required faults and enabling state:** Direct dependency-level open using empty and non-empty `info`.
 - **Confidence:** high for this implementation; [evidence](evidence/hpke-info-remains-empty.md)
-- **Existing check:** none.
+- **Existing check:** [`aad_and_info_are_exact`](../../../crates/cortexkit-push-seal/src/lib.rs); audited for empty `info` success and fixed non-empty `info` failure against the same envelope. External opener compatibility and key-purpose isolation remain unaudited.
 - **Impact:** Any one-sided change breaks every envelope.
 - **Open questions:** Whether the recipient key is actually dedicated is tracked separately.
 
@@ -249,13 +249,13 @@ No production `assert!`, `debug_assert!`, or equivalent invariant assertion was 
 
 - **Type:** safety
 - **Status:** active
-- **Exercised:** yes, narrowly; two sequential calls in `src/lib.rs:232-242`
+- **Exercised:** yes and locally audited through the shared RNG-injected sealing path
 - **Guarantee:** Every successful `seal` after the plaintext and key gates uses a newly generated ephemeral and a newly constructed sender context.
-- **Check:** A custom backend records exactly one fresh draw per successful call and supplies distinct fixed draw bytes; each call constructs a new sender context. A negative-control backend repeats draw bytes and must produce repeated `enc`, proving the no-repeat canary detects degraded entropy. Production no-repeat campaigns remain statistical evidence, not proof. `always` applies to the per-successful-call draw/context obligation.
+- **Check:** A test-only RNG records exactly one fresh draw per successful call and supplies distinct fixed draw bytes; each call constructs a new sender context. A negative-control RNG repeats draw bytes and must produce repeated `enc`, proving the no-repeat canary detects degraded entropy. Production no-repeat campaigns remain statistical evidence, not proof. `always` applies to the per-successful-call draw/context obligation.
 - **Fault/timing angle:** Degraded or accidental deterministic custom RNG, or cached sender context. The resolved default `SysRng` obtains OS bytes per call; fork duplication is not asserted for that backend.
-- **Required faults and enabling state:** Many successful seals with identical valid recipient and accepted plaintext under working entropy. The resolved `getrandom` custom backend can observe or control draw calls.
+- **Required faults and enabling state:** Two successful seals with identical valid recipient and accepted plaintext under distinct deterministic draws, plus two seals under a repeated-draw negative control.
 - **Confidence:** high for intended behavior; [evidence](evidence/each-seal-uses-fresh-ephemeral.md)
-- **Existing check:** `src/lib.rs:232-242`; status unaudited.
+- **Existing check:** [`each_seal_uses_a_fresh_ephemeral`](../../../crates/cortexkit-push-seal/src/lib.rs); audited for one 32-byte draw per successful seal, distinct deterministic draws producing distinct encapsulations, and repeated draws producing repeated encapsulations. Production entropy quality remains outside this check.
 - **Impact:** Reuse can repeat the AEAD key/nonce pair and break confidentiality.
 - **Open questions:** Whether production build flags can select a custom entropy backend and how that configuration is controlled.
 
@@ -277,13 +277,13 @@ No production `assert!`, `debug_assert!`, or equivalent invariant assertion was 
 
 - **Type:** safety
 - **Status:** active — dependency source predicts this claim is violated if the ambient RNG fails
-- **Exercised:** not yet; no repository check uses the resolved backend-selection seam
+- **Exercised:** no; ambient entropy failure remains an untested known panic
 - **Guarantee:** Under sufficient memory, an entropy-source error is returned through the sealing error surface instead of unwinding through `seal`.
 - **Check:** Build with the resolved `getrandom` `unsupported` backend; call `seal` with accepted plaintext and a fixed valid, non-low-order 32-byte public key; prove the backend was invoked; then require `always(catch_unwind(seal) == Ok(Err(_)))`. The input preconditions and backend witness prevent earlier guards from producing a vacuous green result.
 - **Fault/timing angle:** OS entropy-source failure before encapsulation.
 - **Required faults and enabling state:** Sufficient memory, accepted plaintext, fixed valid non-low-order public key, and deterministic entropy failure through `getrandom_backend="unsupported"` or a failing custom backend, with an invocation witness.
 - **Confidence:** high that the resolved dependency panics; medium that the crate promises otherwise; [evidence](evidence/entropy-failure-does-not-unwind.md)
-- **Existing check:** none.
+- **Existing check:** none by design in this wave. [`seal`](../../../crates/cortexkit-push-seal/src/lib.rs) documents the current panic; consumer policy and the desired no-unwind property remain unaudited.
 - **Impact:** Depending on panic policy, one entropy failure can abort a request task or process instead of returning a diagnosable error.
 - **Open questions:** Consumer panic policy and deployment conditions; both need human input.
 
@@ -333,13 +333,13 @@ No production `assert!`, `debug_assert!`, or equivalent invariant assertion was 
 
 - **Type:** reachability
 - **Status:** active
-- **Exercised:** not yet by repository tests
+- **Exercised:** yes and locally audited for 31-byte and 33-byte public and private keys
 - **Guarantee:** Both public `BadRecipientKey` return paths can be reached under their preceding successful gates.
 - **Check:** `reachable(seal(short_public_key, accepted_plaintext) == Err(SealError::BadRecipientKey))` and `reachable(open(short_private_key, current_version_full_length_envelope) == Err(OpenError::BadRecipientKey))`.
 - **Fault/timing angle:** Truncated or prefixed local key material.
 - **Required faults and enabling state:** Accepted-size plaintext for `seal`; at least 33-byte current-version envelope for `open`; public/private key lengths other than 32.
 - **Confidence:** high from control flow and resolved dependency source; [evidence](evidence/bad-recipient-key-paths-are-reachable.md)
-- **Existing check:** none.
+- **Existing check:** [`key_deserialization_and_degenerate_public_key_paths_are_reachable`](../../../crates/cortexkit-push-seal/src/lib.rs); audited with accepted plaintext, a valid full envelope, exact errors, and valid 32-byte controls.
 - **Impact:** Without these enabling states, public variants and the `BadRecipientKey -> malformed` wire mapping remain unexercised.
 - **Open questions:** The separate contract disagreement over whether `BadRecipientKey` should mean length-only or semantic validation remains unresolved.
 
@@ -347,13 +347,13 @@ No production `assert!`, `debug_assert!`, or equivalent invariant assertion was 
 
 - **Type:** safety
 - **Status:** active
-- **Exercised:** not yet by repository tests
+- **Exercised:** yes and locally audited against the resolved HPKE deserializers
 - **Guarantee:** After earlier gates pass, each API returns `BadRecipientKey` exactly when the resolved HPKE public/private-key deserializer rejects the supplied bytes.
 - **Check:** With accepted plaintext for `seal` and a current-version full-length envelope for `open`, `always((from_bytes(key).is_err()) == (result == BadRecipientKey))` for the respective resolved key type.
 - **Fault/timing angle:** Dependency deserializer changes from length-only behavior to same-size semantic validation, or local error mapping drifts.
 - **Required faults and enabling state:** Inputs accepted and rejected by each resolved deserializer while all earlier API gates pass.
 - **Confidence:** high for current control flow; [evidence](evidence/bad-recipient-key-follows-resolved-deserializer.md)
-- **Existing check:** none.
+- **Existing check:** [`key_deserialization_and_degenerate_public_key_paths_are_reachable`](../../../crates/cortexkit-push-seal/src/lib.rs); audited for rejected lengths 31 and 33 and valid generated 32-byte controls. It does not define an independent X25519 validity policy.
 - **Impact:** Preserves the documented error classification without pretending this repository has independently defined X25519 point/scalar validity.
 - **Open questions:** Whether public docs should describe the resolved length-only behavior or the API should impose a stricter independent validity contract.
 
@@ -361,13 +361,13 @@ No production `assert!`, `debug_assert!`, or equivalent invariant assertion was 
 
 - **Type:** reachability
 - **Status:** active
-- **Exercised:** not yet by repository tests
+- **Exercised:** yes and locally audited with an all-zero 32-byte public value
 - **Guarantee:** The `SealError::Hpke` branch is reachable with a 32-byte public value whose X25519 shared secret is all zero.
 - **Check:** `reachable(seal(degenerate_key, b"x") == Err(SealError::Hpke))`. `reachable` fits because this records a specific branch that existing happy-path keys never enter.
 - **Fault/timing angle:** Degenerate or low-order recipient public value.
 - **Required faults and enabling state:** Known degenerate 32-byte input and a working entropy source; ordinary generated keys cannot witness the branch.
 - **Confidence:** high from resolved dependency source; [evidence](evidence/degenerate-public-key-hpke-error-is-reachable.md)
-- **Existing check:** none.
+- **Existing check:** [`key_deserialization_and_degenerate_public_key_paths_are_reachable`](../../../crates/cortexkit-push-seal/src/lib.rs); audited for exact `SealError::Hpke` under working ambient entropy.
 - **Impact:** Without this reachability condition, `SealError::Hpke` and its caller handling can remain untested forever.
 - **Open questions:** Which degenerate vectors should be normative for the pinned dependency.
 
@@ -375,13 +375,13 @@ No production `assert!`, `debug_assert!`, or equivalent invariant assertion was 
 
 - **Type:** reachability
 - **Status:** active
-- **Exercised:** not yet; no branch-level reachability instrumentation exists
+- **Exercised:** partially; the dependency serialized size is pinned to the local split, but the error branch is not instrumented
 - **Guarantee:** Under the resolved X25519 deserializer contract, the `EncappedKey::from_bytes` error mapping at `src/lib.rs:176` is never entered.
 - **Check:** `unreachable(encapped_key_parse_error_branch)`. `unreachable` fits because this is a dedicated code point whose execution would mean `ENC_LEN` no longer matches the dependency's serialized key size.
 - **Fault/timing angle:** KEM or dependency change that alters serialized size or adds same-size semantic validation while local splitting remains unchanged.
 - **Required faults and enabling state:** None under the resolved dependency behavior; a future size or deserializer-semantics change can wake the branch.
 - **Confidence:** high from two-hop dependency source analysis; [evidence](evidence/encapped-key-parse-failure-is-unreachable.md)
-- **Existing check:** none; the layout test only catches the size relationship indirectly.
+- **Existing check:** [`low_order_encapsulation_reaches_decap_error`](../../../crates/cortexkit-push-seal/src/lib.rs) directly asserts the dependency encapsulated-key serialized size equals `ENC_LEN`. The unreachable-branch claim still rests on pinned dependency source analysis, not branch proof.
 - **Impact:** If this branch becomes reachable, the dependency deserializer contract no longer matches local assumptions and the new failure is mapped to `Aead` and then `malformed`.
 - **Open questions:** None.
 
@@ -389,13 +389,13 @@ No production `assert!`, `debug_assert!`, or equivalent invariant assertion was 
 
 - **Type:** reachability
 - **Status:** active
-- **Exercised:** not yet by repository tests
+- **Exercised:** yes and locally audited with a fixed all-zero low-order encapsulation
 - **Guarantee:** A low-order 32-byte encapsulated key can reach the dependency's decapsulation rejection and is collapsed to `OpenError::Aead` and wire code `malformed`.
 - **Check:** Use direct dependency decapsulation or branch instrumentation to prove `DecapError` was reached for a low-order `enc`; then require the public result to be `OpenError::Aead` with wire code `malformed`. `reachable` fits the witnessed dependency-facing path; the public result alone is non-discriminating.
 - **Fault/timing angle:** Attacker-controlled low-order `enc` field with an otherwise valid envelope shape.
 - **Required faults and enabling state:** Valid recipient private key and a dependency-approved low-order X25519 point in bytes 1..33.
 - **Confidence:** high from dependency decapsulation source; [evidence](evidence/low-order-encapsulation-aead-path-is-reachable.md)
-- **Existing check:** none; empty ciphertext reaches a different `OpenError` cause that is also collapsed to `Aead`.
+- **Existing check:** [`low_order_encapsulation_reaches_decap_error`](../../../crates/cortexkit-push-seal/src/lib.rs); audited for direct `HpkeError::DecapError`, public `OpenError::Aead`, wire code `malformed`, and a valid neighboring envelope control.
 - **Impact:** Without this situation, the KEM-level rejection and its caller classification can remain untested while ordinary random fuzzing almost never reaches it.
 - **Open questions:** Which low-order vector should be normative for the pinned dependency.
 

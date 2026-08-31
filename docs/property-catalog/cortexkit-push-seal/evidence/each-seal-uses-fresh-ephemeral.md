@@ -2,10 +2,10 @@
 
 - Discovery lenses: data integrity, concurrency, idempotency and replay.
 - Trigger: the test comment states HPKE base-mode confidentiality requires a fresh ephemeral for every message.
-- Code trail: ambient-random seal at `src/lib.rs:115-123`; test at `:227-242`; `hpke 0.14.0` routes this API through `SysRng`.
-- Implemented mechanism: each `single_shot_seal` creates a sender context and requests ephemeral randomness from `SysRng` (`hpke-0.14.0/src/single_shot.rs:102-125`). Random outputs can collide; the requirement is a fresh draw and context, not mathematical uniqueness.
+- Code trail: public `seal` supplies `UnwrapErr(SysRng)` to the private `seal_with_rng`; the test calls that same private path with a tiny recording RNG.
+- Implemented mechanism: each `single_shot_seal_with_rng` creates a sender context and requests ephemeral randomness from its RNG (`hpke-0.14.0/src/single_shot.rs:128-158`). Public `seal` supplies `UnwrapErr(SysRng)`. Random outputs can collide; the requirement is a fresh draw and context, not mathematical uniqueness.
 - Failure scenario: deterministic or degraded custom RNG, or cached sender context, reuses ephemeral state and therefore the AEAD key/nonce pair. Fork duplication is not claimed for the resolved default `SysRng`, which obtains OS bytes per call.
-- Timing/configuration: repeated successful calls with accepted plaintext, valid recipient key, and working entropy matter. Resolved `getrandom 0.4.3` exposes a custom backend that can observe or control draw calls at build time.
-- Existing evidence: two sequential calls have different `enc` values. This is a weak statistical canary, not proof that each call drew independently or that degraded entropy is detected.
-- Instrumentation: a recorded custom backend counts draws and supplies distinct fixed byte streams; a negative-control backend repeats bytes and must repeat `enc`. Envelope bytes expose `enc` at offsets 1..33.
-- Investigation log: a corpus cannot cover this property because each vector is independent; it needs an in-process campaign.
+- Timing/configuration: repeated successful calls with accepted plaintext and a valid recipient key matter. The private seam permits deterministic observation without changing the public entropy path.
+- Existing evidence: `each_seal_uses_a_fresh_ephemeral` records exactly one 32-byte fill for each successful seal. Distinct deterministic draws produce distinct `enc` fields; a fixed repeated draw produces repeated `enc` fields and proves the canary discriminates degraded entropy.
+- Instrumentation: test-only `RecordingRng` implements `TryRng<Error = Infallible>` and `TryCryptoRng`; no trait abstraction or mocking dependency was added.
+- Investigation log: local call and context behavior is audited through `hpke 0.14.0` and observed `rand_core 0.10.1`. Production entropy quality and external vectors remain separate obligations.

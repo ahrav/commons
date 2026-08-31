@@ -6,6 +6,6 @@
 - Dependency trail: resolved `hpke 0.14.0` X25519 public and private `from_bytes` implementations reject serialized lengths other than 32 at `src/dhkex/x25519.rs:54-65` and `:80-100`.
 - Failure scenario: a test supplies a wrong-length key but an earlier plaintext, envelope-length, or version gate wins, so the claimed branch remains unexercised.
 - Timing/configuration: no timing dependence; precondition construction is the whole issue.
-- Existing evidence: none. The wrong-recipient test uses a valid-length key and reaches `Aead` instead.
+- Existing evidence: `key_deserialization_and_degenerate_public_key_paths_are_reachable` reaches both variants with 31-byte and 33-byte keys after the preceding gates succeed, with generated 32-byte controls.
 - Instrumentation: direct variant result plus a branch counter if situation coverage needs to be explicit.
-- Investigation log: reachability is confirmed under the stated preceding gates. Whether semantic point/scalar validation should also map here remains an unresolved API contract question.
+- Investigation log: both local paths are audited under the stated preceding gates. Whether semantic point/scalar validation should also map here remains an unresolved API contract question.

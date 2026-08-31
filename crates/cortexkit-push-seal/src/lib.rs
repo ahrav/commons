@@ -58,8 +58,8 @@ pub const MAX_PLAINTEXT_BYTES: usize = 2048;
 /// Length of the encapsulated key for the pinned KEM.
 const ENC_LEN: usize = 32;
 
-/// Sealing failures preserve their cause so callers can diagnose input and key
-/// errors separately.
+/// Reported sealing failures preserve their cause so callers can diagnose input
+/// and key errors separately.
 #[derive(Debug, PartialEq, Eq)]
 pub enum SealError {
     /// The plaintext exceeds [`MAX_PLAINTEXT_BYTES`]. Carries both numbers.
@@ -100,7 +100,23 @@ pub enum OpenError {
 /// associated data, so it is authenticated. Left cleartext and unbound it would
 /// not be covered by the tag, and flipping it would silently select a different
 /// parse rather than failing.
+///
+/// # Panics
+///
+/// Panics if `getrandom::SysRng` fails to generate random bytes.
 pub fn seal(recipient_public_key: &[u8], plaintext: &[u8]) -> Result<Vec<u8>, SealError> {
+    seal_with_rng(
+        recipient_public_key,
+        plaintext,
+        &mut hpke::rand_core::UnwrapErr(getrandom::SysRng),
+    )
+}
+
+fn seal_with_rng(
+    recipient_public_key: &[u8],
+    plaintext: &[u8],
+    rng: &mut impl hpke::rand_core::CryptoRng,
+) -> Result<Vec<u8>, SealError> {
     if plaintext.len() > MAX_PLAINTEXT_BYTES {
         return Err(SealError::PlaintextTooLarge {
             limit: MAX_PLAINTEXT_BYTES,
@@ -112,15 +128,12 @@ pub fn seal(recipient_public_key: &[u8], plaintext: &[u8]) -> Result<Vec<u8>, Se
         .map_err(|_| SealError::BadRecipientKey)?;
 
     let aad = [VERSION];
-    let (enc, ciphertext) =
-        hpke::single_shot_seal::<ChaCha20Poly1305, HkdfSha256, X25519HkdfSha256>(
-            &OpModeS::Base,
-            &pk,
-            &[],
-            plaintext,
-            &aad,
-        )
-        .map_err(|_| SealError::Hpke)?;
+    let (enc, ciphertext) = hpke::single_shot_seal_with_rng::<
+        ChaCha20Poly1305,
+        HkdfSha256,
+        X25519HkdfSha256,
+    >(&OpModeS::Base, &pk, &[], plaintext, &aad, rng)
+    .map_err(|_| SealError::Hpke)?;
 
     let enc = enc.to_bytes();
     let mut out = Vec::with_capacity(1 + enc.len() + ciphertext.len());
@@ -190,6 +203,7 @@ pub fn open(recipient_private_key: &[u8], envelope: &[u8]) -> Result<Vec<u8>, Op
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hpke::rand_core::{Infallible, TryCryptoRng, TryRng};
     use hpke::{aead::Aead, kdf::Kdf, Kem as KemTrait};
 
     fn keypair() -> (Vec<u8>, Vec<u8>) {
@@ -241,20 +255,68 @@ mod tests {
         }
     }
 
-    /// Two seals of identical plaintext to one recipient must differ.
-    ///
-    /// A vector corpus cannot detect ephemeral-key reuse because it opens each
-    /// vector independently. Base-mode confidentiality requires a fresh
-    /// ephemeral key per message.
+    struct RecordingRng {
+        next: u8,
+        repeat: bool,
+        fills: Vec<usize>,
+    }
+
+    impl TryRng for RecordingRng {
+        type Error = Infallible;
+
+        fn try_next_u32(&mut self) -> Result<u32, Self::Error> {
+            let mut bytes = [0; 4];
+            self.try_fill_bytes(&mut bytes)?;
+            Ok(u32::from_le_bytes(bytes))
+        }
+
+        fn try_next_u64(&mut self) -> Result<u64, Self::Error> {
+            let mut bytes = [0; 8];
+            self.try_fill_bytes(&mut bytes)?;
+            Ok(u64::from_le_bytes(bytes))
+        }
+
+        fn try_fill_bytes(&mut self, dst: &mut [u8]) -> Result<(), Self::Error> {
+            self.fills.push(dst.len());
+            dst.fill(self.next);
+            if !self.repeat {
+                self.next = self.next.wrapping_add(1);
+            }
+            Ok(())
+        }
+    }
+
+    impl TryCryptoRng for RecordingRng {}
+
     #[test]
     fn each_seal_uses_a_fresh_ephemeral() {
         let (_, pk) = keypair();
-        let a = seal(&pk, b"same").expect("seal");
-        let b = seal(&pk, b"same").expect("seal");
+        let mut fresh = RecordingRng {
+            next: 1,
+            repeat: false,
+            fills: Vec::new(),
+        };
+        let a = seal_with_rng(&pk, b"same", &mut fresh).expect("first seal");
+        let b = seal_with_rng(&pk, b"same", &mut fresh).expect("second seal");
+        assert_eq!(fresh.fills, [32, 32], "one fresh draw per seal");
         assert_ne!(
             a[1..1 + ENC_LEN],
             b[1..1 + ENC_LEN],
             "encapsulated key must not repeat across messages"
+        );
+
+        let mut repeated = RecordingRng {
+            next: 1,
+            repeat: true,
+            fills: Vec::new(),
+        };
+        let a = seal_with_rng(&pk, b"same", &mut repeated).expect("first repeated seal");
+        let b = seal_with_rng(&pk, b"same", &mut repeated).expect("second repeated seal");
+        assert_eq!(repeated.fills, [32, 32], "negative-control draws");
+        assert_eq!(
+            a[1..1 + ENC_LEN],
+            b[1..1 + ENC_LEN],
+            "repeated entropy must trip the encapsulation canary"
         );
     }
 
@@ -469,35 +531,126 @@ mod tests {
         assert_eq!(open(&other_sk, &sealed), Err(OpenError::Aead));
     }
 
-    /// The version byte must be authenticated as associated data.
-    ///
-    /// Omitting it produces the same authentication failure as a wrong suite or
-    /// key.
     #[test]
-    fn the_version_byte_is_authenticated_not_merely_present() {
+    fn aad_and_info_are_exact() {
         let (sk, pk) = keypair();
         let sealed = seal(&pk, b"q").expect("seal");
 
         let recipient = <X25519HkdfSha256 as hpke::Kem>::PrivateKey::from_bytes(&sk).unwrap();
         let enc = <X25519HkdfSha256 as hpke::Kem>::EncappedKey::from_bytes(&sealed[1..1 + ENC_LEN])
             .unwrap();
+        let direct_open = |info: &[u8], aad: &[u8]| {
+            hpke::single_shot_open::<ChaCha20Poly1305, HkdfSha256, X25519HkdfSha256>(
+                &OpModeR::Base,
+                &recipient,
+                &enc,
+                info,
+                &sealed[1 + ENC_LEN..],
+                aad,
+            )
+        };
 
-        // Failure without associated data proves the sealer bound the version.
-        let without_aad = hpke::single_shot_open::<ChaCha20Poly1305, HkdfSha256, X25519HkdfSha256>(
-            &OpModeR::Base,
-            &recipient,
-            &enc,
-            &[],
-            &sealed[1 + ENC_LEN..],
-            &[],
+        assert_eq!(
+            direct_open(&[], &[VERSION]).expect("direct correct open"),
+            b"q"
+        );
+
+        for aad in [&[][..], &[0][..], &[VERSION, 0][..]] {
+            assert_eq!(
+                direct_open(&[], aad),
+                Err(hpke::HpkeError::OpenError),
+                "AAD {aad:?}"
+            );
+        }
+
+        assert_eq!(
+            direct_open(b"push", &[VERSION]),
+            Err(hpke::HpkeError::OpenError),
+            "non-empty info"
+        );
+    }
+
+    #[test]
+    fn key_deserialization_and_degenerate_public_key_paths_are_reachable() {
+        type PrivateKey = <X25519HkdfSha256 as hpke::Kem>::PrivateKey;
+        type PublicKey = <X25519HkdfSha256 as hpke::Kem>::PublicKey;
+
+        let (sk, pk) = keypair();
+        assert!(
+            PublicKey::from_bytes(&pk).is_ok(),
+            "valid public key parses"
         );
         assert!(
-            without_aad.is_err(),
-            "the version byte must be bound as AAD"
+            PrivateKey::from_bytes(&sk).is_ok(),
+            "valid private key parses"
+        );
+        let sealed = seal(&pk, b"key control").expect("valid public key");
+        assert_eq!(
+            open(&sk, &sealed).expect("valid private key"),
+            b"key control"
         );
 
-        // Positive control in the same test: with the correct AAD it opens, so
-        // the failure above is about the AAD rather than about the envelope.
-        assert_eq!(open(&sk, &sealed).expect("open"), b"q");
+        for len in [31, 33] {
+            let key = vec![0; len];
+            assert!(matches!(
+                PublicKey::from_bytes(&key),
+                Err(hpke::HpkeError::IncorrectInputLength(32, observed)) if observed == len
+            ));
+            assert!(matches!(
+                PrivateKey::from_bytes(&key),
+                Err(hpke::HpkeError::IncorrectInputLength(32, observed)) if observed == len
+            ));
+            assert_eq!(
+                seal(&key, b"x"),
+                Err(SealError::BadRecipientKey),
+                "public key length {len}"
+            );
+            assert_eq!(
+                open(&key, &sealed),
+                Err(OpenError::BadRecipientKey),
+                "private key length {len}"
+            );
+        }
+
+        assert_eq!(seal(&[0; 32], b"x"), Err(SealError::Hpke));
+    }
+
+    #[test]
+    fn low_order_encapsulation_reaches_decap_error() {
+        type EncappedKey = <X25519HkdfSha256 as hpke::Kem>::EncappedKey;
+
+        assert_eq!(
+            <EncappedKey as Serializable>::size(),
+            ENC_LEN,
+            "local split must match the dependency serialization"
+        );
+
+        let (sk, pk) = keypair();
+        let sealed = seal(&pk, b"low-order control").expect("seal");
+        assert_eq!(
+            open(&sk, &sealed).expect("valid neighboring control"),
+            b"low-order control"
+        );
+
+        let recipient =
+            <X25519HkdfSha256 as hpke::Kem>::PrivateKey::from_bytes(&sk).expect("private key");
+        let low_order = EncappedKey::from_bytes(&[0; ENC_LEN]).expect("length-valid encapped key");
+        assert_eq!(
+            hpke::setup_receiver::<ChaCha20Poly1305, HkdfSha256, X25519HkdfSha256>(
+                &OpModeR::Base,
+                &recipient,
+                &low_order,
+                &[],
+            )
+            .err(),
+            Some(hpke::HpkeError::DecapError),
+            "dependency must reject during decapsulation"
+        );
+
+        let mut malformed = sealed;
+        malformed[1..1 + ENC_LEN].fill(0);
+        let error = open(&sk, &malformed).expect_err("low-order enc must fail");
+        assert_eq!(error, OpenError::Aead);
+        assert_eq!(error.wire_code(), "malformed");
     }
 }

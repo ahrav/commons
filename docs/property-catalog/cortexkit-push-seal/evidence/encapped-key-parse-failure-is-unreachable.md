@@ -7,6 +7,6 @@
 - Competing explanation: the parser could reject non-canonical or low-order points. Dependency source says conversion is infallible once length is 32; low-order rejection occurs later during DH.
 - Failure scenario: a future KEM or dependency changes its serialized size or adds same-size semantic validation while local assumptions remain unchanged, waking the branch and mapping the new failure to `Aead`.
 - Timing/configuration: build-time suite identity; no runtime schedule.
-- Existing evidence: no branch instrumentation. The total-length test catches the size relation only indirectly.
+- Existing evidence: `low_order_encapsulation_reaches_decap_error` directly asserts `<EncappedKey as Serializable>::size() == ENC_LEN` and proves a same-size low-order value parses before failing with `HpkeError::DecapError`.
 - Instrumentation: a branch counter or mutation that forces the mapping closure to run, paired with a build-time assertion tying local split assumptions to the resolved deserializer contract.
-- Investigation log: bounded dependency-facing branch pass confirmed this call-site branch is unreachable under the pinned suite.
+- Investigation log: the size and one same-size semantic path are executable evidence. The branch itself is not instrumented, so unreachability still rests on pinned `hpke 0.14.0` source analysis and must not be described as branch proof.
