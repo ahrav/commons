@@ -330,6 +330,137 @@ mod tests {
         assert_eq!(open(&sk, &sealed).expect("valid neighboring control"), b"q");
     }
 
+    #[test]
+    fn every_proper_prefix_of_a_valid_envelope_is_rejected() {
+        let (sk, pk) = keypair();
+        let plaintext = b"prefix anchor";
+        let sealed = seal(&pk, plaintext).expect("seal");
+        assert_eq!(open(&sk, &sealed).expect("valid anchor"), plaintext);
+
+        let mut malformed = 0;
+        let mut aead = 0;
+        for len in 0..sealed.len() {
+            let expected = if len < 1 + ENC_LEN {
+                malformed += 1;
+                OpenError::Malformed { observed: len }
+            } else {
+                aead += 1;
+                OpenError::Aead
+            };
+            assert_eq!(open(&sk, &sealed[..len]), Err(expected), "prefix {len}");
+        }
+
+        assert_eq!(malformed, 33, "all structural prefixes reached");
+        assert_eq!(malformed + aead, sealed.len(), "all prefixes reached");
+        assert!(aead > 0, "authenticated-open prefixes reached");
+    }
+
+    #[test]
+    fn single_bit_mutations_have_field_specific_outcomes() {
+        let (sk, pk) = keypair();
+        let plaintext = b"mutation anchor";
+        let sealed = seal(&pk, plaintext).expect("seal");
+        assert_eq!(open(&sk, &sealed).expect("valid anchor"), plaintext);
+
+        let mut version_mutations = 0;
+        for bit in 0..8 {
+            let mut mutated = sealed.clone();
+            mutated[0] ^= 1 << bit;
+            assert_eq!(
+                open(&sk, &mutated),
+                Err(OpenError::UnknownVersion {
+                    observed: mutated[0]
+                })
+            );
+            version_mutations += 1;
+        }
+
+        let mut encapsulation_rejections = 0;
+        for byte in 1..1 + ENC_LEN {
+            for bit in 0..8 {
+                let mut mutated = sealed.clone();
+                mutated[0] = VERSION;
+                mutated[byte] ^= 1 << bit;
+                assert_eq!(open(&sk, &mutated), Err(OpenError::Aead));
+                encapsulation_rejections += 1;
+            }
+        }
+
+        let tag_start = sealed.len() - 16;
+        let mut ciphertext_mutations = 0;
+        let mut tag_mutations = 0;
+        for byte in 1 + ENC_LEN..sealed.len() {
+            for bit in 0..8 {
+                let mut mutated = sealed.clone();
+                mutated[0] = VERSION;
+                mutated[byte] ^= 1 << bit;
+                assert_eq!(open(&sk, &mutated), Err(OpenError::Aead));
+                if byte < tag_start {
+                    ciphertext_mutations += 1;
+                } else {
+                    tag_mutations += 1;
+                }
+            }
+        }
+
+        assert_eq!(version_mutations, 8, "version bits reached");
+        assert_eq!(
+            encapsulation_rejections,
+            ENC_LEN * 8,
+            "encapsulated-key bits reached"
+        );
+        assert_eq!(
+            ciphertext_mutations,
+            plaintext.len() * 8,
+            "ciphertext bits reached"
+        );
+        assert_eq!(tag_mutations, 16 * 8, "authentication-tag bits reached");
+    }
+
+    #[test]
+    fn sampled_malformed_bytes_are_total_through_the_local_envelope_bound() {
+        let (sk, pk) = keypair();
+        let sealed = seal(&pk, b"bounded anchor").expect("seal");
+        assert_eq!(open(&sk, &sealed).expect("valid anchor"), b"bounded anchor");
+
+        let mut reached = [0usize; 4];
+        for len in 0..=2097 {
+            let mut envelope = vec![(len as u8).wrapping_mul(31); len];
+            let (key, expected) = if len < 1 + ENC_LEN {
+                reached[0] += 1;
+                (&[][..], OpenError::Malformed { observed: len })
+            } else if len == 1 + ENC_LEN {
+                envelope[0] = VERSION;
+                reached[3] += 1;
+                (&sk[..], OpenError::Aead)
+            } else if len % 2 == 0 {
+                envelope[0] = VERSION.wrapping_add(1);
+                reached[1] += 1;
+                (
+                    &[][..],
+                    OpenError::UnknownVersion {
+                        observed: VERSION.wrapping_add(1),
+                    },
+                )
+            } else {
+                envelope[0] = VERSION;
+                reached[2] += 1;
+                (&[][..], OpenError::BadRecipientKey)
+            };
+
+            let result = std::panic::catch_unwind(|| open(key, &envelope));
+            assert!(result.is_ok(), "length {len} must not unwind");
+            assert_eq!(result.unwrap(), Err(expected), "length {len}");
+        }
+
+        assert_eq!(reached.iter().sum::<usize>(), 2098, "all lengths reached");
+        assert_eq!(reached[0], 33, "short-input gate reached");
+        assert!(
+            reached[1..].iter().all(|count| *count > 0),
+            "every public error class reached: {reached:?}"
+        );
+    }
+
     /// Pins the complete local error enum to the two-string wire vocabulary.
     #[test]
     fn every_open_failure_maps_to_the_wire_vocabulary() {
