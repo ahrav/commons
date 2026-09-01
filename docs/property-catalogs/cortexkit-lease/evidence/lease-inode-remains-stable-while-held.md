@@ -1,7 +1,7 @@
 # `lease-inode-remains-stable-while-held`
 
 - **Discovery:** concurrency, recovery, and resource passes.
-- **Primary evidence:** path open and descriptor lock at `src/lib.rs:240-275,278-313`; no path/inode revalidation exists.
+- **Primary evidence:** `open_lease_file` returns an open inode and both acquisition methods retain its descriptor-bound lock; no later path/inode revalidation exists.
 - **Documented lead:** `docs/lease-store-density.md:22-24` says files are never unlinked to avoid the unlink-inode race.
 - **Failure scenario:** holder locks inode A; external unlink/replacement creates inode B at the same path; another acquirer locks B successfully.
 - **Timing window:** replacement after first open and before holder drop.

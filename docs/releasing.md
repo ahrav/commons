@@ -10,6 +10,15 @@ triggered by pushing a tag; there is no manual publish step.
 3. Tag it `<crate>-v<version>` — for example `cortexkit-paths-v0.1.1` — and push
    the tag.
 
+If the unpublished lease and store crates are ever published at version 0.2,
+publish `cortexkit-store-types` and `cortexkit-lease` first. Publish
+`cortexkit-store` and `cortexkit-store-postgres` only after crates.io serves both
+versions they depend on. The release workflow runs `cargo publish` without
+`--no-verify`, so it builds the packaged crate, which resolves those dependencies
+from the registry rather than through their workspace paths: a store crate
+requiring `cortexkit-store-types = "0.1.1"` cannot publish while the registry
+serves only 0.1.0.
+
 The workflow re-runs the full test matrix (Linux, macOS, Windows) before
 publishing, reusing the CI workflow rather than copying it, so a release cannot
 ship code that would fail CI. It then parses the crate and version out of the tag,

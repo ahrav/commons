@@ -26,7 +26,7 @@ Fresh-context evaluation ran after the initial 22-record catalog was written. It
 - Reframed inode replacement as a fault that must not enable a competing acquisition; path divergence itself is now a coverage state.
 - Replaced impossible shared-handle runtime mode checks with a source-level provenance check.
 - Split positive and negative contention classifiers by their independent oracles.
-- Set a concrete 32-byte epoch-read bound for catalog purposes.
+- Replaced the catalog's provisional 32-byte allowance with the implementation's 20-byte decimal maximum and 21-byte bounded probe.
 - Made watcher evidence require heartbeat, threshold crossing, bounded delivery, and owner acknowledgement.
 - Replaced circular cross-version comparison with golden vectors.
 - Corrected stale-write implication direction and separated fence completeness.
@@ -40,7 +40,7 @@ Fresh-context evaluation ran after the initial 22-record catalog was written. It
 
 ### Shared-root topology
 
-The lease crate requires a shared root (`src/lib.rs:26-28`), the in-repo SQLite consumer derives a root from each database parent (`cortexkit-store/src/lib.rs:240-262`), and the density measurement implies an external high-cardinality shared root (`docs/lease-store-density.md:7-11`). This unresolved topology changes the impact of key aliasing, density, and filesystem-scope properties.
+The lease crate requires a shared root (`src/lib.rs:10-14`), the in-repo SQLite consumer derives a root from each database parent (`cortexkit-store/src/lib.rs:245-260`), and the density measurement implies an external high-cardinality shared root (`docs/lease-store-density.md:7-11`). This unresolved topology changes the impact of key aliasing, density, and filesystem-scope properties.
 
 ### Contract catalog versus current implementation
 
@@ -48,9 +48,9 @@ The catalog intentionally includes desired contracts that current code contradic
 
 | Disposition | Properties |
 |---|---|
-| **Known violated by code under the recorded enabling state** | `at-most-one-exclusive-holder-per-key` under live path replacement, `writer-epoch-strictly-increases`, `returned-epoch-is-crash-durable` under the provisional power-loss interpretation, `invalid-epoch-fails-closed`, `failed-acquire-preserves-prior-epoch`, `distinct-lease-keys-do-not-alias`, `lease-inode-remains-stable-while-held` under replacement, `unix-lease-file-is-owner-only` when the path is replaced after open, `permission-hardening-never-follows-replacement`, `epoch-input-size-is-bounded`, `logical-store-has-single-lease-identity` for permitted sibling/path-alias inputs, `failed-acquisition-does-not-mutate-lease-state`, `replacement-fence-is-claimed-before-old-writer-writes`, `lease-file-creation-is-never-permissive`, `acquisition-does-not-follow-symlink`. |
-| **Believed satisfied on currently exercised local paths** | `shared-exclusive-exclusion-matrix`, `shared-acquisition-is-epoch-neutral`, `contention-is-classified-as-held`, `handle-drop-releases-lease`, `stale-writer-write-is-rejected` on SQLite's synthetic fenced path. |
-| **Unknown or deployment-dependent** | `dead-holder-lease-is-reclaimable`, `shared-epoch-never-authorizes-write`, `filesystem-lock-scope-matches-deployment`, `lease-file-growth-trigger-is-observed`, `lease-path-format-is-version-stable`, `protected-write-set-is-fence-complete`. |
+| **Known violated by code under the recorded enabling state** | `at-most-one-exclusive-holder-per-key` under live path replacement, `distinct-lease-keys-do-not-alias`, `lease-inode-remains-stable-while-held` under replacement, `logical-store-has-single-lease-identity` for permitted sibling/path-alias inputs, `failed-acquisition-does-not-mutate-lease-state`, `replacement-fence-is-claimed-before-old-writer-writes`. |
+| **Believed satisfied on currently exercised local paths** | `shared-exclusive-exclusion-matrix`, `shared-acquisition-is-epoch-neutral`, `contention-is-classified-as-held`, `handle-drop-releases-lease`, `invalid-epoch-fails-closed`, `epoch-input-size-is-bounded`, `lease-file-creation-is-never-permissive` on Unix, `acquisition-does-not-follow-symlink` on Unix, descriptor-relative lease permission hardening, and `stale-writer-write-is-rejected` on SQLite's synthetic fenced path. |
+| **Unknown or deployment-dependent** | `failed-acquire-preserves-prior-epoch` under real partial `File` errors, `writer-epoch-strictly-increases` under restored older files or machine power loss, `returned-epoch-is-crash-durable`, `dead-holder-lease-is-reclaimable`, `shared-epoch-never-authorizes-write`, `filesystem-lock-scope-matches-deployment`, `lease-file-growth-trigger-is-observed`, `lease-path-format-is-version-stable`, `protected-write-set-is-fence-complete`, Windows reparse-point runtime behavior, and other non-Unix symlink behavior. |
 | **Campaign coverage requirements, not implementation verdicts** | `cross-process-exclusive-race-is-reached`, `epoch-update-interruption-window-is-reached`, `live-lease-file-replacement-is-reached`. |
 
 Known-violated records require an implementation decision before an expected-green test can land. Unknown records require the named deployment or authority evidence.
@@ -61,7 +61,8 @@ The following cannot be settled from this repository:
 
 - External shared-mode consumers.
 - Per-consumer lease-root paths, mount options, and host access topology.
-- Claustrum's claimed real-daemon two-process check.
+- Claustrum's real-daemon two-process review. Its repository is unavailable
+  locally and no receipt was supplied, so this is an unresolved merge gate.
 - BROCA watcher health and owner acknowledgement.
 - The intended machine-crash model.
 - The authoritative set of fence-protected write sites.
@@ -69,7 +70,7 @@ The following cannot be settled from this repository:
 ## Harness-fit synthesis
 
 - Real OS lock semantics require real processes and the target filesystem; a simulated lock model would test itself.
-- Power-loss, short-write, and post-truncate failure properties route to crash-consistency/failpoint work.
+- Power-loss, storage-tear, and returned partial-`File` errors route to crash-consistency work. Pure byte-prefix tests cover only representation invariants.
 - Deployment mount and watcher properties route to production-readiness evidence.
 - Pure encoding, parsing, and boundary properties remain candidates for ordinary test-strategy selection.
 - Existing tests remain unaudited regardless of whether they pass.

@@ -3,9 +3,11 @@
 ## Provenance and scope
 
 - System: `crates/cortexkit-lease`
-- Revision: `fa975843afd4b3122288149968ea5d6ff46322b3`
+- Revision: parent `610cd07b84f9d0d0f3e01afee0ee04c33420acb5` plus the U4 working-tree changes
 - Date: 2026-08-30
-- External-evidence answer: **none**. No external design docs, related repositories, issue trackers, incident reports, or known failure reports were supplied.
+- External-evidence answer: **unavailable**. Claustrum owns the real-daemon
+  two-process review, but that repository is not available in this workspace.
+  No review receipt was supplied; this remains an unresolved merge gate.
 - In-repo references consulted:
   - `crates/cortexkit-lease/src/lib.rs`: implementation, claims, and unit checks.
   - `crates/cortexkit-store/src/lib.rs`: the in-repo file-lease consumer and fence enforcement point.
@@ -17,9 +19,9 @@
 
 All documentation and history statements are leads. They establish intended contracts, not implementation correctness. The target crate was clean at the recorded revision; unrelated untracked artifacts were left untouched.
 
-Observation constraint: `LeaseKey::identity`, `fnv1a`, and `fnv1a_hex` are public (`src/lib.rs:112-123,341-358`); only `FileLeaseStore::lease_path` remains private (`src/lib.rs:204-210`). `LeaseKey` derives neither `Hash` nor `Ord` (`src/lib.rs:92`). Checks index logical keys by the field tuple `(module_id, backend, scope_key)`. External checks can verify identity and hash vectors directly, but exact path checks must live inside this crate or infer the fixed `.lease` convention from public outputs.
+Observation constraint: `LeaseKey::identity`, `fnv1a`, and `fnv1a_hex` are public; only `FileLeaseStore::lease_path` remains private. `LeaseKey` derives neither `Hash` nor `Ord`. Checks index logical keys by the field tuple `(module_id, backend, scope_key)`. External checks can verify identity and hash vectors directly, but exact path checks must live inside this crate or infer the fixed `.lease` convention from public outputs.
 
-The parked dual-store migration sketch in `docs/lease-store-density.md:44-51` is outside this catalog because that system is not built. Its stated prerequisite depends on `returned-epoch-is-crash-durable`; the relationship map records that dependency.
+The parked dual-store migration sketch in `docs/lease-store-density.md:53-60` is outside this catalog because that system is not built. Its stated prerequisite depends on `returned-epoch-is-crash-durable`; the relationship map records that dependency.
 
 Supporting artifacts:
 
@@ -41,10 +43,12 @@ Supporting artifacts:
 - **Check:** `always(exclusive_live_count[(physical_root_identity, module_id, backend, scope_key)] <= 1)`, where physical root identity is canonicalized and, on Unix, confirmed by device/inode rather than raw path spelling. Each successful holder records that identity, process, epoch, acquire-return time, and release time in a witness ledger outside the lease root; the oracle rejects overlapping intervals.
 - **Fault/timing angle:** Two acquirers race from separate processes; path aliasing, inode replacement, or degraded filesystem lock semantics can let both return `Ok`.
 - **Required faults and enabling state:** Two processes must have the same lease file open concurrently and both must attempt exclusive locking. For faulted histories, also inject path aliasing, file replacement, or the deployed filesystem's lock-degradation mode.
-- **Confidence:** high. The contract is explicit at `src/lib.rs:3-5`; the implementation delegates it to `File::try_lock` at `src/lib.rs:239-276`.
-- **Existing check:** `acquire_then_second_holder_is_rejected`, `src/lib.rs:491-506`, same process and sequential; status **unaudited**.
+- **Confidence:** high. The contract is explicit at `src/lib.rs:2-6`; `LeaseStore::acquire` delegates exclusion to `File::try_lock`.
+- **Existing check:** `acquire_then_second_holder_is_rejected`, same process and sequential; status **unaudited**.
 - **Impact:** Two writers can mutate one logical store. This is the crate's primary prohibited state.
-- **Open questions:** Does the real-daemon two-process check claimed by `README.md:12-13` live in an external repository? `(needs human input)`
+- **Open questions:** Claustrum's real-daemon two-process review remains an
+  unresolved merge gate. Its repository is unavailable locally, and no review
+  receipt is present. `(needs human input)`
 - **Evidence:** [evidence/at-most-one-exclusive-holder-per-key.md](evidence/at-most-one-exclusive-holder-per-key.md)
 
 ### `shared-exclusive-exclusion-matrix`
@@ -56,8 +60,8 @@ Supporting artifacts:
 - **Check:** Safety: `always(exclusive_count <= 1 && (exclusive_count == 0 || shared_count == 0))`. Availability coverage: `sometimes(shared_count >= 2)`. The first forbids mixed modes; the second proves the documented positive shared-coexistence path occurred.
 - **Fault/timing angle:** The last-of-many shared-holder drop is the discriminating transition; per-process lock semantics can release another handle's lock early.
 - **Required faults and enabling state:** At least two simultaneous shared holders, an exclusive attempt while both live, another attempt after one drops, and the reverse exclusive-then-shared history.
-- **Confidence:** high. The contract is explicit at `src/lib.rs:173-186`; the implementation uses shared and exclusive OS locks.
-- **Existing check:** `shared_holders_coexist_but_block_exclusive`, `exclusive_holder_blocks_shared`, and `shared_lease_across_processes_blocks_exclusive`, `src/lib.rs:548-691`; status **unaudited**.
+- **Confidence:** high. `LeaseStore::acquire` and `LeaseStore::acquire_shared` use exclusive and shared OS locks.
+- **Existing check:** `shared_holders_coexist_but_block_exclusive`, `exclusive_holder_blocks_shared`, `concurrent_shared_first_acquisitions_coexist`, and `shared_lease_across_processes_blocks_exclusive`; status **unaudited**.
 - **Impact:** A GC can delete a resource under a live reader, or readers can enter while an exclusive mutator is active.
 - **Open questions:** Are Solaris or network filesystems supported, where the lock primitive may be process-scoped or host-scoped? `(needs human input)`
 - **Evidence:** [evidence/shared-exclusive-exclusion-matrix.md](evidence/shared-exclusive-exclusion-matrix.md)
@@ -71,8 +75,8 @@ Supporting artifacts:
 - **Check:** With a configured recovery bound `B`, after process death is confirmed and no unrelated holder exists, attempt acquisition until deadline `death_confirmed + B`; assert `always(acquired_by_deadline)`. The configured deadline makes the eventual claim exact.
 - **Fault/timing angle:** `SIGKILL`, abort, OOM kill, or equivalent termination while the handle is live.
 - **Required faults and enabling state:** A child must hold the real OS lock and be terminated without unwind; the harness must confirm process exit before starting the recovery deadline.
-- **Confidence:** high that this is intended (`src/lib.rs:8-10`); medium that every deployed filesystem supplies the promised behavior.
-- **Existing check:** `shared_lease_across_processes_blocks_exclusive`, `src/lib.rs:632-691`, exits normally; status **unaudited**.
+- **Confidence:** high that this is intended (`src/lib.rs:4`); medium that every deployed filesystem supplies the promised behavior.
+- **Existing check:** `shared_lease_across_processes_blocks_exclusive` exits normally; status **unaudited**.
 - **Impact:** A dead writer can permanently prevent module restart.
 - **Open questions:** What recovery bound is operationally required? `(needs human input)`
 - **Evidence:** [evidence/dead-holder-lease-is-reclaimable.md](evidence/dead-holder-lease-is-reclaimable.md)
@@ -81,60 +85,60 @@ Supporting artifacts:
 
 - **Type:** safety
 - **Status:** active
-- **Exercised:** not yet under corruption, interruption, restore, or exhaustion; clean two-step examples exist.
+- **Exercised:** yes for malformed input, exhaustion, and deterministic ordered prefix-write failures through `persist_epoch`; exact `File` failures, restore, process interruption, and power loss remain absent.
 - **Guarantee:** Every successful exclusive acquisition returns an epoch strictly greater than every epoch previously returned for the same physical root and key.
-- **Check:** On each successful exclusive acquisition, `always(epoch > max_returned_epoch[(physical_root_identity, module_id, backend, scope_key)])`, then update the witness. This is the exact per-file fence-token contract at `src/lib.rs:135-137`.
-- **Fault/timing angle:** Truncate-before-write interruption, unsynced write loss, valid-UTF-8 corruption, old-file restore, and a persisted `u64::MAX` all threaten strict increase.
-- **Required faults and enabling state:** At least one prior successful acquisition, followed separately by each fault class. The maximum-value case requires the parser to observe `18446744073709551615` and then two consecutive successful acquisitions; counting to it is not required.
-- **Confidence:** high. The contract is explicit; `parse().unwrap_or(0)` and `saturating_add(1)` at `src/lib.rs:328-337` provide discriminating contradictory code evidence.
-- **Existing check:** `acquire_then_second_holder_is_rejected` and `epoch_persists_across_store_instances`, `src/lib.rs:491-506,694-706`; status **unaudited**.
+- **Check:** On each successful exclusive acquisition, `always(epoch > max_returned_epoch[(physical_root_identity, module_id, backend, scope_key)])`, then update the witness. `bump_epoch` performs checked increment and `persist_epoch` performs canonical persistence.
+- **Fault/timing angle:** Unsynced write loss, old-file restore, and machine power loss remain threats. Malformed input and a persisted `u64::MAX` fail closed in exercised local paths.
+- **Required faults and enabling state:** At least one prior successful acquisition, followed separately by each fault class. The maximum-value case requires the parser to observe `18446744073709551615` and repeated exclusive attempts to return `LeaseError::Io(InvalidData)` without changing bytes; counting to it is not required.
+- **Confidence:** high for bounded parsing, checked increment, and ordered-prefix behavior in the injected `Write + Seek` model; exact partial-`File` I/O and power-loss behavior remain unproved.
+- **Existing check:** `invalid_epoch_states_fail_closed` and `interrupted_persist_never_leaves_a_lower_parseable_epoch`, plus clean acquisition checks; status **unaudited**.
 - **Impact:** Reused or regressed epochs let a superseded writer pass an equal-or-older fence or can permanently reject legitimate writers.
-- **Open questions:** Was saturation chosen deliberately? No rationale appears in code.
+- **Open questions:** What recovery behavior is required after an older valid lease file is restored?
 - **Evidence:** [evidence/writer-epoch-strictly-increases.md](evidence/writer-epoch-strictly-increases.md)
 
 ### `returned-epoch-is-crash-durable`
 
 - **Type:** safety
-- **Status:** active — provisional crash-model interpretation
+- **Status:** unknown — no power-loss guarantee is documented or implemented
 - **Exercised:** not yet; store-instance recreation does not test device durability.
-- **Guarantee:** Once `acquire` returns epoch `e`, a power loss cannot cause a later acquisition for the same physical root and key to return an epoch less than or equal to `e`.
+- **Question:** Whether an epoch returned by `acquire` survives power loss and remains strictly below every later returned epoch.
 - **Check:** Witness by `(physical_root_identity, module_id, backend, scope_key)`; after each acknowledged acquisition and crash-image recovery, assert `always(reacquired_epoch > acknowledged_epoch)`. This checks the durability promise at the acknowledgement boundary.
 - **Fault/timing angle:** Power loss after file creation or epoch write but before file data and directory entry reach stable storage.
 - **Required faults and enabling state:** A first-ever acquisition to exercise directory-entry durability, a later acquisition to exercise content durability, and volatile-cache loss rather than process death alone.
-- **Confidence:** high that the docs claim durability; high that no `sync_data`, `sync_all`, or directory sync exists. `File::flush` at `src/lib.rs:337` is not a durability barrier.
-- **Existing check:** `epoch_persists_across_store_instances`, `src/lib.rs:694-706`; status **unaudited**.
+- **Confidence:** high that no `sync_data`, `sync_all`, or directory sync exists. `persist_epoch` calls `Write::flush`, which is not a durability barrier, so no power-loss atomicity or durability claim follows.
+- **Existing check:** `epoch_persists_across_store_instances`; status **unaudited**.
 - **Impact:** A post-reboot writer can reuse a superseded writer's token.
-- **Open questions:** Confirm whether the documented word “durable” includes machine power loss. This record adopts that conventional interpretation because no narrower crash model is documented. `(needs human input)`
+- **Open questions:** Is machine-power-loss durability required? If so, the write and directory-entry protocol needs a separate design and crash test. `(needs human input)`
 - **Evidence:** [evidence/returned-epoch-is-crash-durable.md](evidence/returned-epoch-is-crash-durable.md)
 
 ### `invalid-epoch-fails-closed`
 
 - **Type:** safety
 - **Status:** active
-- **Exercised:** not yet. Existing tests only use an empty new file or valid decimal content.
-- **Guarantee:** Non-empty lease content that is not a valid `u64` causes acquisition to fail without issuing an epoch.
-- **Check:** For each invalid non-empty body, use the strongest current check `always(acquire(key).is_err() && bytes_after == bytes_before)`. A future diagnostic form requires a corruption-specific error distinguishable from device and permission failures; `LeaseError` currently exposes only `Held` and `Io` (`src/lib.rs:143-150`).
+- **Exercised:** yes for existing empty content, non-decimal UTF-8, trailing whitespace, invalid UTF-8, oversized input, and 20-digit `u64` overflow through both acquisition modes.
+- **Guarantee:** Existing lease content that is empty or not a valid `u64` causes acquisition to fail without issuing an epoch.
+- **Check:** For each invalid existing body, use `always(matches!(acquire(key), Err(LeaseError::Io(error))) && error.kind() == InvalidData && bytes_after == bytes_before)`. A corruption-specific public variant does not exist; `LeaseError` exposes only `Held` and `Io`.
 - **Fault/timing angle:** Valid-UTF-8 garbage, decimal overflow, foreign non-decimal writes, and future-format bytes. A torn body that remains valid decimal belongs to epoch monotonicity, not this parse-failure property.
-- **Required faults and enabling state:** Place malformed content in the exact derived lease path while no holder is live; include invalid UTF-8 as a comparison because it already fails closed through `read_to_string`.
-- **Confidence:** high. `read_epoch` and `bump_epoch` use `parse().unwrap_or(0)` at `src/lib.rs:323,332`, so valid-UTF-8 garbage currently resets to zero.
-- **Existing check:** none.
+- **Required faults and enabling state:** Place malformed content in the exact derived lease path while no holder is live; include invalid UTF-8 and content longer than 20 bytes.
+- **Confidence:** high for the exercised input classes. `read_epoch` accepts only 1-20 ASCII digits in `u64` range.
+- **Existing check:** `invalid_epoch_states_fail_closed` asserts exact `LeaseError::Io(InvalidData)` classification and unchanged bytes; status **unaudited**.
 - **Impact:** Silent reset to epoch 1 reissues old fence tokens.
-- **Open questions:** Should an empty existing file also fail closed, or remain the representation of a new key? `(needs human input)`
+- **Open questions:** None for the current format. Empty content is never a valid final lease-file state.
 - **Evidence:** [evidence/invalid-epoch-fails-closed.md](evidence/invalid-epoch-fails-closed.md)
 
 ### `failed-acquire-preserves-prior-epoch`
 
 - **Type:** safety
 - **Status:** active
-- **Exercised:** not yet; no write-path error is injected.
+- **Exercised:** through a deterministic injected short writer that calls production `persist_epoch`; no `File` or filesystem error is injected.
 - **Guarantee:** An exclusive acquisition that returns `Err` does not lower, erase, or corrupt the prior persisted epoch.
 - **Check:** Around each forced post-lock failure, `always(after_epoch_bytes parse to a value >= before_epoch)`. This checks durable state, not only that the lock was released.
-- **Fault/timing angle:** `ENOSPC`, `EDQUOT`, or returned `EIO` after `set_len(0)` and before `write_all` completes. Non-returning termination belongs to crash recovery, not this property.
-- **Required faults and enabling state:** A prior nonzero epoch and an injected I/O error after `src/lib.rs:334` succeeds, with `acquire` returning `Err`.
-- **Confidence:** high. The error path unlocks at `src/lib.rs:265-269` but does not restore bytes truncated at `src/lib.rs:334`.
-- **Existing check:** none.
+- **Fault/timing angle:** `ENOSPC`, `EDQUOT`, or returned `EIO` after a positive write prefix. Non-returning termination and power loss belong to crash recovery, not this property.
+- **Required faults and enabling state:** A prior nonzero epoch and an injected error after positive progress, with acquisition returning `Err`.
+- **Confidence:** `interrupted_persist_never_leaves_a_lower_parseable_epoch` exercises the helper's padding and fixed-width write order for legacy-width and canonical-width prior states and asserts how many prefixes stay parseable, but it does not prove exact `File` behavior under a real device error.
+- **Existing check:** `interrupted_persist_never_leaves_a_lower_parseable_epoch`; status **unaudited**.
 - **Impact:** A transient storage error turns into permanent fence regression.
-- **Open questions:** A replace-by-rename repair conflicts with the documented stable-inode requirement; what update protocol is intended? `(needs human input)`
+- **Open questions:** Which real filesystem fault mechanism can exercise the same positive-prefix error through `File` without adding a production failpoint?
 - **Evidence:** [evidence/failed-acquire-preserves-prior-epoch.md](evidence/failed-acquire-preserves-prior-epoch.md)
 
 ### `distinct-lease-keys-do-not-alias`
@@ -147,7 +151,8 @@ Supporting artifacts:
 - **Fault/timing angle:** No timing fault is needed. A field containing `U+001F` makes the tuple encoding ambiguous; FNV-1a-64 also has no collision handling.
 - **Required faults and enabling state:** Construct keys containing the separator in different fields. A targeted FNV collision is a separate enabling state whose practical cost remains open.
 - **Confidence:** high for the separator witness; high that collision handling is absent; low on practical targeted-FNV cost.
-- **Existing check:** `distinct_scopes_do_not_conflict`, `distinct_modules_do_not_conflict_on_same_scope`, and `distinct_backends_do_not_conflict_on_same_scope`, `src/lib.rs:509-545`; status **unaudited**.
+- **Existing check:** `distinct_identity_axes_do_not_conflict` covers distinct
+  scope, module, and backend axes; status **unaudited**.
 - **Impact:** Unrelated stores falsely contend and share one epoch sequence.
 - **Open questions:** Are key fields attacker-controlled in any external consumer? `(needs human input)`
 - **Evidence:** [evidence/distinct-lease-keys-do-not-alias.md](evidence/distinct-lease-keys-do-not-alias.md)
@@ -171,13 +176,13 @@ Supporting artifacts:
 
 - **Type:** safety
 - **Status:** active
-- **Exercised:** yes, for serial shared acquisitions on the local filesystem.
-- **Guarantee:** Shared acquisition never changes the persisted writer epoch.
-- **Check:** `always(epoch_bytes_after_shared_acquire == epoch_bytes_before_shared_acquire)`. Byte equality is stronger and more direct than comparing parsed handle values.
+- **Exercised:** yes, including synchronized concurrent shared-first acquisitions on a fresh key.
+- **Guarantee:** Shared acquisition over an existing valid lease file does not change its persisted writer epoch. Shared-first creation initializes canonical epoch zero and does not issue a writer epoch.
+- **Check:** For existing files, `always(epoch_bytes_after_shared_acquire == epoch_bytes_before_shared_acquire)`. For first creation, assert canonical zero and require the first exclusive acquisition to return one.
 - **Fault/timing angle:** Concurrent shared holders matter because a future refactor that writes metadata into the file can create lost updates or consume fence values.
 - **Required faults and enabling state:** A nonzero writer epoch and at least two simultaneous shared holders in the same history; no injected fault is required.
-- **Confidence:** high. `read_epoch` at `src/lib.rs:319-324` performs no content write.
-- **Existing check:** `shared_acquisition_does_not_bump_the_write_epoch`, `src/lib.rs:600-624`; status **unaudited**.
+- **Confidence:** high on local tests. `open_lease_file` initializes canonical zero before publication; every shared acquirer then uses only `File::try_lock_shared` and `read_epoch`.
+- **Existing check:** `shared_first_initializes_canonical_zero`, `concurrent_shared_first_acquisitions_coexist`, and `shared_acquisition_does_not_bump_the_write_epoch`; status **unaudited**.
 - **Impact:** Readers consuming writer epochs can prematurely fence legitimate writers.
 - **Open questions:** None. This record is explicitly limited to epoch bytes; metadata effects are covered by permission and failed-acquisition records.
 - **Evidence:** [evidence/shared-acquisition-is-epoch-neutral.md](evidence/shared-acquisition-is-epoch-neutral.md)
@@ -191,8 +196,8 @@ Supporting artifacts:
 - **Check:** No runtime mode check exists because `LeaseHandle` exposes no mode. The available check is source-level: `always(no value returned by acquire_shared reaches a durable write fence or stamp)` across every consumer. If the interface later carries mode, add `always(handle.mode == Exclusive)` at every write-fence boundary.
 - **Fault/timing angle:** No fault is needed. Both acquisition methods return the same erased `Box<dyn LeaseHandle>`, while shared handles report the incumbent writer epoch.
 - **Required faults and enabling state:** A consumer that accepts both handle modes and routes `epoch()` to a durable write path.
-- **Confidence:** high that the type cannot distinguish modes (`src/lib.rs:134-187`); low that a current unseen consumer misuses it.
-- **Existing check:** `shared_acquisition_does_not_bump_the_write_epoch`, `src/lib.rs:600-624`, pins equal epoch values but not their use; status **unaudited**.
+- **Confidence:** high that `LeaseHandle` cannot distinguish modes; low that a current unseen consumer misuses it.
+- **Existing check:** `shared_acquisition_does_not_bump_the_write_epoch` pins equal epoch values but not their use; status **unaudited**.
 - **Impact:** A reader can present the live writer's epoch as write authority.
 - **Open questions:** Which external repository consumes shared mode, and should the interface split reader and writer handles or expose mode? `(needs human input)`
 - **Evidence:** [evidence/shared-epoch-never-authorizes-write.md](evidence/shared-epoch-never-authorizes-write.md)
@@ -205,26 +210,26 @@ Supporting artifacts:
 - **Guarantee:** After a successful Unix acquisition, the locked lease file's permission bits are exactly `0600`.
 - **Check:** `always(mode(locked_inode) & 0o777 == 0o600)` after both exclusive and shared acquisition. Platform qualification is explicit; non-Unix behavior is not imported into this claim.
 - **Fault/timing angle:** Pre-existing `0644` files, restores, and copies. Creation-window exposure is a separate property.
-- **Required faults and enabling state:** Exercise exclusive and shared acquisition against pre-existing permissive files, including replacement between descriptor open and path-based hardening. Confirm the opened/locked inode is the inode whose mode is checked.
+- **Required faults and enabling state:** Exercise exclusive and shared acquisition against pre-existing permissive files, including replacement after descriptor open. Confirm the opened/locked inode is the inode whose mode is checked.
 - **Confidence:** high for the intended Unix outcome; commit `49bcaa2` records the observed permissive deployment state and the fix rationale.
-- **Existing check:** `an_acquired_lease_file_is_owner_only`, `src/lib.rs:398-424`, Unix-only; status **unaudited**.
+- **Existing check:** `an_acquired_lease_file_is_owner_only`, Unix-only; status **unaudited**.
 - **Impact:** A writable lease file allows fence-token forgery. A readable file exposes key activity, though filenames are hashed.
-- **Open questions:** What security contract, if any, applies on Windows, where `protect_file` returns success without work? `(needs human input)`
+- **Open questions:** Windows acquisition rejects reparse points but does not provide Unix owner-only mode semantics. The public `protect_file` remains a no-op on Windows. `(needs human input)`
 - **Evidence:** [evidence/unix-lease-file-is-owner-only.md](evidence/unix-lease-file-is-owner-only.md)
 
 ### `permission-hardening-never-follows-replacement`
 
 - **Type:** safety
 - **Status:** active
-- **Exercised:** not yet for a concurrent replacement; static symlink refusal is covered.
-- **Guarantee:** `protect_file` changes permissions only on the regular inode it inspected and never on a replacement target.
+- **Exercised:** structurally for lease acquisition through descriptor-relative metadata and chmod; a concurrent replacement history is not injected.
+- **Guarantee:** Lease acquisition changes permissions only on the regular inode opened for that acquisition. Public `protect_file` is path-based and makes no concurrent-replacement guarantee.
 - **Check:** Whenever the chmod branch executes, `always(inspected_inode == chmod_target_inode)`, and assert every unrelated target's mode is unchanged. Pre-open symlink following is a separate property.
-- **Fault/timing angle:** Replace the final path component with a symlink between `symlink_metadata` at `src/lib.rs:62` and path-based `set_permissions` at `src/lib.rs:77`.
-- **Required faults and enabling state:** Directory mutation permission plus a deterministic pause after metadata inspection and before chmod.
-- **Confidence:** high that the check-then-act window exists; medium on exploitability in deployment.
-- **Existing check:** `protect_file_refuses_a_symlink_and_leaves_its_target_untouched`, `src/lib.rs:435-466`, static case; status **unaudited**.
+- **Fault/timing angle:** Replace the final path component after open and before permission hardening.
+- **Required faults and enabling state:** Directory mutation permission plus a deterministic pause after open and before descriptor-relative metadata and chmod.
+- **Confidence:** high that acquisition metadata inspection and chmod apply to the same opened descriptor (`protect_open_file`). Path replacement can still split lock domains. Public `protect_file` documents its path race between `symlink_metadata` and `set_permissions`.
+- **Existing check:** acquisition and public-helper symlink tests cover static links only; status **unaudited**.
 - **Impact:** Permission changes can land on a file the caller never named; acquisition may also create a symlink target before refusal.
-- **Open questions:** Is the process ever privileged, and are lease directories writable by another principal? `(needs human input)`
+- **Open questions:** Which deployment actors can replace lease or SQLite/WAL/SHM paths during hardening? Lease acquisition retains its descriptor, while public `protect_file` intentionally avoids opening caller-owned files.
 - **Evidence:** [evidence/permission-hardening-never-follows-replacement.md](evidence/permission-hardening-never-follows-replacement.md)
 
 ### `contention-is-classified-as-held`
@@ -237,7 +242,7 @@ Supporting artifacts:
 - **Fault/timing angle:** Platform-specific raw OS codes and filesystems that report unsupported/exhausted lock resources rather than the normal contention code.
 - **Required faults and enabling state:** Genuine contention for the positive arm; injected `EACCES`, `ENOLCK`, `EOPNOTSUPP`, or target equivalents for the negative arm.
 - **Confidence:** high on Linux/macOS/Windows ordinary contention; lower on unsupported targets and filesystems.
-- **Existing check:** contention tests at `src/lib.rs:491-691`; status **unaudited**.
+- **Existing check:** same-process and cross-process contention tests; status **unaudited**.
 - **Impact:** Callers can mistake a live holder for storage failure or a broken lock facility for ordinary contention.
 - **Open questions:** Is the CI matrix the complete supported platform set? `(needs human input)`
 - **Evidence:** [evidence/contention-is-classified-as-held.md](evidence/contention-is-classified-as-held.md)
@@ -252,7 +257,7 @@ Supporting artifacts:
 - **Fault/timing angle:** Node-local advisory locking, unsupported locking, overlay replacement, or process-scoped emulation.
 - **Required faults and enabling state:** The real deployment filesystem and mount options, with concurrent acquirers in every host/process topology that can access it.
 - **Confidence:** medium. The crate accepts arbitrary paths and documents no filesystem contract.
-- **Existing check:** local-temp-directory cross-process shared contention, `src/lib.rs:632-691`; status **unaudited**.
+- **Existing check:** local-temp-directory cross-process shared contention in `shared_lease_across_processes_blocks_exclusive`; status **unaudited**.
 - **Impact:** Both hosts can believe they exclusively own one store.
 - **Open questions:** Where does each external consumer place its lease root, and with what mount options? `(needs human input)`
 - **Evidence:** [evidence/filesystem-lock-scope-matches-deployment.md](evidence/filesystem-lock-scope-matches-deployment.md)
@@ -261,15 +266,15 @@ Supporting artifacts:
 
 - **Type:** safety
 - **Status:** active
-- **Exercised:** not yet.
-- **Guarantee:** Acquisition reads at most the maximum valid encoded epoch size plus bounded framing, independent of file size.
-- **Check:** `always(bytes_read_for_epoch <= 32)` and reject files larger than 32 bytes before proportional allocation. The current decimal `u64` needs at most 20 bytes; the remainder permits bounded surrounding whitespace accepted by `trim()`.
+- **Exercised:** yes for a 21-byte file through exclusive and shared acquisition.
+- **Guarantee:** Acquisition reads at most 21 epoch bytes and rejects any state longer than the 20-byte decimal maximum, independent of file size.
+- **Check:** `always(bytes_read_for_epoch <= 21)` and reject files larger than 20 bytes without proportional allocation. Whitespace is not part of the format.
 - **Fault/timing angle:** A corrupt, restored, or hostile multi-gigabyte lease file.
 - **Required faults and enabling state:** Replace a key's lease file with progressively oversized content while no holder is live; exercise both exclusive and shared acquisition paths.
-- **Confidence:** high that the current read is unbounded: both paths call `read_to_string` with no length check at `src/lib.rs:322,331`.
-- **Existing check:** none.
+- **Confidence:** high. `read_epoch` applies `Read::take(21)` and allocates capacity for 21 bytes before rejecting lengths above 20.
+- **Existing check:** `invalid_epoch_states_fail_closed`; status **unaudited**.
 - **Impact:** Opening a store can exhaust process memory before the database is opened.
-- **Open questions:** A future versioned format must revise the 32-byte bound deliberately.
+- **Open questions:** A future versioned format must revise the 20-byte bound deliberately.
 - **Evidence:** [evidence/epoch-input-size-is-bounded.md](evidence/epoch-input-size-is-bounded.md)
 
 ### `lease-file-growth-trigger-is-observed`
@@ -281,7 +286,7 @@ Supporting artifacts:
 - **Check:** Coverage: `reachable(watcher_evaluated_and_reported_size)` once per monitoring interval. Convergence: after crossing a configurable campaign threshold and a bounded signal window with no injected watcher fault, `always(owner_acknowledged_reopen_signal)`. Production uses 1 GiB; campaigns use a smaller constructible threshold.
 - **Fault/timing angle:** Long-running growth from ephemeral identities, watcher failure, ownership drift, and inode exhaustion before the byte threshold.
 - **Required faults and enabling state:** Sustained unique-key creation through an actual configured-threshold crossing, with the watcher healthy for the bounded acknowledgement check. Injected watcher failure is evaluated separately by heartbeat coverage.
-- **Confidence:** medium. The measurement and ownership assignment are documented at `docs/lease-store-density.md:3-42`; watcher operation is outside this repository.
+- **Confidence:** medium. The measurement and ownership assignment are documented at `docs/lease-store-density.md:3-51`; watcher operation is outside this repository.
 - **Existing check:** none in the crate.
 - **Impact:** Unbounded file and inode growth can exhaust the filesystem; an unsafe cleanup can then trigger the unlink-inode race.
 - **Open questions:** Is the watcher still armed, and who watches inode availability? `(needs human input)`
@@ -296,8 +301,8 @@ Supporting artifacts:
 - **Check:** Expand the checked-in vectors to representative keys, including empty, non-ASCII, and `U+001F` fields, and assert `always(derived_filename == golden_filename)`. Pin the PostgreSQL advisory bigint from the same public `LeaseKey::identity` and `fnv1a` derivation.
 - **Fault/timing angle:** Changing field order, separator, hash, suffix, or normalization while old and new processes overlap.
 - **Required faults and enabling state:** Two versions running concurrently against one lease root, including rolling restart and rollback.
-- **Confidence:** high that the path is a de facto persisted protocol (`src/lib.rs:204-210`). Crate version `0.1.1` records the public derivation and MSRV change, but compatibility remains a manual versioning convention rather than an automated gate.
-- **Existing check:** `identity_hash_derivation_is_stable`, `src/lib.rs:482-488`, pins one identity and filename hash; `advisory_key_derivation_is_stable`, `cortexkit-store-postgres/src/lib.rs:396-402`, pins the corresponding shared derivation for a PostgreSQL key; status **unaudited**.
+- **Confidence:** high that `FileLeaseStore::lease_path` is a de facto persisted protocol. Crate version `0.2.0` records the breaking persisted-state compatibility change, but compatibility remains a manual versioning convention rather than an automated gate.
+- **Existing check:** `identity_hash_derivation_is_stable` pins one identity and filename hash; `advisory_key_derivation_is_stable` pins the corresponding shared derivation for a PostgreSQL key; status **unaudited**.
 - **Impact:** Old and new binaries lock different files and can both write.
 - **Open questions:** Is mixed-version overlap supported for all consumers? `(needs human input)`
 - **Evidence:** [evidence/lease-path-format-is-version-stable.md](evidence/lease-path-format-is-version-stable.md)
@@ -311,8 +316,8 @@ Supporting artifacts:
 - **Check:** `always(effects_begin => holder_epoch >= authoritative_epoch)`. For every stale attempt, assert an explicit fenced result and unchanged application state.
 - **Fault/timing angle:** A stale connection remains usable after its lease is released and a replacement acquires a newer epoch.
 - **Required faults and enabling state:** Real handover, retained old connection, replacement fence claim, then a late old-writer mutation. Run for every path declared fence-protected; fence-coverage completeness is a separate property.
-- **Confidence:** high that the crate claims it at `src/lib.rs:11-16`; high that SQLite implements one fenced path; high that PostgreSQL exposes an epoch but no in-repo fence check was found.
-- **Existing check:** `superseded_writer_is_fenced_out_after_handover`, `cortexkit-store/src/lib.rs:631-670`, synthetic `for_test` handles; status **unaudited**.
+- **Confidence:** high that the crate claims it at `src/lib.rs:2-6`; high that SQLite implements one fenced path; high that PostgreSQL exposes an epoch but no in-repo fence check was found.
+- **Existing check:** `superseded_writer_is_fenced_out_after_handover`, `cortexkit-store/src/lib.rs:629-667`, synthetic `for_test` handles; status **unaudited**.
 - **Impact:** A superseded process can overwrite state owned by its replacement.
 - **Open questions:** Is PostgreSQL's session lock intentionally considered sufficient, making its epoch informational, or is the fence path missing? `(needs human input)`
 - **Evidence:** [evidence/stale-writer-write-is-rejected.md](evidence/stale-writer-write-is-rejected.md)
@@ -326,8 +331,8 @@ Supporting artifacts:
 - **Check:** `always(same_logical_store => lease_identity_a == lease_identity_b)` and `always(independent_stores => lease_identity_a != lease_identity_b)`, where identity includes canonical root plus all three key fields.
 - **Fault/timing angle:** The lease key excludes the SQLite database path, while the root is only its parent. Sibling databases with equal descriptors alias; one database opened with differing module or namespace values splits into independent locks.
 - **Required faults and enabling state:** Open the same SQLite database through descriptors differing in module or namespace; open it through cross-parent symlink or hardlink aliases; open two sibling database files under one parent with equal key fields.
-- **Confidence:** high on derivation facts (`cortexkit-store/src/lib.rs:80-88,240-262`); unknown whether descriptor authority prevents these combinations in deployment.
-- **Existing check:** `distinct_databases_do_not_falsely_contend`, `cortexkit-store/src/lib.rs:495-504`, uses different parent directories and does not exercise sibling files; status **unaudited**.
+- **Confidence:** high on derivation facts (`cortexkit-store/src/lib.rs:69-75,245-260`); unknown whether descriptor authority prevents these combinations in deployment.
+- **Existing check:** `distinct_databases_do_not_falsely_contend`, `cortexkit-store/src/lib.rs:493-501`, uses different parent directories and does not exercise sibling files; status **unaudited**.
 - **Impact:** One store can have two writers, or independent stores can falsely block each other.
 - **Open questions:** What component guarantees descriptor uniqueness and canonical database paths? `(needs human input)`
 - **Evidence:** [evidence/logical-store-has-single-lease-identity.md](evidence/logical-store-has-single-lease-identity.md)
@@ -339,9 +344,9 @@ Supporting artifacts:
 - **Exercised:** not yet.
 - **Guarantee:** An attempt rejected as `Held` does not change the incumbent lease file's bytes, mode, owner, or modification time.
 - **Check:** Around every known-contended attempt, `always(after_state == before_state)` for content and metadata of the incumbent inode.
-- **Fault/timing angle:** Both acquisition paths create/open and call `protect_file` before try-lock, so a non-holder can chmod the file before learning it is contended.
+- **Fault/timing angle:** Both acquisition paths create/open and call `protect_open_file` before try-lock, so a non-holder can chmod the file before learning it is contended.
 - **Required faults and enabling state:** A live holder plus a competing process that sees a deliberately permissive mode before attempting acquisition.
-- **Confidence:** high on operation order at `src/lib.rs:239-263,278-299`.
+- **Confidence:** high on operation order in `open_lease_file`, `LeaseStore::acquire`, and `LeaseStore::acquire_shared`.
 - **Existing check:** none.
 - **Impact:** A rejected actor mutates state it never owned; foreign-owned or read-only roots also collapse into undifferentiated `Io` failures.
 - **Open questions:** Is single-UID ownership a supported precondition or merely a deployment habit? `(needs human input)`
@@ -357,7 +362,7 @@ Supporting artifacts:
 - **Fault/timing angle:** `Drop` discards errors from standard-library `File::unlock`; descriptor close is the final release mechanism.
 - **Required faults and enabling state:** A competitor that has observed `Held` and continues retrying, last-handle drop, injected unlock error where possible, and every supported target/toolchain family.
 - **Confidence:** high for current Linux/macOS/Windows close semantics. Rust 1.89 is the declared MSRV because it stabilized `File::try_lock`, `File::try_lock_shared`, and `File::unlock`, but CI has no MSRV job.
-- **Existing check:** T5, T9, T10, and T12 reacquire after clean drop/exit (`src/lib.rs:491-691`); status **unaudited**.
+- **Existing check:** the contention and cross-process tests reacquire after clean drop/exit; status **unaudited**.
 - **Impact:** A cleanly stopped module can leave its successor unable to start.
 - **Open questions:** Should CI add an explicit Rust 1.89 job to enforce the declared MSRV? `(needs human input)`
 - **Evidence:** [evidence/handle-drop-releases-lease.md](evidence/handle-drop-releases-lease.md)
@@ -371,7 +376,7 @@ Supporting artifacts:
 - **Check:** `always(old_epoch_effect_commits => replacement_not_yet_acquired_at_commit)`. After replacement acquisition, every old-epoch attempt or in-flight transaction must abort as fenced and leave application state unchanged.
 - **Fault/timing angle:** SQLite claims the database fence lazily in `with_conn_fenced`, not during `open_sqlite`; before the replacement's first fenced write, the stored fence can still equal the old writer's epoch.
 - **Required faults and enabling state:** Old connection retained after releasing its lease, replacement acquires a newer epoch but performs no fenced write, then old connection calls the fenced path.
-- **Confidence:** high from `cortexkit-store/src/lib.rs:173-215,248-286` and equal-epoch behavior at `:672-692`.
+- **Confidence:** high from `cortexkit-store/src/lib.rs:162-205,245-284` and equal-epoch behavior at `:670-689`.
 - **Existing check:** none; the synthetic handover test claims epoch 2 before the stale attempt.
 - **Impact:** A superseded writer can commit during the handover window the fence is meant to close.
 - **Open questions:** Is fence claim intended at open, or is a pre-claim stale-write window accepted? `(needs human input)`
@@ -399,9 +404,9 @@ Supporting artifacts:
 - **Exercised:** not yet.
 - **Guarantee:** A newly created Unix lease file is never observable with permission bits wider than `0600`.
 - **Check:** `always(mode_observed_from_creation & 0o077 == 0)` and, structurally, assert the create operation requests exactly `0600`; a numeric comparison or post-acquisition check is insufficient.
-- **Fault/timing angle:** `OpenOptions::create(true)` uses umask-derived mode before `protect_file` corrects it.
+- **Fault/timing angle:** First creation uses `NamedTempFile` in the target directory and publishes its initialized inode with `persist_noclobber`.
 - **Required faults and enabling state:** First acquisition under permissive umasks plus a concurrent observer that opens during the create-before-chmod window.
-- **Confidence:** high on operation order at `src/lib.rs:243-254,281-288`; deployment umasks are unknown.
+- **Confidence:** high that `NamedTempFile` creates a private file and publication occurs only after initialization (`open_lease_file`); the dependency contract is part of this claim.
 - **Existing check:** T1 checks only post-acquisition steady state; status **unaudited**.
 - **Impact:** A racing process can retain access acquired before chmod.
 - **Open questions:** What umasks do supported deployments use? `(needs human input)`
@@ -411,13 +416,13 @@ Supporting artifacts:
 
 - **Type:** safety
 - **Status:** active
-- **Exercised:** not yet through either acquisition path.
+- **Exercised:** yes on Unix through both acquisition paths for a symlink to an existing target. Windows is compile-checked only; dangling-link and Windows runtime tests remain absent.
 - **Guarantee:** Exclusive and shared acquisition never create, open, lock, write, or chmod a symlink target as the lease file.
 - **Check:** With the derived lease path replaced by symlinks to existing and absent targets, assert `always(acquire_returns_error)`, `always(target_content_mode_and_existence_unchanged)`, and `unreachable("acquisition-owned-fd-resolved-to-target-inode")` using syscall or descriptor tracing.
-- **Fault/timing angle:** Acquisition opens the path before `protect_file` inspects it; on Unix a dangling target can be created before refusal, while the non-Unix hardening branch is a no-op.
+- **Fault/timing angle:** Unix uses `O_NOFOLLOW`; Windows opens the reparse point itself and rejects reparse metadata. Other non-Unix targets have no explicit no-follow flag.
 - **Required faults and enabling state:** Existing-target and dangling-target symlinks through both shared and exclusive methods on every supported platform.
-- **Confidence:** high from `src/lib.rs:243-254,281-288,80-82`.
-- **Existing check:** T2 calls `protect_file` directly and never traverses acquisition; status **unaudited**.
+- **Confidence:** high on Unix from `O_NOFOLLOW` and compile-checked on Windows from `FILE_FLAG_OPEN_REPARSE_POINT` plus attribute rejection (`lease_open_options`, `protect_open_file`); Windows runtime behavior remains untested.
+- **Existing check:** `acquisition_refuses_symlink_and_leaves_target_untouched` exercises exclusive and shared acquisition; status **unaudited**.
 - **Impact:** The lease can protect and overwrite an attacker-chosen inode or create an unintended file.
 - **Open questions:** Is Windows a supported deployment target? `(needs human input)`
 - **Evidence:** [evidence/acquisition-does-not-follow-symlink.md](evidence/acquisition-does-not-follow-symlink.md)
@@ -432,7 +437,7 @@ Supporting artifacts:
 - **Fault/timing angle:** Scheduler ordering can otherwise serialize every attempt and let the safety check pass vacuously.
 - **Required faults and enabling state:** A barrier after both opens and before both try-lock calls, then concurrent release of the barrier.
 - **Confidence:** high that this is reachable; the current test machinery already spawns a child for shared mode.
-- **Existing check:** none; `src/lib.rs:632-691` reaches cross-process shared contention only.
+- **Existing check:** none; `shared_lease_across_processes_blocks_exclusive` reaches cross-process shared contention only.
 - **Impact:** Without this witness, `at-most-one-exclusive-holder-per-key` can pass without exercising its primary contention state.
 - **Open questions:** None.
 - **Evidence:** [evidence/cross-process-exclusive-race-is-reached.md](evidence/cross-process-exclusive-race-is-reached.md)
@@ -442,12 +447,12 @@ Supporting artifacts:
 - **Type:** reachability
 - **Status:** active
 - **Exercised:** not yet.
-- **Guarantee:** Every crash-recovery campaign interrupts at least one acquisition after the old epoch is truncated and before the replacement is fully written.
-- **Check:** `reachable("process-terminated-after-set-len-before-write-complete")`. The event fires only after the harness confirms termination occurred inside the named code window.
-- **Fault/timing angle:** Random process kills are unlikely to land in a two-syscall window.
-- **Required faults and enabling state:** A deterministic failpoint immediately after `set_len(0)` at `src/lib.rs:334`, followed by non-unwinding process termination.
-- **Confidence:** high that the point is reachable in code; no current injection mechanism exposes it.
-- **Existing check:** none.
+- **Guarantee:** Every crash-recovery campaign interrupts at least one acquisition after epoch-update work begins and before the canonical value is fully written.
+- **Check:** `reachable("process-terminated-during-epoch-update")`. The event fires only after the harness confirms termination occurred inside `persist_epoch`.
+- **Fault/timing angle:** Random process kills are unlikely to land inside the short update sequence.
+- **Required faults and enabling state:** A deterministic process boundary during `persist_epoch`, followed by non-unwinding termination.
+- **Confidence:** high that the point is reachable in code; the injected short-writer test does not inject process death.
+- **Existing check:** `interrupted_persist_never_leaves_a_lower_parseable_epoch` covers ordered prefix-write outcomes only; status **unaudited**.
 - **Impact:** Without this witness, crash-recovery properties can pass vacuously. Returned-I/O-error preservation needs a separate injected error witness.
 - **Open questions:** None.
 - **Evidence:** [evidence/epoch-update-interruption-window-is-reached.md](evidence/epoch-update-interruption-window-is-reached.md)
@@ -478,17 +483,17 @@ All active records go to `/testing:test-strategy` for test-form, oracle, and bou
 | `dead-holder-lease-is-reclaimable` | `/testing:crash-consistency-and-failpoint-testing` for non-unwinding termination and restart |
 | `writer-epoch-strictly-increases` | `/testing:crash-consistency-and-failpoint-testing`; `/testing:invariant-test-review` for T5/T13 |
 | `returned-epoch-is-crash-durable` | `/testing:crash-consistency-and-failpoint-testing` for power-loss and crash-image evidence |
-| `invalid-epoch-fails-closed` | `/low-level-systems:defensive-assertions-and-invariant-guards` for production corruption handling |
-| `failed-acquire-preserves-prior-epoch` | `/testing:crash-consistency-and-failpoint-testing` for short writes and I/O failpoints |
+| `invalid-epoch-fails-closed` | `/testing:invariant-test-review` for the malformed-input regressions |
+| `failed-acquire-preserves-prior-epoch` | `/testing:crash-consistency-and-failpoint-testing` for real `File` errors and process interruption beyond the injected ordered-prefix model |
 | `distinct-lease-keys-do-not-alias` | `/testing:invariant-test-review` for T6-T8 |
 | `lease-inode-remains-stable-while-held` | `/testing:test-strategy` for a real two-process replacement ordering test |
 | `shared-acquisition-is-epoch-neutral` | `/testing:invariant-test-review` for T11 |
 | `shared-epoch-never-authorizes-write` | `/testing:test-strategy` at consumer boundary; interface design is a separate follow-up |
 | `unix-lease-file-is-owner-only` | `/testing:invariant-test-review` for T1 |
-| `permission-hardening-never-follows-replacement` | `/testing:crash-consistency-and-failpoint-testing` for a deterministic check-act pause; `/testing:invariant-test-review` for T2 |
+| `permission-hardening-never-follows-replacement` | `/testing:invariant-test-review` for descriptor-relative hardening and the static symlink test |
 | `contention-is-classified-as-held` | `/testing:invariant-test-review` for contention tests |
 | `filesystem-lock-scope-matches-deployment` | `/operational-resilience:production-readiness-review`; it needs deployment mount and host evidence |
-| `epoch-input-size-is-bounded` | `/low-level-systems:defensive-assertions-and-invariant-guards` for production input bounds |
+| `epoch-input-size-is-bounded` | `/testing:invariant-test-review` for the 20-byte input bound |
 | `lease-file-growth-trigger-is-observed` | `/operational-resilience:production-readiness-review` for watcher and inode-headroom evidence |
 | `lease-path-format-is-version-stable` | `/testing:test-strategy`; SemVer tooling is a separate follow-up |
 | `stale-writer-write-is-rejected` | `/testing:invariant-test-review` for the SQLite check; `/testing:test-strategy` for real handover histories |
@@ -498,7 +503,7 @@ All active records go to `/testing:test-strategy` for test-form, oracle, and bou
 | `replacement-fence-is-claimed-before-old-writer-writes` | `/testing:test-strategy` at the SQLite handover boundary |
 | `protected-write-set-is-fence-complete` | `/testing:test-strategy` for source-level write-site inventory |
 | `lease-file-creation-is-never-permissive` | `/testing:test-strategy` for a real creation-window observer |
-| `acquisition-does-not-follow-symlink` | `/testing:test-strategy`; `/testing:invariant-test-review` for the narrower direct helper test |
+| `acquisition-does-not-follow-symlink` | `/testing:invariant-test-review` for Unix acquisition coverage; `/testing:test-strategy` for non-Unix behavior |
 | `epoch-update-interruption-window-is-reached` | `/testing:crash-consistency-and-failpoint-testing` |
 | Other reachability records | `/testing:test-strategy` for real process/filesystem scheduling |
 
