@@ -39,6 +39,9 @@ pub enum StoreError {
     /// writer has been superseded — for example a draining old instance attempting a
     /// late write after a replacement took the lease. The write was not applied.
     Fenced { holder_epoch: u64, db_epoch: u64 },
+    /// An out-of-range database epoch prevents proving monotonic fencing. The store
+    /// refuses to open until an operator resets `cortexkit_fence.epoch`.
+    FenceCorrupt { db_epoch: i64 },
 }
 
 impl std::fmt::Display for StoreError {
@@ -59,6 +62,11 @@ impl std::fmt::Display for StoreError {
                 f,
                 "fenced write rejected: this writer holds epoch {holder_epoch} but the \
                  database was claimed by a newer writer at epoch {db_epoch}"
+            ),
+            StoreError::FenceCorrupt { db_epoch } => write!(
+                f,
+                "database fence epoch {db_epoch} is outside the supported range; reset \
+                 cortexkit_fence.epoch to at least the highest epoch a writer has used"
             ),
         }
     }
@@ -130,13 +138,42 @@ mod sqlite_backend {
         }
 
         /// `with_conn` permits read-only queries and connection-local configuration.
-        /// Callers must keep callbacks read-only; SQLite does not enforce that
-        /// restriction. Durable writes must use [`Self::with_conn_fenced`].
+        /// `PRAGMA query_only` makes database writes fail with `SQLITE_READONLY`,
+        /// which keeps every durable write on the fenced path
+        /// ([`Self::with_conn_fenced`]). An authorizer denies setting `query_only`,
+        /// `synchronous`, `journal_mode`, `locking_mode`, and `writable_schema`, so the
+        /// callback cannot lift the guard, weaken fence durability, or take a lock that
+        /// blocks a replacement's fence-floor read; reading those pragmas stays allowed.
         ///
         /// # Errors
         ///
-        /// Returns [`StoreError::Backend`] when the closure returns a SQLite error.
+        /// Returns [`StoreError::Backend`] if the callback returns an error,
+        /// attempts a write, sets a denied pragma, or if installing or clearing the
+        /// guard fails.
         pub fn with_conn<T>(
+            &self,
+            f: impl FnOnce(&Connection) -> rusqlite::Result<T>,
+        ) -> Result<T, StoreError> {
+            let guard = self.conn.lock().unwrap_or_else(|p| p.into_inner());
+            let read_only = QueryOnlyGuard::enable(&guard)?;
+            let out = f(&guard);
+            let restored = read_only.restore();
+            let out = out.map_err(|e| StoreError::Backend(e.to_string()))?;
+            restored?;
+            Ok(out)
+        }
+
+        /// [`Self::with_conn`]'s read-only guard rejects `VACUUM` as a write,
+        /// and SQLite rejects it inside [`Self::with_conn_fenced`]'s
+        /// transaction, so maintenance statements run here on the
+        /// lease-holding connection. Fence-protected durable mutations belong
+        /// in [`Self::with_conn_fenced`]; SQLite does not enforce that
+        /// restriction here.
+        ///
+        /// # Errors
+        ///
+        /// Returns [`StoreError::Backend`] when the callback fails.
+        pub fn with_conn_unfenced<T>(
             &self,
             f: impl FnOnce(&Connection) -> rusqlite::Result<T>,
         ) -> Result<T, StoreError> {
@@ -157,15 +194,21 @@ mod sqlite_backend {
         /// database for this epoch and runs `f`, committing atomically. Returning an
         /// error from `f` rolls the transaction back.
         ///
+        /// Callbacks must not send transaction-control SQL. A `COMMIT` in the callback
+        /// ends the fence-checked transaction; later store statements would commit
+        /// without the fence, and the store operation fails instead. A callback that
+        /// also opens a replacement transaction defeats that detection.
+        ///
         /// # Errors
         ///
         /// Returns [`StoreError::Fenced`] if the persisted database epoch exceeds the store epoch.
-        /// Returns [`StoreError::Backend`] if transaction setup, fence access, the callback, or commit fails.
+        /// Returns [`StoreError::Backend`] if transaction setup, fence access, the callback, the durability pin, or commit fails, or if the callback ended the transaction.
         pub fn with_conn_fenced<T>(
             &self,
             f: impl FnOnce(&rusqlite::Transaction) -> rusqlite::Result<T>,
         ) -> Result<T, StoreError> {
             let mut guard = self.conn.lock().unwrap_or_else(|p| p.into_inner());
+            pin_fence_durability(&guard)?;
             let tx = guard
                 .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
                 .map_err(|e| StoreError::Backend(e.to_string()))?;
@@ -173,6 +216,7 @@ mod sqlite_backend {
             claim_fence(&tx, self.epoch)?;
 
             let out = f(&tx).map_err(|e| StoreError::Backend(e.to_string()))?;
+            require_open_transaction(&tx)?;
             tx.commit()
                 .map_err(|e| StoreError::Backend(e.to_string()))?;
             Ok(out)
@@ -195,6 +239,91 @@ mod sqlite_backend {
             let mut guard = self.conn.lock().unwrap_or_else(|p| p.into_inner());
             run_migrations(&mut guard, self.epoch, namespace, migrations)
         }
+    }
+
+    /// Clearing `query_only` in `Drop` prevents a reused connection from rejecting
+    /// later writes with `SQLITE_READONLY`.
+    struct QueryOnlyGuard<'c> {
+        /// `None` once cleared, so `Drop` never repeats a restore whose failure
+        /// [`Self::restore`] already reported.
+        conn: Option<&'c Connection>,
+    }
+
+    impl<'c> QueryOnlyGuard<'c> {
+        fn enable(conn: &'c Connection) -> Result<Self, StoreError> {
+            conn.pragma_update(None, "query_only", "ON")
+                .map_err(|e| StoreError::Backend(e.to_string()))?;
+            conn.authorizer(Some(deny_guard_pragmas))
+                .map_err(|e| StoreError::Backend(e.to_string()))?;
+            Ok(Self { conn: Some(conn) })
+        }
+
+        /// Reports a failed clear to the caller, which `Drop` cannot do.
+        fn restore(mut self) -> Result<(), StoreError> {
+            match self.conn.take() {
+                Some(conn) => Self::clear(conn),
+                None => Ok(()),
+            }
+        }
+
+        fn clear(conn: &Connection) -> Result<(), StoreError> {
+            conn.authorizer(NO_AUTHORIZER).map_err(|e| {
+                StoreError::Backend(format!("failed to clear read-only guard: {e}"))
+            })?;
+            conn.pragma_update(None, "query_only", "OFF")
+                .map_err(|e| StoreError::Backend(format!("failed to clear read-only guard: {e}")))
+        }
+    }
+
+    /// Specifies callback type so `None` removes the authorizer.
+    const NO_AUTHORIZER: Option<
+        fn(rusqlite::hooks::AuthContext<'_>) -> rusqlite::hooks::Authorization,
+    > = None;
+
+    /// `query_only` permits PRAGMA changes, including its own.
+    /// A PRAGMA read has no value and remains allowed.
+    fn deny_guard_pragmas(
+        context: rusqlite::hooks::AuthContext<'_>,
+    ) -> rusqlite::hooks::Authorization {
+        use rusqlite::hooks::{AuthAction, Authorization};
+        match context.action {
+            AuthAction::Pragma {
+                pragma_name:
+                    "query_only" | "synchronous" | "journal_mode" | "locking_mode" | "writable_schema",
+                pragma_value: Some(_),
+            } => Authorization::Deny,
+            _ => Authorization::Allow,
+        }
+    }
+
+    impl Drop for QueryOnlyGuard<'_> {
+        fn drop(&mut self) {
+            if let Some(conn) = self.conn.take() {
+                // Drop ignores cleanup errors because it cannot return them.
+                let _ = Self::clear(conn);
+            }
+        }
+    }
+
+    /// `query_only` permits lowering `synchronous`, which changes no database content.
+    /// With WAL and `synchronous=NORMAL`, power loss can roll back committed
+    /// transactions, so a protected transaction cannot trust the mode set at open.
+    fn pin_fence_durability(conn: &Connection) -> Result<(), StoreError> {
+        conn.pragma_update(None, "synchronous", "FULL")
+            .map_err(|e| StoreError::Backend(e.to_string()))
+    }
+
+    /// Transaction-control SQL sent by the callback ends the fence-checked transaction.
+    /// Later statements commit in autocommit without a fence.
+    fn require_open_transaction(tx: &rusqlite::Transaction<'_>) -> Result<(), StoreError> {
+        if tx.is_autocommit() {
+            return Err(StoreError::Backend(
+                "the callback ended the fence-checked transaction; effects after that \
+                 commit ran unfenced"
+                    .to_string(),
+            ));
+        }
+        Ok(())
     }
 
     /// Open a module's SQLite store from its descriptor.
@@ -221,6 +350,7 @@ mod sqlite_backend {
     /// Returns [`StoreError::Io`] when the parent directory cannot be created.
     /// Returns [`StoreError::Lease`] when lease acquisition fails.
     /// Returns [`StoreError::Fenced`] if the database advances during open.
+    /// Returns [`StoreError::FenceCorrupt`] if the stored fence epoch is out of range.
     /// Returns [`StoreError::Backend`] when SQLite inspection, setup, or fence claim fails.
     pub fn open_sqlite(descriptor: &StorageDescriptor) -> Result<SqliteStore, StoreError> {
         let path = match &descriptor.backend {
@@ -245,6 +375,10 @@ mod sqlite_backend {
         // wait rather than fail, and foreign-key enforcement is enabled.
         conn.pragma_update(None, "journal_mode", "WAL")
             .map_err(|e| StoreError::Backend(e.to_string()))?;
+        // In WAL mode, `synchronous=NORMAL` may lose the most recent commits
+        // after power loss, which would roll the persisted fence epoch backward.
+        conn.pragma_update(None, "synchronous", "FULL")
+            .map_err(|e| StoreError::Backend(e.to_string()))?;
         conn.busy_timeout(Duration::from_secs(5))
             .map_err(|e| StoreError::Backend(e.to_string()))?;
         conn.pragma_update(None, "foreign_keys", "ON")
@@ -254,7 +388,7 @@ mod sqlite_backend {
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
             .map_err(|e| StoreError::Backend(e.to_string()))?;
         ensure_fence_table(&tx)?;
-        claim_fence(&tx, epoch)?;
+        claim_fence_strict(&tx, epoch)?;
         tx.commit()
             .map_err(|e| StoreError::Backend(e.to_string()))?;
 
@@ -278,6 +412,8 @@ mod sqlite_backend {
         }
         let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
             .map_err(|e| StoreError::Backend(e.to_string()))?;
+        conn.busy_timeout(Duration::from_secs(5))
+            .map_err(|e| StoreError::Backend(e.to_string()))?;
         let has_fence: bool = conn
             .query_row(
                 "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'cortexkit_fence')",
@@ -288,12 +424,16 @@ mod sqlite_backend {
         if !has_fence {
             return Ok(0);
         }
+        read_fence_epoch_in(&conn)
+    }
+
+    const FENCE_EPOCH_SQL: &str =
+        "SELECT COALESCE((SELECT epoch FROM cortexkit_fence WHERE id = 0), 0)";
+
+    /// The caller guarantees that `cortexkit_fence` exists.
+    fn read_fence_epoch_in(conn: &Connection) -> Result<u64, StoreError> {
         let epoch: i64 = conn
-            .query_row(
-                "SELECT COALESCE((SELECT epoch FROM cortexkit_fence WHERE id = 0), 0)",
-                [],
-                |row| row.get(0),
-            )
+            .query_row(FENCE_EPOCH_SQL, [], |row| row.get(0))
             .map_err(|e| StoreError::Backend(e.to_string()))?;
         decode_fence_epoch(epoch)
     }
@@ -309,21 +449,14 @@ mod sqlite_backend {
     }
 
     /// Binds fence comparison and claim to the caller's protected transaction.
-    fn claim_fence(tx: &rusqlite::Transaction<'_>, holder_epoch: u64) -> Result<(), StoreError> {
-        let holder_epoch_sql = i64::try_from(holder_epoch).map_err(|_| {
-            StoreError::Backend(format!(
-                "lease epoch {holder_epoch} exceeds SQLite INTEGER maximum"
-            ))
-        })?;
-
-        let db_epoch_sql: i64 = tx
-            .query_row(
-                "SELECT COALESCE((SELECT epoch FROM cortexkit_fence WHERE id = 0), 0)",
-                [],
-                |r| r.get(0),
-            )
-            .map_err(|e| StoreError::Backend(e.to_string()))?;
-        let db_epoch = decode_fence_epoch(db_epoch_sql)?;
+    ///
+    /// An epoch equal to the stored epoch permits repeated writes.
+    pub(crate) fn claim_fence(
+        tx: &rusqlite::Transaction<'_>,
+        holder_epoch: u64,
+    ) -> Result<(), StoreError> {
+        let holder_epoch_sql = fence_epoch_sql_value(holder_epoch)?;
+        let db_epoch = read_fence_epoch_in(tx)?;
 
         if db_epoch > holder_epoch {
             return Err(StoreError::Fenced {
@@ -332,23 +465,53 @@ mod sqlite_backend {
             });
         }
         if holder_epoch > db_epoch {
-            tx.execute(
-                "INSERT INTO cortexkit_fence (id, epoch) VALUES (0, ?1) \
-                 ON CONFLICT(id) DO UPDATE SET epoch = excluded.epoch",
-                rusqlite::params![holder_epoch_sql],
-            )
-            .map_err(|e| StoreError::Backend(e.to_string()))?;
+            write_fence(tx, holder_epoch_sql)?;
         }
         Ok(())
     }
 
-    /// Rejects negative SQLite integers instead of wrapping them into writer epochs.
-    fn decode_fence_epoch(epoch: i64) -> Result<u64, StoreError> {
-        u64::try_from(epoch).map_err(|_| {
+    /// A stale externally derived floor can otherwise reissue the stored epoch.
+    pub(crate) fn claim_fence_strict(
+        tx: &rusqlite::Transaction<'_>,
+        holder_epoch: u64,
+    ) -> Result<(), StoreError> {
+        let holder_epoch_sql = fence_epoch_sql_value(holder_epoch)?;
+        let db_epoch = read_fence_epoch_in(tx)?;
+
+        if holder_epoch <= db_epoch {
+            return Err(StoreError::Fenced {
+                holder_epoch,
+                db_epoch,
+            });
+        }
+        write_fence(tx, holder_epoch_sql)
+    }
+
+    /// `i64::try_from` rejects unrepresentable epochs before any database access.
+    fn fence_epoch_sql_value(holder_epoch: u64) -> Result<i64, StoreError> {
+        i64::try_from(holder_epoch).map_err(|_| {
             StoreError::Backend(format!(
-                "database fence epoch {epoch} is outside the supported range"
+                "lease epoch {holder_epoch} exceeds SQLite INTEGER maximum"
             ))
         })
+    }
+
+    fn write_fence(
+        tx: &rusqlite::Transaction<'_>,
+        holder_epoch_sql: i64,
+    ) -> Result<(), StoreError> {
+        tx.execute(
+            "INSERT INTO cortexkit_fence (id, epoch) VALUES (0, ?1) \
+             ON CONFLICT(id) DO UPDATE SET epoch = excluded.epoch",
+            rusqlite::params![holder_epoch_sql],
+        )
+        .map(|_| ())
+        .map_err(|e| StoreError::Backend(e.to_string()))
+    }
+
+    /// Rejects negative SQLite integers instead of wrapping them into writer epochs.
+    fn decode_fence_epoch(epoch: i64) -> Result<u64, StoreError> {
+        u64::try_from(epoch).map_err(|_| StoreError::FenceCorrupt { db_epoch: epoch })
     }
 
     /// Apply un-applied migrations for one `namespace` in ascending version order,
@@ -364,6 +527,7 @@ mod sqlite_backend {
         namespace: &str,
         migrations: &[Migration],
     ) -> Result<(), StoreError> {
+        pin_fence_durability(conn)?;
         let tx = conn
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
             .map_err(|e| StoreError::Migration(e.to_string()))?;
@@ -405,6 +569,12 @@ mod sqlite_backend {
                     m.version
                 ))
             })?;
+            require_open_transaction(&tx).map_err(|e| {
+                StoreError::Migration(format!(
+                    "namespace '{namespace}' migration {}: {e}",
+                    m.version
+                ))
+            })?;
             tx.execute(
                 "INSERT INTO cortexkit_schema_version (namespace, version, applied_at_unix) \
                  VALUES (?1, ?2, ?3)",
@@ -430,6 +600,7 @@ pub use sqlite_backend::{open_sqlite, SqliteStore};
 
 #[cfg(all(test, feature = "sqlite"))]
 mod tests {
+    use super::sqlite_backend::{claim_fence, claim_fence_strict};
     use super::*;
 
     /// Reopening covers pre-existing permissive files. A first open cannot test
@@ -541,6 +712,49 @@ mod tests {
             })
             .expect("open claimed fence");
         assert_eq!(claimed as u64, store.epoch());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Models the interleaving where a floor read before lease acquisition goes stale:
+    /// an opener issues the epoch the database already stores. `claim_fence` authorizes
+    /// that equal epoch, which would place two holders on one epoch, so open uses
+    /// `claim_fence_strict` instead.
+    #[test]
+    fn open_claim_rejects_an_epoch_the_database_already_stores() {
+        let (root, d) = tmp();
+        let path = sqlite_path(&d);
+        open_sqlite(&d).expect("seed database");
+
+        let mut conn = rusqlite::Connection::open(&path).expect("reopen database");
+        let stored: u64 = conn
+            .query_row(
+                "SELECT epoch FROM cortexkit_fence WHERE id = 0",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .map(|epoch| epoch as u64)
+            .expect("stored fence");
+
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .expect("claim transaction");
+        match claim_fence_strict(&tx, stored) {
+            Err(StoreError::Fenced {
+                holder_epoch,
+                db_epoch,
+            }) => {
+                assert_eq!(holder_epoch, stored);
+                assert_eq!(db_epoch, stored);
+            }
+            other => panic!("expected an equal epoch to be rejected, got {other:?}"),
+        }
+        assert!(
+            claim_fence(&tx, stored).is_ok(),
+            "an equal epoch stays authorized for a holder that already claimed it"
+        );
+        claim_fence_strict(&tx, stored + 1).expect("a strictly greater epoch claims");
+        drop(tx);
+
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -737,6 +951,205 @@ mod tests {
     }
 
     #[test]
+    fn unfenced_connection_rejects_writes() {
+        let (root, d) = tmp();
+        let store = open_sqlite(&d).expect("open");
+        store.migrate("kv", FENCE_SCHEMA).expect("migrate");
+        let r = store.with_conn(|c| {
+            c.execute("INSERT INTO kv (k, v) VALUES ('sneak', '1')", [])
+                .map(|_| ())
+        });
+        assert!(
+            matches!(&r, Err(StoreError::Backend(m)) if m.contains("readonly")),
+            "unfenced write must fail with SQLITE_READONLY, got {r:?}"
+        );
+        let n: i64 = store
+            .with_conn(|c| c.query_row("SELECT COUNT(*) FROM kv", [], |r| r.get(0)))
+            .expect("count");
+        assert_eq!(n, 0, "the rejected write left no row");
+        store
+            .with_conn_fenced(|tx| {
+                tx.execute("INSERT INTO kv (k, v) VALUES ('a', '1')", [])
+                    .map(|_| ())
+            })
+            .expect("fenced writes still work after the read-only guard clears");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn open_pins_full_synchronous() {
+        let (root, d) = tmp();
+        let store = open_sqlite(&d).expect("open");
+        let sync: i64 = store
+            .with_conn(|c| c.query_row("PRAGMA synchronous", [], |r| r.get(0)))
+            .expect("read synchronous");
+        assert_eq!(sync, 2, "fence durability requires synchronous=FULL");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_panicking_read_does_not_strand_the_connection_read_only() {
+        let (root, d) = tmp();
+        let store = open_sqlite(&d).expect("open");
+        store.migrate("kv", FENCE_SCHEMA).expect("migrate");
+
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            store.with_conn(|_| -> rusqlite::Result<()> { panic!("callback panics") })
+        }));
+        assert!(panicked.is_err(), "the callback's panic propagates");
+
+        store
+            .with_conn_fenced(|tx| {
+                tx.execute("INSERT INTO kv (k, v) VALUES ('after-panic', '1')", [])
+                    .map(|_| ())
+            })
+            .expect("a fenced write after a panicking read is still authorized");
+        store
+            .with_conn_unfenced(|c| c.execute_batch("VACUUM"))
+            .expect("maintenance after a panicking read still reaches the database");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_read_callback_cannot_lower_fence_durability() {
+        let (root, d) = tmp();
+        let store = open_sqlite(&d).expect("open");
+        store.migrate("kv", FENCE_SCHEMA).expect("migrate");
+
+        let lowered = store.with_conn(|c| c.pragma_update(None, "synchronous", "OFF"));
+        assert!(
+            matches!(&lowered, Err(StoreError::Backend(m)) if m.contains("not authorized")),
+            "the read guard denies lowering synchronous, got {lowered:?}"
+        );
+        let unchanged: i64 = store
+            .with_conn(|c| c.query_row("PRAGMA synchronous", [], |r| r.get(0)))
+            .expect("reading a pragma stays allowed");
+        assert_eq!(unchanged, 2, "the denied pragma left synchronous=FULL");
+
+        // The fenced write restores `synchronous=FULL` after unrestricted maintenance
+        // changes it.
+        store
+            .with_conn_unfenced(|c| c.pragma_update(None, "synchronous", "OFF"))
+            .expect("maintenance may lower it");
+        store
+            .with_conn_fenced(|tx| {
+                tx.execute("INSERT INTO kv (k, v) VALUES ('durable', '1')", [])
+                    .map(|_| ())
+            })
+            .expect("fenced write");
+        let after: i64 = store
+            .with_conn(|c| c.query_row("PRAGMA synchronous", [], |r| r.get(0)))
+            .expect("read synchronous");
+        assert_eq!(
+            after, 2,
+            "the fenced write re-pinned synchronous=FULL, so the committed epoch is crash-durable"
+        );
+
+        store
+            .with_conn_unfenced(|c| c.pragma_update(None, "synchronous", "NORMAL"))
+            .expect("lower again");
+        let second = &[Migration {
+            version: 1,
+            statements: "CREATE TABLE kv2 (k TEXT PRIMARY KEY);",
+        }];
+        store.migrate("kv2", second).expect("migrate");
+        let after_migrate: i64 = store
+            .with_conn(|c| c.query_row("PRAGMA synchronous", [], |r| r.get(0)))
+            .expect("read synchronous");
+        assert_eq!(after_migrate, 2, "migration re-pinned synchronous=FULL");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_read_callback_cannot_clear_the_read_only_guard() {
+        let (root, d) = tmp();
+        let store = open_sqlite(&d).expect("open");
+        store.migrate("kv", FENCE_SCHEMA).expect("migrate");
+
+        let bypass = store.with_conn(|c| {
+            c.pragma_update(None, "query_only", "OFF")?;
+            c.execute("INSERT INTO kv (k, v) VALUES ('bypass', '1')", [])
+                .map(|_| ())
+        });
+        assert!(
+            matches!(&bypass, Err(StoreError::Backend(m)) if m.contains("not authorized")),
+            "clearing the guard is denied before any write runs, got {bypass:?}"
+        );
+        for pragma in ["journal_mode", "locking_mode", "writable_schema"] {
+            let denied = store.with_conn(|c| c.pragma_update(None, pragma, "EXCLUSIVE"));
+            assert!(
+                matches!(&denied, Err(StoreError::Backend(m)) if m.contains("not authorized")),
+                "setting {pragma} from a read callback is denied, got {denied:?}"
+            );
+        }
+        let n: i64 = store
+            .with_conn(|c| c.query_row("SELECT COUNT(*) FROM kv", [], |r| r.get(0)))
+            .expect("count");
+        assert_eq!(n, 0, "the denied callback wrote nothing");
+
+        store
+            .with_conn_fenced(|tx| {
+                tx.execute("INSERT INTO kv (k, v) VALUES ('fenced', '1')", [])
+                    .map(|_| ())
+            })
+            .expect("the fenced path still works after a denied callback");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_callback_that_ends_the_transaction_is_rejected() {
+        let (root, d) = tmp();
+        let store = open_sqlite(&d).expect("open");
+        store.migrate("kv", FENCE_SCHEMA).expect("migrate");
+
+        let r = store.with_conn_fenced(|tx| {
+            tx.execute_batch("COMMIT; INSERT INTO kv (k, v) VALUES ('escaped', '1')")?;
+            Ok(())
+        });
+        assert!(
+            matches!(&r, Err(StoreError::Backend(m)) if m.contains("ended the fence-checked transaction")),
+            "ending the transaction is reported as such, not as a failed commit, got {r:?}"
+        );
+
+        let migration = &[Migration {
+            version: 9,
+            statements: "COMMIT; CREATE TABLE escaped_ddl (v TEXT);",
+        }];
+        let m = store.migrate("escape", migration);
+        assert!(
+            matches!(&m, Err(StoreError::Migration(msg)) if msg.contains("ended the fence-checked transaction")),
+            "a migration that ends its transaction is rejected, got {m:?}"
+        );
+        let recorded: i64 = store
+            .with_conn(|c| {
+                c.query_row(
+                    "SELECT COUNT(*) FROM cortexkit_schema_version WHERE namespace = 'escape'",
+                    [],
+                    |r| r.get(0),
+                )
+            })
+            .expect("count");
+        assert_eq!(recorded, 0, "the rejected migration recorded no version");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn maintenance_runs_through_the_unfenced_path() {
+        let (root, d) = tmp();
+        let store = open_sqlite(&d).expect("open");
+        store.migrate("kv", FENCE_SCHEMA).expect("migrate");
+        let r = store.with_conn(|c| c.execute_batch("VACUUM"));
+        assert!(
+            matches!(&r, Err(StoreError::Backend(m)) if m.contains("readonly")),
+            "VACUUM must not pass the read-only guard, got {r:?}"
+        );
+        store
+            .with_conn_unfenced(|c| c.execute_batch("VACUUM"))
+            .expect("VACUUM through the maintenance path");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn fenced_write_rolls_back_on_error() {
         let (root, d) = tmp();
         let path = sqlite_path(&d);
@@ -814,9 +1227,7 @@ mod tests {
             Err(error) => error,
             Ok(_) => panic!("negative fence must fail closed"),
         };
-        assert!(
-            matches!(error, StoreError::Backend(message) if message.contains("database fence epoch -1 is outside the supported range"))
-        );
+        assert!(matches!(error, StoreError::FenceCorrupt { db_epoch } if db_epoch == -1));
         let persisted: i64 = rusqlite::Connection::open(&path)
             .expect("reopen legacy database")
             .query_row(

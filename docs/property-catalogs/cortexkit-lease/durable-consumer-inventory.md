@@ -12,7 +12,10 @@ Commit-pinned links keep the evidence stable as consumer branches move.
 | `broca`, `broca-tagref` | Repository lookup returned HTTP 404 | Source was unavailable, so this inventory makes no claim about either repository. |
 
 Two external blockers remain. Magic Context has durable mutations through
-unfenced `with_conn`; removing that compatibility surface and defining the
-complete protected write set require a companion consumer migration.
+`with_conn`, which now fails `SQLITE_READONLY` rather than committing unfenced, so
+upgrading that consumer requires moving those mutations to `with_conn_fenced`
+before the version bump reaches it. Defining the complete protected write set is
+a separate owner decision, because `with_conn_unfenced` can carry the same
+mutations without a fence check.
 Claustrum has no supplied receipt for its real-daemon two-process review. The
 backend-fencing PR remains draft until both blockers are resolved.
