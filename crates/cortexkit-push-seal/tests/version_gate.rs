@@ -5,6 +5,17 @@ use serde_json::{json, Value};
 
 const FIXTURE_PATH: &str = "crates/cortexkit-push-seal/tests/golden/push-seal-wire-v1.json";
 const MANIFEST_PATH: &str = "crates/cortexkit-push-seal/Cargo.toml";
+const WIRE_V1_FIXTURE: &str = include_str!("golden/push-seal-wire-v1.json");
+
+#[test]
+fn fixture_build_identity_matches_package() {
+    let fixture: Value = serde_json::from_str(WIRE_V1_FIXTURE).expect("parse wire fixture");
+    assert_eq!(fixture["build_identity"]["package"], "cortexkit-push-seal");
+    assert_eq!(
+        fixture["build_identity"]["package_version"],
+        env!("CARGO_PKG_VERSION")
+    );
+}
 
 // Parse TOML keys because quoted keys and escapes can encode `version`.
 fn package_version(manifest: &str) -> Result<String, String> {

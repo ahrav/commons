@@ -22,7 +22,7 @@ Documentation and commit messages are treated as claims or leads. Code resolves 
 | Claimed safety | The docs claim a fixed suite, layout, version, AAD, empty `info`, inclusive plaintext cap, error vocabulary, recipient confidentiality, and version-bump discipline. |
 | Claimed liveness | No explicit liveness guarantee. The library has no convergence or eventual-completion protocol. `seal` also depends on the OS entropy path, which may block, retry, or fall back before returning or panicking. |
 | Bug history and density | Seven commits touch the crate. Three concentrate on selecting the correct operator-pasted key in `handseal`; no production incident or library regression is recorded. The library implementation has not changed since its initial commit. |
-| Existing test strategy | Fourteen in-module unit tests cover round trips, suite IDs, layout and overhead, ephemeral freshness on both the ambient and RNG-injected paths, cap boundaries, open-error precedence, prefix and single-bit campaigns, sampled totality, the wire vocabulary, wrong recipient, exact AAD and `info`, key-deserialization reachability, and low-order encapsulation. There is no cross-language corpus, integration test, property test, fuzz target, fault injection, or example test. |
+| Existing test strategy | In-module unit tests cover local cryptographic behavior: round trips, suite IDs, deterministic fixture bytes and classifications, layout and overhead, ephemeral freshness, cap boundaries, open-error precedence, mutation campaigns, malformed-input totality, key handling, exact AAD and `info`, and low-order encapsulation. The `version_gate` integration test checks fixture package identity and revision-to-revision version policy. There is no cross-language corpus, property test, fuzz target, fault injection, or example test. |
 | Failure and degradation | The crate itself performs no retry or fallback. Its dependency may retry or fall back while obtaining entropy and panics if the ambient RNG ultimately fails. Crate documentation claims that a sealer/opener wire mismatch is silent locally and appears on the device as an undecryptable notification; the unavailable device path was not verified. |
 | Dependencies | `hpke 0.14` supplies all cryptographic behavior; direct `getrandom 0.4` supplies the ambient `SysRng` that `seal` passes to it. hpke's `getrandom` feature and `hex` are dev-only. The tracked `Cargo.lock` records the resolved version-and-checksum closure, and CI uses `--locked`. Target-specific feature activation and entropy backends, alternate consumers, the external opener, and non-default build purposes remain unaudited. See [`byte-determining-dependency-closure-is-pinned`](evidence/byte-determining-dependency-closure-is-pinned.md). |
 | Product context | This crate seals push-notification payloads. The actual opener is in another repository. The examples are operator tools for generating a keypair and hand-checking a round trip. |
@@ -36,8 +36,7 @@ These disagreements stay visible because code may be the defect.
 1. `BadRecipientKey` is documented as invalid X25519 point/scalar detection in the `SealError` and `OpenError` variant docs, but the resolved dependency checks only the 32-byte serialized length. A degenerate 32-byte public key can instead reach `SealError::Hpke`.
 2. The docs say sealing failures preserve their cause in the `SealError` docs, but the dependency's ambient RNG wrapper panics on entropy failure.
 3. The docs delegate `open`'s size bound to transport in the `open` docs, but no transport or bound exists in this repository.
-4. The docs require version bumps for emitted-byte or behavior changes in the module docs, but no repository check enforces the rule.
-5. The docs say the recipient key is dedicated to this purpose in the module docs, but this repository cannot inspect key use in the device or caller.
+4. The docs say the recipient key is dedicated to this purpose in the module docs, but this repository cannot inspect key use in the device or caller.
 
 ## Existing-check inventory
 
@@ -67,6 +66,7 @@ No production `assert!`, `debug_assert!`, or equivalent invariant assertion was 
 |---|---|---|
 | [`the_pinned_suite_has_the_documented_codepoints`](../../../crates/cortexkit-push-seal/src/lib.rs) | Three literal codepoint equalities; messages name KEM, KDF, and AEAD. | audited for local build-wide codepoints; external opener equality remains unaudited |
 | [`wire_v1_fixture_matches_local_bytes_and_classifications`](../../../crates/cortexkit-push-seal/src/lib.rs) | Regenerates one exact deterministic envelope through the private RNG seam, opens it, and checks all represented local errors and wire codes. | audited as a local fixture oracle; not independent opener evidence |
+| `fixture_build_identity_matches_package`, `tests/version_gate.rs` | Requires the fixture package name and version to match the crate being tested. | audited for the local fixture and crate build |
 | `synthetic_version_gate_cases` and `actual_git_diff_requires_version_bump`, `tests/version_gate.rs` | Exercise fixture/version policy in memory and compare explicitly named Git revisions only when both event SHAs are present. | audited for represented fixture changes; unrepresented behavior remains unaudited |
 | [`a_sealed_payload_opens_to_the_same_plaintext`](../../../crates/cortexkit-push-seal/src/lib.rs) | Exact byte round trips at lengths 0, 2047, and 2048 with non-UTF-8 fixtures. | audited for these local boundaries |
 | [`the_envelope_has_version_one_and_fixed_overhead`](../../../crates/cortexkit-push-seal/src/lib.rs) | Pins literal version 1, 32-byte encapsulation, 49-byte overhead, and 2097-byte maximum at lengths 0, 1, and 2048. | audited for the leading version and local size literals |
@@ -410,13 +410,13 @@ No production `assert!`, `debug_assert!`, or equivalent invariant assertion was 
 
 - **Type:** safety
 - **Status:** active
-- **Exercised:** partially; default CI records direct version requirements, manifest features, and the resolved version-and-checksum closure, and rejects manifest/lock mismatch
+- **Exercised:** partially; the tracked workspace lockfile and `--locked` CI commands pin default-CI resolution, and the local byte fixture detects changes to its represented envelope and classifications
 - **Guarantee:** Every supported target and build purpose that produces or verifies sealed bytes uses its approved enabled-feature set, entropy-backend configuration, command edge set, and version-and-checksum identity for the full transitive dependency graph.
 - **Check:** `always((enabled_features, getrandom_backend, cargo_edges, resolved_graph) == approved_build_identity[target, purpose])` for default verification, deterministic-vector generation, and entropy-failure testing on each supported target. `always` fits because one target can intentionally have several backend/configuration identities.
 - **Fault/timing angle:** A new in-range dependency release appears between developer, CI, consumer, or release builds.
 - **Required faults and enabling state:** The tracked lockfile plus a deliberate manifest/lock mismatch prove default-CI resolution drift is rejected. Deliberate target-feature, backend, consumer, opener, and build-purpose drift remain untested.
-- **Confidence:** high for the default-CI resolution and manifest feature set; low for the broader property; [evidence](evidence/byte-determining-dependency-closure-is-pinned.md)
-- **Existing check:** Direct dependency requirements and explicit features in `crates/cortexkit-push-seal/Cargo.toml`, the tracked workspace `Cargo.lock`, and `--locked` on every CI Cargo build/lint/test command. The broad property remains unaudited.
+- **Confidence:** high that default CI consumes the tracked resolution; low for the broader multi-target property; [evidence](evidence/byte-determining-dependency-closure-is-pinned.md)
+- **Existing check:** Direct dependency requirements and explicit features in `crates/cortexkit-push-seal/Cargo.toml`, the tracked workspace `Cargo.lock`, `--locked` CI commands, and the local exact-byte fixture. The fixture does not record or independently validate the dependency closure. Target-specific activation and external build identities remain unaudited.
 - **Impact:** Dependency drift can change bytes or error behavior without a crate-source diff or version signal, and it makes revision-to-revision wire comparisons ambiguous.
 - **Open questions:** Target-specific activated features and entropy backends; identities for deterministic-vector and entropy-failure builds; alternate path consumers; whether the external opener pins its closure and where conformance vectors record build identity. `(needs human input)`
 
@@ -467,7 +467,7 @@ These findings are not active safety properties. A future sender-authentication 
 | Degenerate or low-order public value | `degenerate-public-key-hpke-error-is-reachable` | yes |
 | KEM serialized-size or deserializer-semantics drift | `encapped-key-parse-failure-is-unreachable`, `envelope-layout-and-overhead-stay-fixed` | build-time only |
 | Low-order attacker-controlled `enc` | `low-order-encapsulation-aead-path-is-reachable` | yes with a fixed dependency-approved vector |
-| New in-range crypto dependency release | `byte-determining-dependency-closure-is-pinned` | yes for default CI through the tracked `Cargo.lock` and `--locked`; broader identities remain unaudited |
+| New in-range crypto dependency release | `byte-determining-dependency-closure-is-pinned` | yes for default CI through the tracked `Cargo.lock` and `--locked`; the local byte fixture detects represented output drift; broader identities remain unaudited |
 | Represented fixture change without version bump | `version-bump-accompanies-wire-change` | yes through synthetic policy cases and merge-base pull-request CI; no qualifying historical commit yet |
 
 ## Relationship map
@@ -501,7 +501,7 @@ Fresh-context evaluation ran after the first catalog draft.
 - The layout property now records the locally derivable maximum envelope size of 2097 bytes.
 - RNG failure is marked as a source-confirmed contradiction to the error-return claim and uses the resolved `getrandom` build-time failure seam; entropy blocking/retry is retained as a liveness limitation.
 - Empty `info` now names its dependency-level observation method and the external corpus as the durable oracle.
-- Default-CI identity now records manifest features and the resolved version-and-checksum closure. Target-specific activation, backend configuration, consumers, the opener, and other build purposes remain unaudited.
+- Default CI consumes the tracked lockfile, and the local fixture pins one exact envelope and its error classifications. The fixture does not record dependency closure. Target-specific activation, backend configuration, consumers, the opener, and other build purposes remain unaudited.
 
 ### Biases and dispositions
 
@@ -511,7 +511,7 @@ Fresh-context evaluation ran after the first catalog draft.
 
 ### Harness fit and balance
 
-- Build constants and dependency identity belong at build or repository boundaries.
+- Build constants and locked dependency resolution belong at build or repository boundaries.
 - Pure byte-domain properties fit local API or dependency-level boundaries.
 - RNG failure uses the resolved `getrandom` backend-selection seam; a custom backend can also observe draw calls.
 - Transport bounds and key dedication belong in unavailable caller/provisioning systems.
