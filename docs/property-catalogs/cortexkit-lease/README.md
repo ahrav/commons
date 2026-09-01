@@ -297,7 +297,7 @@ Supporting artifacts:
 - **Fault/timing angle:** Changing field order, separator, hash, suffix, or normalization while old and new processes overlap.
 - **Required faults and enabling state:** Two versions running concurrently against one lease root, including rolling restart and rollback.
 - **Confidence:** high that the path is a de facto persisted protocol (`src/lib.rs:204-210`). Crate version `0.1.1` records the public derivation and MSRV change, but compatibility remains a manual versioning convention rather than an automated gate.
-- **Existing check:** `identity_hash_derivation_is_stable`, `src/lib.rs:482-488`, pins one identity and filename hash; `advisory_key_derivation_is_stable`, `cortexkit-store-postgres/src/lib.rs:396-402`, pins the corresponding shared derivation for a PostgreSQL key; status **unaudited**.
+- **Existing check:** `identity_hash_derivation_is_stable`, `src/lib.rs:482-488`, pins one identity and filename hash; `advisory_key_derivation_is_stable`, `cortexkit-store-postgres/src/lib.rs:375-381`, pins the corresponding shared derivation for a PostgreSQL key; status **unaudited**.
 - **Impact:** Old and new binaries lock different files and can both write.
 - **Open questions:** Is mixed-version overlap supported for all consumers? `(needs human input)`
 - **Evidence:** [evidence/lease-path-format-is-version-stable.md](evidence/lease-path-format-is-version-stable.md)
@@ -312,7 +312,7 @@ Supporting artifacts:
 - **Fault/timing angle:** A stale connection remains usable after its lease is released and a replacement acquires a newer epoch.
 - **Required faults and enabling state:** Real handover, retained old connection, replacement fence claim, then a late old-writer mutation. Run for every path declared fence-protected; fence-coverage completeness is a separate property.
 - **Confidence:** high that the crate claims it at `src/lib.rs:11-16`; high that SQLite implements one fenced path; high that PostgreSQL exposes an epoch but no in-repo fence check was found.
-- **Existing check:** `superseded_writer_is_fenced_out_after_handover`, `cortexkit-store/src/lib.rs:631-670`, synthetic `for_test` handles; status **unaudited**.
+- **Existing check:** `superseded_writer_is_fenced_out_after_handover`, `cortexkit-store/src/lib.rs:629-667`, synthetic `for_test` handles; status **unaudited**.
 - **Impact:** A superseded process can overwrite state owned by its replacement.
 - **Open questions:** Is PostgreSQL's session lock intentionally considered sufficient, making its epoch informational, or is the fence path missing? `(needs human input)`
 - **Evidence:** [evidence/stale-writer-write-is-rejected.md](evidence/stale-writer-write-is-rejected.md)
@@ -326,8 +326,8 @@ Supporting artifacts:
 - **Check:** `always(same_logical_store => lease_identity_a == lease_identity_b)` and `always(independent_stores => lease_identity_a != lease_identity_b)`, where identity includes canonical root plus all three key fields.
 - **Fault/timing angle:** The lease key excludes the SQLite database path, while the root is only its parent. Sibling databases with equal descriptors alias; one database opened with differing module or namespace values splits into independent locks.
 - **Required faults and enabling state:** Open the same SQLite database through descriptors differing in module or namespace; open it through cross-parent symlink or hardlink aliases; open two sibling database files under one parent with equal key fields.
-- **Confidence:** high on derivation facts (`cortexkit-store/src/lib.rs:80-88,240-262`); unknown whether descriptor authority prevents these combinations in deployment.
-- **Existing check:** `distinct_databases_do_not_falsely_contend`, `cortexkit-store/src/lib.rs:495-504`, uses different parent directories and does not exercise sibling files; status **unaudited**.
+- **Confidence:** high on derivation facts (`cortexkit-store/src/lib.rs:69-75,245-260`); unknown whether descriptor authority prevents these combinations in deployment.
+- **Existing check:** `distinct_databases_do_not_falsely_contend`, `cortexkit-store/src/lib.rs:493-501`, uses different parent directories and does not exercise sibling files; status **unaudited**.
 - **Impact:** One store can have two writers, or independent stores can falsely block each other.
 - **Open questions:** What component guarantees descriptor uniqueness and canonical database paths? `(needs human input)`
 - **Evidence:** [evidence/logical-store-has-single-lease-identity.md](evidence/logical-store-has-single-lease-identity.md)
@@ -371,7 +371,7 @@ Supporting artifacts:
 - **Check:** `always(old_epoch_effect_commits => replacement_not_yet_acquired_at_commit)`. After replacement acquisition, every old-epoch attempt or in-flight transaction must abort as fenced and leave application state unchanged.
 - **Fault/timing angle:** SQLite claims the database fence lazily in `with_conn_fenced`, not during `open_sqlite`; before the replacement's first fenced write, the stored fence can still equal the old writer's epoch.
 - **Required faults and enabling state:** Old connection retained after releasing its lease, replacement acquires a newer epoch but performs no fenced write, then old connection calls the fenced path.
-- **Confidence:** high from `cortexkit-store/src/lib.rs:173-215,248-286` and equal-epoch behavior at `:672-692`.
+- **Confidence:** high from `cortexkit-store/src/lib.rs:162-205,245-284` and equal-epoch behavior at `:670-689`.
 - **Existing check:** none; the synthetic handover test claims epoch 2 before the stale attempt.
 - **Impact:** A superseded writer can commit during the handover window the fence is meant to close.
 - **Open questions:** Is fence claim intended at open, or is a pre-claim stale-write window accepted? `(needs human input)`

@@ -48,16 +48,16 @@ These are outside the target crate but explicitly exercise or consume its contra
 
 | Test | Location | Claim | Status |
 |---|---|---|---|
-| `reopening_a_permissive_store_protects_the_database_and_its_wal` | `cortexkit-store/src/lib.rs:365-418` | Database and WAL are `0600` on reopen. | unaudited |
-| `open_runs_migrations_and_seeds_once` | `cortexkit-store/src/lib.rs:459-480` | Store epochs are 1 then 2 across clean opens. | unaudited |
-| `second_live_writer_is_rejected` | `cortexkit-store/src/lib.rs:483-493` | Second same-process store open is rejected as a lease error. | unaudited |
-| `distinct_databases_do_not_falsely_contend` | `cortexkit-store/src/lib.rs:495-504` | Distinct database paths coexist. | unaudited |
-| `superseded_writer_is_fenced_out_after_handover` | `cortexkit-store/src/lib.rs:631-670` | Synthetic epoch-1 writer cannot overwrite epoch-2 state. | unaudited |
-| `equal_epoch_writer_is_not_fenced` | `cortexkit-store/src/lib.rs:672-692` | Equal epoch can continue writing. | unaudited |
-| `open_migrate_and_single_writer` | `cortexkit-store-postgres/src/lib.rs:327-362` | Live PostgreSQL session lock rejects a second open; first epoch is `>= 1` and reopened epoch is `>= 2` after clean release. It does not compare the values directly. Skips locally unless `CORTEXKIT_TEST_PG_DSN` is set; CI has a required live job. | unaudited |
-| `advisory_key_derivation_is_stable` | `cortexkit-store-postgres/src/lib.rs:396-402` | Pins one advisory bigint derived through public `LeaseKey::identity` and `fnv1a`. | unaudited |
+| `reopening_a_permissive_store_protects_the_database_and_its_wal` | `cortexkit-store/src/lib.rs:364-418` | Database and WAL are `0600` on reopen. | unaudited |
+| `open_runs_migrations_and_seeds_once` | `cortexkit-store/src/lib.rs:457-478` | Store epochs are 1 then 2 across clean opens. | unaudited |
+| `second_live_writer_is_rejected` | `cortexkit-store/src/lib.rs:481-490` | Second same-process store open is rejected as a lease error. | unaudited |
+| `distinct_databases_do_not_falsely_contend` | `cortexkit-store/src/lib.rs:493-501` | Distinct database paths coexist. | unaudited |
+| `superseded_writer_is_fenced_out_after_handover` | `cortexkit-store/src/lib.rs:629-667` | Synthetic epoch-1 writer cannot overwrite epoch-2 state. | unaudited |
+| `equal_epoch_writer_is_not_fenced` | `cortexkit-store/src/lib.rs:670-689` | Equal epoch can continue writing. | unaudited |
+| `open_migrate_and_single_writer` | `cortexkit-store-postgres/src/lib.rs:305-341` | Live PostgreSQL session lock rejects a second open; first epoch is `>= 1` and reopened epoch is `>= 2` after clean release. It does not compare the values directly. Skips locally unless `CORTEXKIT_TEST_PG_DSN` is set; CI has a required live job. | unaudited |
+| `advisory_key_derivation_is_stable` | `cortexkit-store-postgres/src/lib.rs:375-381` | Pins one advisory bigint derived through public `LeaseKey::identity` and `fnv1a`. | unaudited |
 
-The handover checks use `SqliteStore::for_test` (`cortexkit-store/src/lib.rs:120-143`), which bypasses real lease acquisition. They check fence logic, not an end-to-end handover.
+The handover checks use `SqliteStore::for_test` (`cortexkit-store/src/lib.rs:105-128`), which bypasses real lease acquisition. They check fence logic, not an end-to-end handover.
 
 ## Explicitly absent checks
 
