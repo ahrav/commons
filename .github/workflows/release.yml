@@ -35,31 +35,10 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
-      # Parse `<crate>-v<version>` from the tag and assert the crate's
-      # Cargo.toml version matches — guards against tagging a stale version.
+      # Ensure the tag version matches Cargo metadata, including inherited metadata.
       - name: Resolve crate + version from tag
         id: tag
-        run: |
-          TAG="${GITHUB_REF_NAME}"
-          if [[ ! "$TAG" =~ ^(.+)-v([0-9].*)$ ]]; then
-            echo "::error::Tag '$TAG' must be '<crate>-v<version>', e.g. cortexkit-paths-v0.1.1"
-            exit 1
-          fi
-          CRATE="${BASH_REMATCH[1]}"
-          VERSION="${BASH_REMATCH[2]}"
-          MANIFEST="crates/${CRATE}/Cargo.toml"
-          if [ ! -f "$MANIFEST" ]; then
-            echo "::error::No crate '${CRATE}' at ${MANIFEST}"
-            exit 1
-          fi
-          CARGO_VERSION=$(grep '^version' "$MANIFEST" | head -1 | sed -E 's/version *= *"([^"]+)"/\1/')
-          if [ "$VERSION" != "$CARGO_VERSION" ]; then
-            echo "::error::Tag wants ${VERSION} but ${MANIFEST} has ${CARGO_VERSION}"
-            exit 1
-          fi
-          echo "crate=$CRATE" >> "$GITHUB_OUTPUT"
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          echo "Publishing ${CRATE} v${VERSION}"
+        run: bash .github/scripts/resolve-release-tag.sh
 
       # Idempotent: a retag of the same version (recovery re-run) treats
       # "already exists" as success instead of failing the release.

@@ -164,6 +164,7 @@ dependencies = [
  "getrandom",
  "hex",
  "hpke",
+ "semver",
  "serde_json",
  "toml",
 ]

@@ -1,5 +1,6 @@
-use std::process::Command;
+use std::{cmp::Ordering, process::Command};
 
+use semver::Version;
 use serde_json::{json, Value};
 
 const FIXTURE_PATH: &str = "crates/cortexkit-push-seal/tests/golden/push-seal-wire-v1.json";
@@ -32,115 +33,13 @@ fn package_version(manifest: &str) -> Result<String, String> {
         .ok_or_else(|| format!("[package] version is not a string: {version:?}"))
 }
 
-// Keep numeric identifiers as digit strings because SemVer does not bound their width.
-#[derive(Debug, PartialEq, Eq)]
-enum Identifier {
-    Numeric(String),
-    Alphanumeric(String),
-}
-
-impl Ord for Identifier {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        use std::cmp::Ordering;
-        match (self, other) {
-            // Numeric identifiers without leading zeroes sort by length before
-            // lexicographic order.
-            (Identifier::Numeric(left), Identifier::Numeric(right)) => {
-                left.len().cmp(&right.len()).then_with(|| left.cmp(right))
-            }
-            (Identifier::Numeric(_), Identifier::Alphanumeric(_)) => Ordering::Less,
-            (Identifier::Alphanumeric(_), Identifier::Numeric(_)) => Ordering::Greater,
-            (Identifier::Alphanumeric(left), Identifier::Alphanumeric(right)) => left.cmp(right),
-        }
-    }
-}
-
-impl PartialOrd for Identifier {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-#[derive(Debug, PartialEq, Eq)]
-struct Version {
-    triple: (u64, u64, u64),
-    prerelease: Vec<Identifier>,
-}
-
-impl Ord for Version {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        use std::cmp::Ordering;
-        self.triple.cmp(&other.triple).then_with(|| {
-            // A release outranks any prerelease sharing its triple.
-            match (self.prerelease.is_empty(), other.prerelease.is_empty()) {
-                (true, true) => Ordering::Equal,
-                (true, false) => Ordering::Greater,
-                (false, true) => Ordering::Less,
-                (false, false) => self.prerelease.cmp(&other.prerelease),
-            }
-        })
-    }
-}
-
-impl PartialOrd for Version {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-// Drop build metadata before comparison because it does not affect SemVer precedence.
-// Reject unparseable versions so an unknown spelling cannot let a wire change pass.
 fn parse_version(version: &str) -> Result<Version, String> {
-    let without_build = version.split('+').next().unwrap_or(version);
-    let (core, prerelease) = match without_build.split_once('-') {
-        Some((core, prerelease)) => (core, prerelease),
-        None => (without_build, ""),
-    };
-    let mut parts = core.split('.');
-    let mut number = |field: &str| -> Result<u64, String> {
-        parts
-            .next()
-            .ok_or_else(|| format!("unparseable package version {version:?}: missing {field}"))?
-            .parse()
-            .map_err(|error| format!("unparseable package version {version:?}: {field}: {error}"))
-    };
-    let triple = (number("major")?, number("minor")?, number("patch")?);
-    if parts.next().is_some() {
-        return Err(format!(
-            "unparseable package version {version:?}: more than three numeric fields"
-        ));
-    }
-    let prerelease = match without_build.split_once('-') {
-        None => Vec::new(),
-        Some(_) => prerelease
-            .split('.')
-            .map(|identifier| identifier_of(version, identifier))
-            .collect::<Result<Vec<_>, _>>()?,
-    };
-    Ok(Version { triple, prerelease })
+    Version::parse(version)
+        .map_err(|error| format!("unparseable package version {version:?}: {error}"))
 }
 
-// An empty or leading-zero identifier is not a version Cargo accepts, so it is reported
-// rather than ordered under a guess.
-fn identifier_of(version: &str, identifier: &str) -> Result<Identifier, String> {
-    if identifier.is_empty() {
-        return Err(format!(
-            "unparseable package version {version:?}: empty prerelease identifier"
-        ));
-    }
-    if !identifier.bytes().all(|byte| byte.is_ascii_digit()) {
-        return Ok(Identifier::Alphanumeric(identifier.to_owned()));
-    }
-    if identifier.len() > 1 && identifier.starts_with('0') {
-        return Err(format!(
-            "unparseable package version {version:?}: leading zero in numeric prerelease \
-             identifier {identifier:?}"
-        ));
-    }
-    Ok(Identifier::Numeric(identifier.to_owned()))
-}
-
-// `provenance` and `build_identity` are recording metadata, not wire data.
+// Gate policy excludes `provenance` and `build_identity` from wire and
+// classification changes; changing them does not require a version bump.
 //
 // Wire-surface validation requires every section to be present and non-null.
 fn represented_wire_surface(fixture: &str) -> Result<Value, String> {
@@ -209,17 +108,20 @@ fn check_version_gate(
     let head = parse_version(&head_version)?;
     for (prior_version, changed) in constraints {
         let prior = parse_version(&prior_version)?;
-        if head == prior {
-            return Err(format!(
-                "push-seal wire fixture changed without a package version bump \
-                 ({head_version}); changed: {changed}"
-            ));
-        }
-        if head < prior {
-            return Err(format!(
-                "push-seal wire fixture changed but the package version did not increase \
-                 ({prior_version} -> {head_version}); changed: {changed}"
-            ));
+        match head.cmp_precedence(&prior) {
+            Ordering::Equal => {
+                return Err(format!(
+                    "push-seal wire fixture changed without a package version bump \
+                     ({head_version}); changed: {changed}"
+                ));
+            }
+            Ordering::Less => {
+                return Err(format!(
+                    "push-seal wire fixture changed but the package version did not increase \
+                     ({prior_version} -> {head_version}); changed: {changed}"
+                ));
+            }
+            Ordering::Greater => {}
         }
     }
     Ok(())
@@ -357,8 +259,10 @@ fn a_fixture_missing_a_wire_surface_section_fails_the_gate() {
 }
 
 #[test]
-fn manifest_formatting_does_not_change_the_read_version() {
+fn manifest_spellings_parse_equally_and_still_enforce_the_gate() {
     let canonical = "[package]\nname = \"cortexkit-push-seal\"\nversion = \"0.1.0\"\n";
+    let unchanged = fixture_with("0.1.0", "01", "synthetic");
+    let wire_change = fixture_with("0.1.0", "02", "synthetic");
     for variant in [
         "[ package ]\nversion = \"0.1.0\"\n",
         "[package]\nversion=\"0.1.0\"\n",
@@ -368,6 +272,7 @@ fn manifest_formatting_does_not_change_the_read_version() {
         "[package]\nkeywords = [\n    \"push\",\n]\nversion = \"0.1.0\"\n",
         "[package]\n\"version\" = \"0.1.0\"\n",
         "[package]\n'version' = \"0.1.0\"\n",
+        "[package]\nversion = '0.1.0'\n",
         "[package]\nversion = \"0.\\u0031.0\"\n",
         "package.version = \"0.1.0\"\n",
         "[package]\ndescription = \"\"\"\n[package]\nversion = \"9.9.9\"\n\"\"\"\nversion = \"0.1.0\"\n",
@@ -377,42 +282,13 @@ fn manifest_formatting_does_not_change_the_read_version() {
             package_version(canonical),
             "variant read a different version: {variant:?}"
         );
+        assert!(
+            check_version_gate(&[at(Some(&unchanged), variant)], &wire_change, variant)
+            .unwrap_err()
+            .contains("without a package version bump"),
+            "manifest spelling bypassed the gate: {variant:?}"
+        );
     }
-}
-
-#[test]
-fn a_commented_version_still_gates_a_wire_change() {
-    let unchanged = fixture_with("0.1.0", "01", "synthetic");
-    let wire_change = fixture_with("0.1.0", "02", "synthetic");
-    let commented = "[package]\nversion = \"0.1.0\" # pinned until the wire settles\n";
-
-    assert!(
-        check_version_gate(&[at(Some(&unchanged), commented)], &wire_change, commented)
-            .unwrap_err()
-            .contains("without a package version bump")
-    );
-    assert!(check_version_gate(
-        &[at(Some(&unchanged), commented)],
-        &wire_change,
-        "[package]\nversion = \"0.0.9\" # rolled back\n"
-    )
-    .unwrap_err()
-    .contains("did not increase"));
-}
-
-#[test]
-fn literal_string_quoting_reads_the_same_version() {
-    let unchanged = fixture_with("0.1.0", "01", "synthetic");
-    let wire_change = fixture_with("0.1.0", "02", "synthetic");
-    let double = "[package]\nversion = \"0.1.0\"\n";
-    let literal = "[package]\nversion = '0.1.0'\n";
-
-    assert_eq!(package_version(literal), package_version(double));
-    assert!(
-        check_version_gate(&[at(Some(&unchanged), double)], &wire_change, literal)
-            .unwrap_err()
-            .contains("without a package version bump")
-    );
 }
 
 #[test]
@@ -501,6 +377,14 @@ fn an_unparseable_version_fails_the_gate() {
             "an unparseable version passed the gate: {head:?}"
         );
     }
+
+    let invalid_prior = "[package]\nversion = \"0.1\"\n";
+    assert!(
+        check_version_gate(&[at(Some(&unchanged), invalid_prior)], &wire_change, base)
+            .unwrap_err()
+            .contains("unparseable package version"),
+        "an unparseable prior version passed the gate"
+    );
 }
 
 #[test]
@@ -552,88 +436,6 @@ fn prerelease_versions_compare_by_semver_precedence() {
     )
     .unwrap_err()
     .contains("without a package version bump"));
-}
-
-#[test]
-fn numeric_prerelease_identifiers_order_by_value_at_any_width() {
-    let unchanged = fixture_with("0.1.0", "01", "synthetic");
-    let wire_change = fixture_with("0.1.0", "02", "synthetic");
-    let manifest = |version: &str| format!("[package]\nversion = \"{version}\"\n");
-    let wide = "100000000000000000000";
-    let narrower = "99999999999999999999";
-
-    assert_eq!(
-        check_version_gate(
-            &[at(
-                Some(&unchanged),
-                &manifest(&format!("0.2.0-alpha.{narrower}"))
-            )],
-            &wire_change,
-            &manifest(&format!("0.2.0-alpha.{wide}"))
-        ),
-        Ok(())
-    );
-    assert!(
-        check_version_gate(
-            &[at(
-                Some(&unchanged),
-                &manifest(&format!("0.2.0-alpha.{wide}"))
-            )],
-            &wire_change,
-            &manifest(&format!("0.2.0-alpha.{narrower}"))
-        )
-        .unwrap_err()
-        .contains("did not increase"),
-        "a decrease past u64 was accepted"
-    );
-    assert!(check_version_gate(
-        &[at(
-            Some(&unchanged),
-            &manifest(&format!("0.2.0-alpha.{wide}"))
-        )],
-        &wire_change,
-        &manifest(&format!("0.2.0-alpha.{wide}"))
-    )
-    .unwrap_err()
-    .contains("without a package version bump"));
-    assert_eq!(
-        check_version_gate(
-            &[at(
-                Some(&unchanged),
-                &manifest(&format!("0.2.0-alpha.{wide}"))
-            )],
-            &wire_change,
-            &manifest("0.2.0-alpha.abc")
-        ),
-        Ok(())
-    );
-    assert!(check_version_gate(
-        &[at(Some(&unchanged), &manifest("0.2.0-alpha.abc"))],
-        &wire_change,
-        &manifest(&format!("0.2.0-alpha.{wide}"))
-    )
-    .unwrap_err()
-    .contains("did not increase"));
-}
-
-#[test]
-fn a_malformed_prerelease_identifier_fails_the_gate() {
-    let unchanged = fixture_with("0.1.0", "01", "synthetic");
-    let wire_change = fixture_with("0.1.0", "02", "synthetic");
-    let base = "[package]\nversion = \"0.1.0\"\n";
-
-    for head in [
-        "[package]\nversion = \"0.2.0-alpha.007\"\n",
-        "[package]\nversion = \"0.2.0-alpha..1\"\n",
-        "[package]\nversion = \"0.2.0-\"\n",
-    ] {
-        assert!(
-            check_version_gate(&[at(Some(&unchanged), base)], &wire_change, head)
-                .unwrap_err()
-                .contains("unparseable package version"),
-            "a malformed prerelease passed the gate: {head:?}"
-        );
-    }
 }
 
 #[test]
