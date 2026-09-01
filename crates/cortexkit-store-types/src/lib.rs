@@ -23,7 +23,7 @@
 use serde::{Deserialize, Serialize};
 
 /// Stores backend-independent migration metadata.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Migration {
     /// Must be unique within a namespace and greater than its recorded maximum.
     /// Stores silently skip versions at or below that watermark.

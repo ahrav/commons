@@ -233,7 +233,7 @@ impl FileLeaseStore {
 
     /// Acquires an exclusive lease with an epoch greater than the persisted epoch and `epoch_floor`.
     ///
-    /// Empty sidecar recovery starts above `epoch_floor`; malformed nonempty state fails closed.
+    /// Empty sidecar recovery uses `epoch_floor` as its sole lower bound, which must cover every epoch previously authorized for the key; malformed nonempty state fails closed.
     ///
     /// # Errors
     ///
@@ -422,7 +422,7 @@ fn read_epoch(file: &mut (impl Read + Seek)) -> std::io::Result<u64> {
         .ok_or_else(|| invalid_epoch("lease epoch is outside the u64 range"))
 }
 
-/// The caller holds the exclusive lock while this function updates the epoch above persisted state and `epoch_floor`.
+/// Caller holds the exclusive lock; recovery derives the epoch from persisted state or `recovery_floor`.
 fn bump_epoch_above(file: &mut File, recovery_floor: Option<u64>) -> std::io::Result<u64> {
     let epoch_floor = recovery_floor.unwrap_or(0);
     let prev = match recovery_floor {

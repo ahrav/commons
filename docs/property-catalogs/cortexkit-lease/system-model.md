@@ -1,6 +1,6 @@
 # System model
 
-System path: `crates/cortexkit-lease` at revision `6e4840b`, plus the U8 working-tree changes documented here.
+System path: `crates/cortexkit-lease` at revision `9e871ce`, plus the U8 working-tree changes documented here.
 
 ## Architecture and data flow
 
@@ -8,13 +8,13 @@ System path: `crates/cortexkit-lease` at revision `6e4840b`, plus the U8 working
 
 `open_lease_file` first opens an existing final path with Unix `O_NOFOLLOW | O_NONBLOCK` or Windows `FILE_FLAG_OPEN_REPARSE_POINT`. On `NotFound`, it creates a same-directory `NamedTempFile`, writes canonical epoch zero, and calls `persist_noclobber`; an `AlreadyExists` race reopens the winner within three attempts. A successful publication returns the already-open temporary-file inode. Descriptor metadata rejects nonregular files and Windows reparse points (`src/lib.rs:56-77,89-104,106-143`). Exclusive and shared acquisition then use only `File::try_lock` or `File::try_lock_shared`. Both methods classify `TryLockError::WouldBlock` as `LeaseError::Held` and unwrap `TryLockError::Error` into `LeaseError::Io` (`src/lib.rs:230-310`).
 
-The crate has no network or database boundary. Its authority boundaries are the filesystem path and kernel lock table. `cortexkit-store` reads the SQLite fence as a resource floor, acquires above it, claims a strictly greater epoch before exposure, and rechecks it in fenced writes and migrations (`cortexkit-store/src/lib.rs:172-187,234-282,284-301,306-312,324-344,346-361,390-454`).
+The crate has no network or database boundary. Its authority boundaries are the filesystem path and kernel lock table. `cortexkit-store` reads the SQLite fence as a resource floor, acquires above it, claims a strictly greater epoch before exposure, and rechecks it in fenced writes and migrations (`cortexkit-store/src/lib.rs:198-217,570-622,669-703,739-806`).
 
 ## State and persistence
 
 One file per derived key stores a decimal `u64`. Published files start with canonical epoch zero; ordinary acquisition rejects existing empty files. `acquire_above` treats an empty sidecar as its caller-supplied resource floor, which must cover every durable epoch previously authorized for the key. Existing nonempty content must contain 1-20 ASCII decimal digits; any longer, non-decimal, or out-of-range state fails closed (`read_epoch`, `src/lib.rs:395-423`). Existing variable-width decimal files remain readable. Successful updates write exactly 20 decimal digits and use checked increment above the persisted epoch and optional resource floor, so `u64::MAX` is terminal (`bump_epoch_above` and `persist_epoch`, `src/lib.rs:426-455`). There is no magic, key binding, checksum, format version, or generation.
 
-The update does not truncate. An empty or 1-19 byte legacy input is extended to 20 bytes with non-decimal markers before the canonical overwrite. For canonical 20-byte values, every prefix splice from the next epoch is either equal to or greater than the prior value. `interrupted_persist_never_leaves_a_lower_parseable_epoch` injects ordered prefix-write failures through `persist_epoch` for all three widths and parses aftermath through production `read_epoch`; the canonical case is where every prefix stays parseable, so the count of parseable aftermaths is asserted to keep the monotonicity oracle non-vacuous. It does not prove `File`, device, process-interruption, or power-loss behavior (`src/lib.rs:395-455,748-866`).
+The update does not truncate. An empty or 1-19 byte legacy input is extended to 20 bytes with non-decimal markers before the canonical overwrite. For canonical 20-byte values, every prefix splice from the next epoch is either equal to or greater than the prior value. `interrupted_persist_never_leaves_a_lower_parseable_epoch` injects ordered prefix-write failures through `persist_epoch` for all three widths and parses aftermath through production `read_epoch`; the canonical case is where every prefix stays parseable, so the count of parseable aftermaths is asserted to keep the monotonicity oracle non-vacuous. It does not prove `File`, device, process-interruption, or power-loss behavior (`src/lib.rs:395-451,744-862`).
 
 `flush` is not `sync_data` or `sync_all`. The crate makes no claim about exact partial-`File` I/O outcomes, process interruption, machine power loss, storage-cache loss, torn sectors, or filesystem reordering.
 

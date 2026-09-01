@@ -25,9 +25,11 @@ pub enum StoreError {
         holder_epoch: i64,
         db_epoch: i64,
     },
-    /// A negative persisted epoch prevents proving monotonic fencing, because every
-    /// positive holder epoch compares as newer. The store refuses to authorize writes
-    /// until an operator resets `cortexkit_lease.epoch`.
+    /// The persisted epoch cannot be reconciled with this holder's: it is negative, or
+    /// it is below the epoch `open_postgres` stamped, which no later write lowers.
+    /// Authorizing the write would also authorize a superseded writer whose epoch
+    /// exceeds the regressed value, so the store refuses until an operator resets
+    /// `cortexkit_lease.epoch`.
     FenceCorrupt {
         db_epoch: i64,
     },
@@ -53,8 +55,8 @@ impl std::fmt::Display for StoreError {
             ),
             StoreError::FenceCorrupt { db_epoch } => write!(
                 f,
-                "database fence epoch {db_epoch} is negative; reset cortexkit_lease.epoch to \
-                 at least the highest epoch a writer has used"
+                "database fence epoch {db_epoch} cannot be reconciled with this writer; \
+                 reset cortexkit_lease.epoch to at least the highest epoch a writer has used"
             ),
         }
     }
@@ -115,8 +117,12 @@ impl PostgresStore {
             .read_only(true)
             .start()
             .map_err(backend_error)?;
-        let out = f(&mut tx).map_err(backend_error)?;
+        // An escape is durable; the callback's error is not. Check for the escape before
+        // propagating the error, or a callback that writes and then fails reports only
+        // its own failure while the unfenced write survives.
+        let out = f(&mut tx);
         require_read_only_transaction(&mut tx)?;
+        let out = out.map_err(backend_error)?;
         tx.commit().map_err(backend_error)?;
         Ok(out)
     }
@@ -127,13 +133,10 @@ impl PostgresStore {
     /// Callbacks must not send transaction-control SQL.
     /// Ending the fence-checked transaction inside the callback fails the store operation.
     ///
-    /// Callbacks must not send transaction-control SQL.
-    /// Ending the fence-checked transaction inside the callback fails the store operation.
-    ///
     /// # Errors
     ///
     /// Returns [`StoreError::Fenced`] when a newer writer owns the database.
-    /// Returns [`StoreError::FenceCorrupt`] when the persisted epoch is negative.
+    /// Returns [`StoreError::FenceCorrupt`] when the persisted epoch is negative or below this holder's.
     /// Returns [`StoreError::Backend`] when transaction setup, the callback, commit, or a backend fence-check operation fails, or when the callback ended the transaction.
     pub fn with_client_fenced<T>(
         &self,
@@ -142,8 +145,10 @@ impl PostgresStore {
         let mut guard = self.client.lock().unwrap_or_else(|p| p.into_inner());
         let mut tx = guard.transaction().map_err(backend_error)?;
         let witness = check_fence(&mut tx, self.lease_key, self.epoch)?;
-        let out = f(&mut tx).map_err(backend_error)?;
+        // See `with_client_read`: the escape outranks the callback's own error.
+        let out = f(&mut tx);
         require_same_transaction(&mut tx, &witness)?;
+        let out = out.map_err(backend_error)?;
         tx.commit().map_err(backend_error)?;
         Ok(out)
     }
@@ -231,6 +236,12 @@ fn check_fence(
             db_epoch,
         });
     }
+    // `bump_epoch` stamps the holder's epoch at open and no later write lowers it, so a
+    // stored value below it means the row regressed. Accepting it would let a superseded
+    // writer whose epoch is also above the regressed value commit after handover.
+    if db_epoch < holder_epoch {
+        return Err(StoreError::FenceCorrupt { db_epoch });
+    }
     Ok(TransactionWitness {
         xact_id: row.get(1),
         lease_key,
@@ -256,17 +267,28 @@ struct TransactionWitness {
 /// Transaction-control SQL sent by the callback ends the fence-checked transaction.
 /// Later statements commit in autocommit without a fence, and `Transaction::commit`
 /// still reports success because `COMMIT` outside a transaction block is a warning.
+/// The server rejects every statement in an aborted transaction. A callback that had
+/// ended the transaction would leave the connection in autocommit, where these checks
+/// run normally, so this error proves the original block is still open and no statement
+/// escaped it. Reporting it would replace the callback's own diagnosis with
+/// "current transaction is aborted".
+fn transaction_block_still_open(error: &postgres::Error) -> bool {
+    error.code() == Some(&postgres::error::SqlState::IN_FAILED_SQL_TRANSACTION)
+}
+
 fn require_same_transaction(
     tx: &mut postgres::Transaction<'_>,
     witness: &TransactionWitness,
 ) -> Result<(), StoreError> {
-    let row = tx
-        .query_one(
-            "SELECT pg_current_xact_id_if_assigned()::text, \
-                    (SELECT epoch FROM cortexkit_lease WHERE lease_key = $1)",
-            &[&witness.lease_key],
-        )
-        .map_err(backend_error)?;
+    let row = match tx.query_one(
+        "SELECT pg_current_xact_id_if_assigned()::text, \
+                (SELECT epoch FROM cortexkit_lease WHERE lease_key = $1)",
+        &[&witness.lease_key],
+    ) {
+        Ok(row) => row,
+        Err(error) if transaction_block_still_open(&error) => return Ok(()),
+        Err(error) => return Err(backend_error(error)),
+    };
     let current: Option<String> = row.get(0);
     if current.as_deref() != Some(witness.xact_id.as_str()) {
         return Err(StoreError::Backend(
@@ -292,10 +314,11 @@ fn require_same_transaction(
 /// `transaction_read_only` reverts to the session default once the started transaction
 /// ends, so an implicit read-write transaction reports `off` here.
 fn require_read_only_transaction(tx: &mut postgres::Transaction<'_>) -> Result<(), StoreError> {
-    let read_only: String = tx
-        .query_one("SHOW transaction_read_only", &[])
-        .map_err(backend_error)?
-        .get(0);
+    let read_only: String = match tx.query_one("SHOW transaction_read_only", &[]) {
+        Ok(row) => row.get(0),
+        Err(error) if transaction_block_still_open(&error) => return Ok(()),
+        Err(error) => return Err(backend_error(error)),
+    };
     if read_only == "on" {
         return Ok(());
     }
@@ -413,17 +436,57 @@ fn ensure_infra_tables(client: &mut Client) -> Result<(), StoreError> {
 /// under the held advisory lock. The lease table is created by
 /// [`ensure_infra_tables`] before this runs.
 fn bump_epoch(client: &mut Client, lease_id: i64) -> Result<i64, StoreError> {
-    let epoch: i64 = client
+    let mut tx = client.transaction().map_err(migration_error)?;
+    let previous: i64 = tx
+        .query_one(
+            "SELECT COALESCE((SELECT epoch FROM cortexkit_lease WHERE lease_key = $1 \
+             FOR UPDATE), 0)",
+            &[&lease_id],
+        )
+        .map_err(migration_error)?
+        .get(0);
+    let epoch: i64 = tx
         .query_one(
             "INSERT INTO cortexkit_lease (lease_key, epoch) VALUES ($1, 1) \
              ON CONFLICT (lease_key) DO UPDATE SET epoch = cortexkit_lease.epoch + 1 \
              RETURNING epoch",
             &[&lease_id],
         )
-        .map(|row| row.get(0))
-        .map_err(migration_error)?;
+        .map_err(migration_error)?
+        .get(0);
     require_nonnegative_epoch(epoch)?;
+    require_epoch_advanced(previous, epoch)?;
+    // `RETURNING` yields the tuple the statement produced, which an `AFTER UPDATE` trigger
+    // can still overwrite. Re-reading the committed row is the only value a later
+    // `check_fence` will compare against.
+    let stored: i64 = tx
+        .query_one(
+            "SELECT epoch FROM cortexkit_lease WHERE lease_key = $1 FOR UPDATE",
+            &[&lease_id],
+        )
+        .map_err(migration_error)?
+        .get(0);
+    if stored != epoch {
+        return Err(StoreError::Migration(format!(
+            "lease epoch {epoch} was issued but the row stores {stored}; a rule or trigger \
+             on cortexkit_lease can rewrite the epoch after the increment"
+        )));
+    }
+    tx.commit().map_err(migration_error)?;
     Ok(epoch)
+}
+
+/// A rule or `BEFORE UPDATE` trigger on the lease table can return the old row, so the
+/// issuing statement reports success while handing out an epoch a live writer still holds.
+/// Two holders would then share an epoch and both pass `check_fence`.
+fn require_epoch_advanced(previous: i64, issued: i64) -> Result<(), StoreError> {
+    if issued <= previous {
+        return Err(StoreError::Migration(format!(
+            "lease epoch did not advance: the row held {previous} and issued {issued}; \
+             a rule or trigger on cortexkit_lease can suppress the increment"
+        )));
+    }
+    Ok(())
 }
 
 /// Apply un-applied migrations for one `namespace` in ascending version order,
@@ -459,17 +522,20 @@ fn run_migrations(
         }
         let mut tx = client.transaction().map_err(migration_error)?;
         let witness = check_fence(&mut tx, lease_key, holder_epoch)?;
-        tx.batch_execute(m.statements).map_err(|e| {
-            StoreError::Migration(format!(
-                "namespace '{namespace}' migration {}: {}",
-                m.version,
-                db_message(&e)
-            ))
-        })?;
+        // See `with_client_read`: a migration that escapes and then fails must report the
+        // escape, so the statement error is held until the transaction is validated.
+        let applied = tx.batch_execute(m.statements);
         require_same_transaction(&mut tx, &witness).map_err(|e| {
             StoreError::Migration(format!(
                 "namespace '{namespace}' migration {}: {e}",
                 m.version
+            ))
+        })?;
+        applied.map_err(|e| {
+            StoreError::Migration(format!(
+                "namespace '{namespace}' migration {}: {}",
+                m.version,
+                db_message(&e)
             ))
         })?;
         tx.execute(
@@ -623,6 +689,109 @@ mod tests {
     }
 
     #[test]
+    fn a_failing_callback_cannot_hide_an_escape() {
+        let Some(dsn) = test_dsn() else {
+            return;
+        };
+        let ns = unique_ns("erresc");
+        let d = descriptor(&dsn, &ns);
+        let store = open_postgres(&d).expect("open");
+        let table = format!("erresc_{ns}");
+        store
+            .with_client_unfenced(|c| c.batch_execute(&format!("CREATE TABLE {table} (v int)")))
+            .expect("create");
+
+        // The callback escapes, writes, and only then fails. The escape is the durable
+        // effect, so it outranks the callback's own error in the report.
+        let fenced = store.with_client_fenced(|tx| {
+            tx.batch_execute(&format!("COMMIT; INSERT INTO {table} (v) VALUES (1)"))?;
+            tx.batch_execute("SELECT 1 / 0")?;
+            Ok(())
+        });
+        assert!(
+            matches!(&fenced, Err(StoreError::Backend(m)) if m.contains("ended the fence-checked transaction")),
+            "the escape is reported even though the callback returned an error, got {fenced:?}"
+        );
+
+        let read = store.with_client_read(|tx| {
+            tx.batch_execute(&format!("COMMIT; INSERT INTO {table} (v) VALUES (2)"))?;
+            tx.batch_execute("SELECT 1 / 0")?;
+            Ok(())
+        });
+        assert!(
+            matches!(&read, Err(StoreError::Backend(m)) if m.contains("no longer read-only")),
+            "the read escape is reported even though the callback returned an error, got {read:?}"
+        );
+
+        // A migration that escapes and then fails reports the escape, and records no version.
+        let migrated = store.migrate(
+            &ns,
+            &[Migration {
+                version: 1,
+                statements: "COMMIT; SELECT 1 / 0;",
+            }],
+        );
+        assert!(
+            matches!(&migrated, Err(StoreError::Migration(m)) if m.contains("ended the fence-checked transaction")),
+            "the migration escape is reported ahead of its statement error, got {migrated:?}"
+        );
+        let recorded: i64 = store
+            .with_client_read(|c| {
+                Ok(c.query_one(
+                    "SELECT COUNT(*) FROM cortexkit_schema_version WHERE namespace = $1",
+                    &[&ns],
+                )?
+                .get(0))
+            })
+            .expect("count");
+        assert_eq!(recorded, 0, "the rejected migration recorded no version");
+
+        let _ = store.with_client_unfenced(|c| c.batch_execute(&format!("DROP TABLE {table}")));
+    }
+
+    #[test]
+    fn a_failing_callback_that_stays_inside_reports_its_own_error() {
+        let Some(dsn) = test_dsn() else {
+            return;
+        };
+        let ns = unique_ns("errkeep");
+        let d = descriptor(&dsn, &ns);
+        let store = open_postgres(&d).expect("open");
+
+        // A callback that fails without escaping leaves an aborted transaction. Checking
+        // for an escape must not run a query that the abort rejects, or the callback's
+        // own diagnosis is replaced by "current transaction is aborted".
+        let fenced = store.with_client_fenced(|tx| {
+            tx.batch_execute("SELECT 1 / 0")?;
+            Ok(())
+        });
+        assert!(
+            matches!(&fenced, Err(StoreError::Backend(m))
+                if m.contains("division by zero") && !m.contains("aborted")),
+            "the callback's own error survives an aborted transaction, got {fenced:?}"
+        );
+
+        let read = store.with_client_read(|tx| {
+            tx.batch_execute("SELECT 1 / 0")?;
+            Ok(())
+        });
+        assert!(
+            matches!(&read, Err(StoreError::Backend(m))
+                if m.contains("division by zero") && !m.contains("aborted")),
+            "the read callback's own error survives an aborted transaction, got {read:?}"
+        );
+
+        // The store is still usable after both aborted transactions.
+        let alive: i32 = store
+            .with_client_read(|c| Ok(c.query_one("SELECT 1", &[])?.get(0)))
+            .expect("read after abort");
+        assert_eq!(
+            alive, 1,
+            "the connection recovers after an aborted callback"
+        );
+    }
+
+    #[test]
     fn a_read_callback_cannot_escape_read_only_mode() {
         let Some(dsn) = test_dsn() else {
             return;
@@ -718,6 +887,51 @@ mod tests {
     }
 
     #[test]
+    fn a_regressed_positive_epoch_fails_closed() {
+        let Some(dsn) = test_dsn() else {
+            return;
+        };
+        let ns = unique_ns("regress");
+        let d = descriptor(&dsn, &ns);
+        // Reopen twice so the stamped epoch is above 1 and a lower positive value exists.
+        drop(open_postgres(&d).expect("open"));
+        drop(open_postgres(&d).expect("reopen"));
+        let store = open_postgres(&d).expect("reopen again");
+        let key = store.lease_key;
+        let stamped = store.epoch();
+        assert!(
+            stamped >= 3,
+            "expected a stamped epoch above 1, got {stamped}"
+        );
+
+        store
+            .with_client_unfenced(|c| {
+                c.execute(
+                    "UPDATE cortexkit_lease SET epoch = 1 WHERE lease_key = $1",
+                    &[&key],
+                )
+            })
+            .expect("regress the row");
+
+        let fenced = store.with_client_fenced(|_| Ok(()));
+        assert!(
+            matches!(fenced, Err(StoreError::FenceCorrupt { db_epoch: 1 })),
+            "a positive epoch below the one stamped at open fails closed, got {fenced:?}"
+        );
+
+        let stale = PostgresStore {
+            client: std::sync::Mutex::new(Client::connect(&dsn, NoTls).expect("client")),
+            epoch: stamped - 1,
+            lease_key: key,
+        };
+        let stale_write = stale.with_client_fenced(|_| Ok(()));
+        assert!(
+            matches!(stale_write, Err(StoreError::FenceCorrupt { db_epoch: 1 })),
+            "a superseded writer above the regressed value is rejected too, got {stale_write:?}"
+        );
+    }
+
+    #[test]
     fn a_callback_cannot_damage_the_lease_row_it_is_fenced_against() {
         let Some(dsn) = test_dsn() else {
             return;
@@ -761,6 +975,53 @@ mod tests {
         assert_eq!(
             intact, epoch,
             "both rejected callbacks rolled back, so the fence row still holds this epoch"
+        );
+    }
+
+    #[test]
+    fn a_suppressed_epoch_increment_is_rejected() {
+        // A rule or `BEFORE UPDATE` trigger on cortexkit_lease can return the old row, so
+        // the issuing statement reports success while handing out an epoch a live writer
+        // still holds. Installing one would break every concurrent test on the shared
+        // table, so the rule is exercised directly.
+        assert!(require_epoch_advanced(0, 1).is_ok(), "a fresh row issues 1");
+        assert!(
+            require_epoch_advanced(4, 5).is_ok(),
+            "an increment advances"
+        );
+        for (previous, issued) in [(5_i64, 5_i64), (5, 4), (5, 0)] {
+            let r = require_epoch_advanced(previous, issued);
+            assert!(
+                matches!(&r, Err(StoreError::Migration(m)) if m.contains("did not advance")),
+                "issuing {issued} while the row held {previous} is rejected, got {r:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn open_verifies_the_stored_epoch_matches_the_issued_one() {
+        let Some(dsn) = test_dsn() else {
+            return;
+        };
+        let ns = unique_ns("stored");
+        let d = descriptor(&dsn, &ns);
+        let store = open_postgres(&d).expect("open");
+        let key = store.lease_key;
+        let issued = store.epoch();
+
+        let stored: i64 = store
+            .with_client_read(|c| {
+                Ok(c.query_one(
+                    "SELECT epoch FROM cortexkit_lease WHERE lease_key = $1",
+                    &[&key],
+                )?
+                .get(0))
+            })
+            .expect("read the row");
+        assert_eq!(
+            stored, issued,
+            "open re-reads the committed row, so an AFTER trigger rewriting the epoch \
+             cannot leave the issued value unbacked"
         );
     }
 
