@@ -165,6 +165,24 @@ mod sqlite_backend {
             Ok(out)
         }
 
+        /// [`Self::with_conn`]'s read-only guard rejects `VACUUM` as a write,
+        /// and SQLite rejects it inside [`Self::with_conn_fenced`]'s
+        /// transaction, so maintenance statements run here on the
+        /// lease-holding connection. Fence-protected durable mutations belong
+        /// in [`Self::with_conn_fenced`]; SQLite does not enforce that
+        /// restriction here.
+        ///
+        /// # Errors
+        ///
+        /// Returns [`StoreError::Backend`] when the callback fails.
+        pub fn with_conn_unfenced<T>(
+            &self,
+            f: impl FnOnce(&Connection) -> rusqlite::Result<T>,
+        ) -> Result<T, StoreError> {
+            let guard = self.conn.lock().unwrap_or_else(|p| p.into_inner());
+            f(&guard).map_err(|e| StoreError::Backend(e.to_string()))
+        }
+
         /// Run a closure inside an epoch-fenced write transaction. The write is
         /// rejected ([`StoreError::Fenced`]) if a newer writer has taken over the
         /// database; otherwise it commits atomically.
@@ -869,6 +887,22 @@ mod tests {
             .with_conn(|c| c.query_row("PRAGMA synchronous", [], |r| r.get(0)))
             .expect("read synchronous");
         assert_eq!(sync, 2, "fence durability requires synchronous=FULL");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn maintenance_runs_through_the_unfenced_path() {
+        let (root, d) = tmp();
+        let store = open_sqlite(&d).expect("open");
+        store.migrate("kv", FENCE_SCHEMA).expect("migrate");
+        let r = store.with_conn(|c| c.execute_batch("VACUUM"));
+        assert!(
+            matches!(&r, Err(StoreError::Backend(m)) if m.contains("readonly")),
+            "VACUUM must not pass the read-only guard, got {r:?}"
+        );
+        store
+            .with_conn_unfenced(|c| c.execute_batch("VACUUM"))
+            .expect("VACUUM through the maintenance path");
         let _ = std::fs::remove_dir_all(&root);
     }
 
