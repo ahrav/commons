@@ -1,9 +1,9 @@
 # `replacement-fence-is-claimed-before-old-writer-writes`
 
 - **Discovery:** targeted SQLite handover pass after portfolio evaluation.
-- **Primary evidence:** `open_sqlite` acquires epoch but does not claim the database fence (`cortexkit-store/src/lib.rs:245-284`); claim is lazy inside `with_conn_fenced` (`:162-205`).
-- **Existing evidence:** synthetic handover test claims epoch 2 before stale epoch 1 attempts a write (`:629-667`); equal epoch is permitted (`:670-689`).
-- **Failure scenario:** on a declared fence-protected path, old epoch 1 connection survives; replacement acquires epoch 2 but does not write; an old transaction commits after replacement acquisition while the database still stores epoch 1.
-- **Timing window:** replacement acquisition through first replacement fenced write.
+- **Primary evidence:** `open_sqlite` reads the existing database fence, acquires a file epoch above that floor, and claims the epoch in an `IMMEDIATE` transaction before constructing the returned store (`cortexkit-store/src/lib.rs:225-273,275-299,312-343`). `with_conn_fenced` reuses the same `claim_fence` helper (`:164-179,312-343`).
+- **Existing evidence:** open observes its claimed epoch before domain setup (`:533-545`); repeated sidecar loss issues greater epochs (`:572-598`); the synthetic handover rejects stale epoch 1 after epoch 2 claims (`:833-871`); equal epoch is permitted (`:907-927`).
+- **Failure scenario:** an old epoch 1 connection survives and races a transaction after replacement file-lease acquisition but before replacement obtains the `IMMEDIATE` database transaction. No replacement store is exposed during this interval.
+- **Timing window:** internal file-lease acquisition through committed database claim.
 - **Instrumentation:** lease acquisition event, database fence value, and old-writer effect event.
-- **Open-question log:** no design text accepts this window; owner must decide whether claim belongs at open.
+- **Open-question log:** owner must define whether authority transfers at internal file-lease acquisition or successful `open_sqlite` return.

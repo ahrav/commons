@@ -9,8 +9,8 @@ Fresh-context evaluation ran after the initial 22-record catalog was written. It
 | Lease root and key were not bound to one logical store. | Added `logical-store-has-single-lease-identity`. |
 | Effects performed before lock success were absent. | Added `failed-acquisition-does-not-mutate-lease-state`. |
 | Drop-time release was claimed in the model but had no record. | Added `handle-drop-releases-lease`. |
-| SQLite had a post-acquire, pre-fence-claim stale-write window. | Added `replacement-fence-is-claimed-before-old-writer-writes`. |
-| Unfenced write APIs made the protected write set unclear. | Added `protected-write-set-is-fence-complete` and narrowed `stale-writer-write-is-rejected`. |
+| SQLite had a post-acquire, pre-fence-claim stale-write window. | Added `replacement-fence-is-claimed-before-old-writer-writes`. Open now claims before exposure; the stronger acquisition-instant property remains unresolved. |
+| Unfenced write APIs made the protected write set unclear. | Added `protected-write-set-is-fence-complete` and narrowed `stale-writer-write-is-rejected`. PostgreSQL now separates read-only and fenced callbacks; SQLite consumer migration remains open. |
 | Steady-state mode, creation-window exposure, and symlink following were conflated. | Added `lease-file-creation-is-never-permissive` and `acquisition-does-not-follow-symlink`; narrowed the original permission records. |
 | Parked dual-store migration rule was inconsistently in scope. | Explicitly excluded the unbuilt migration and linked its durability prerequisite in `relationships.md`. |
 
@@ -40,7 +40,7 @@ Fresh-context evaluation ran after the initial 22-record catalog was written. It
 
 ### Shared-root topology
 
-The lease crate requires a shared root (`src/lib.rs:10-14`), the in-repo SQLite consumer derives a root from each database parent (`cortexkit-store/src/lib.rs:245-260`), and the density measurement implies an external high-cardinality shared root (`docs/lease-store-density.md:7-11`). This unresolved topology changes the impact of key aliasing, density, and filesystem-scope properties.
+The lease crate requires a shared root (`src/lib.rs:10-14`), the in-repo SQLite consumer derives a root from each database parent (`cortexkit-store/src/lib.rs:225-242`), and the density measurement implies an external high-cardinality shared root (`docs/lease-store-density.md:7-11`). This unresolved topology changes the impact of key aliasing, density, and filesystem-scope properties.
 
 ### Contract catalog versus current implementation
 
@@ -49,8 +49,8 @@ The catalog intentionally includes desired contracts that current code contradic
 | Disposition | Properties |
 |---|---|
 | **Known violated by code under the recorded enabling state** | `at-most-one-exclusive-holder-per-key` under live path replacement, `distinct-lease-keys-do-not-alias`, `lease-inode-remains-stable-while-held` under replacement, `logical-store-has-single-lease-identity` for permitted sibling/path-alias inputs, `failed-acquisition-does-not-mutate-lease-state`, `replacement-fence-is-claimed-before-old-writer-writes`. |
-| **Believed satisfied on currently exercised local paths** | `shared-exclusive-exclusion-matrix`, `shared-acquisition-is-epoch-neutral`, `contention-is-classified-as-held`, `handle-drop-releases-lease`, `invalid-epoch-fails-closed`, `epoch-input-size-is-bounded`, `lease-file-creation-is-never-permissive` on Unix, `acquisition-does-not-follow-symlink` on Unix, descriptor-relative lease permission hardening, and `stale-writer-write-is-rejected` on SQLite's synthetic fenced path. |
-| **Unknown or deployment-dependent** | `failed-acquire-preserves-prior-epoch` under real partial `File` errors, `writer-epoch-strictly-increases` under restored older files or machine power loss, `returned-epoch-is-crash-durable`, `dead-holder-lease-is-reclaimable`, `shared-epoch-never-authorizes-write`, `filesystem-lock-scope-matches-deployment`, `lease-file-growth-trigger-is-observed`, `lease-path-format-is-version-stable`, `protected-write-set-is-fence-complete`, Windows reparse-point runtime behavior, and other non-Unix symlink behavior. |
+| **Believed satisfied on currently exercised local paths** | `shared-exclusive-exclusion-matrix`, `shared-acquisition-is-epoch-neutral`, `contention-is-classified-as-held`, `handle-drop-releases-lease`, `invalid-epoch-fails-closed`, `epoch-input-size-is-bounded`, `lease-file-creation-is-never-permissive` on Unix, `acquisition-does-not-follow-symlink` on Unix, descriptor-relative lease permission hardening, and `stale-writer-write-is-rejected` on the SQLite and PostgreSQL synthetic fenced paths. |
+| **Unknown or deployment-dependent** | `failed-acquire-preserves-prior-epoch` under real partial `File` errors, `writer-epoch-strictly-increases` under arbitrary restore or machine power loss outside SQLite's resource-floor recovery, `returned-epoch-is-crash-durable`, `dead-holder-lease-is-reclaimable`, `shared-epoch-never-authorizes-write`, `filesystem-lock-scope-matches-deployment`, `lease-file-growth-trigger-is-observed`, `lease-path-format-is-version-stable`, `protected-write-set-is-fence-complete`, Windows reparse-point runtime behavior, and other non-Unix symlink behavior. |
 | **Campaign coverage requirements, not implementation verdicts** | `cross-process-exclusive-race-is-reached`, `epoch-update-interruption-window-is-reached`, `live-lease-file-replacement-is-reached`. |
 
 Known-violated records require an implementation decision before an expected-green test can land. Unknown records require the named deployment or authority evidence.
@@ -61,8 +61,7 @@ The following cannot be settled from this repository:
 
 - External shared-mode consumers.
 - Per-consumer lease-root paths, mount options, and host access topology.
-- Claustrum's real-daemon two-process review. Its repository is unavailable
-  locally and no receipt was supplied, so this is an unresolved merge gate.
+- External blockers and draft status are tracked in the [durable consumer inventory](durable-consumer-inventory.md).
 - BROCA watcher health and owner acknowledgement.
 - The intended machine-crash model.
 - The authoritative set of fence-protected write sites.

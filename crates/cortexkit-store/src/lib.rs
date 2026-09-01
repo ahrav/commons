@@ -17,7 +17,9 @@ pub use cortexkit_store_types::{
     StorageDescriptor,
 };
 
-use cortexkit_lease::{LeaseError, LeaseKey, LeaseStore};
+use cortexkit_lease::LeaseError;
+#[cfg(feature = "sqlite")]
+use cortexkit_lease::LeaseKey;
 
 #[derive(Debug)]
 pub enum StoreError {
@@ -66,6 +68,7 @@ impl std::error::Error for StoreError {}
 
 /// The lease key includes the module, backend, and storage namespace so stores
 /// sharing a lease root cannot collide.
+#[cfg(feature = "sqlite")]
 fn lease_key(descriptor: &StorageDescriptor) -> LeaseKey {
     LeaseKey::new(
         &descriptor.module_id,
@@ -84,12 +87,11 @@ mod sqlite_backend {
     };
 
     use cortexkit_lease::{protect_file, FileLeaseStore, LeaseHandle};
-    use rusqlite::Connection;
+    use rusqlite::{Connection, OpenFlags};
 
-    /// A lease-guarded, migrated sqlite store. Holds the single-writer lease for
-    /// its lifetime and serializes connection access behind a mutex (sqlite is
-    /// single-connection here; the module runs its domain queries via
-    /// [`SqliteStore::with_conn`]).
+    /// A lease-guarded SQLite store. The lease remains held for the store's lifetime.
+    /// A single mutexed connection preserves connection-local configuration and transaction scope.
+    /// [`open_sqlite`] claims the database lease epoch before returning the store.
     pub struct SqliteStore {
         conn: Mutex<Connection>,
         epoch: u64,
@@ -127,8 +129,9 @@ mod sqlite_backend {
             }
         }
 
-        /// Run a closure against the connection under the store mutex. The module's
-        /// domain trait implementation calls this for every query/transaction.
+        /// `with_conn` permits read-only queries and connection-local configuration.
+        /// Callers must keep callbacks read-only; SQLite does not enforce that
+        /// restriction. Durable writes must use [`Self::with_conn_fenced`].
         ///
         /// # Errors
         ///
@@ -154,11 +157,10 @@ mod sqlite_backend {
         /// database for this epoch and runs `f`, committing atomically. Returning an
         /// error from `f` rolls the transaction back.
         ///
-        /// The fence table is created lazily on the first fenced write.
-        ///
         /// # Errors
         ///
-        /// Returns [`StoreError::Fenced`] if the persisted database epoch exceeds the store epoch, or [`StoreError::Backend`] if transaction setup, SQL execution, the callback, or commit fails.
+        /// Returns [`StoreError::Fenced`] if the persisted database epoch exceeds the store epoch.
+        /// Returns [`StoreError::Backend`] if transaction setup, fence access, the callback, or commit fails.
         pub fn with_conn_fenced<T>(
             &self,
             f: impl FnOnce(&rusqlite::Transaction) -> rusqlite::Result<T>,
@@ -168,35 +170,7 @@ mod sqlite_backend {
                 .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
                 .map_err(|e| StoreError::Backend(e.to_string()))?;
 
-            tx.execute_batch(
-                "CREATE TABLE IF NOT EXISTS cortexkit_fence (\
-                     id INTEGER PRIMARY KEY CHECK (id = 0), \
-                     epoch INTEGER NOT NULL)",
-            )
-            .map_err(|e| StoreError::Backend(e.to_string()))?;
-
-            let db_epoch: u64 = tx
-                .query_row(
-                    "SELECT COALESCE((SELECT epoch FROM cortexkit_fence WHERE id = 0), 0)",
-                    [],
-                    |r| r.get::<_, i64>(0).map(|v| v as u64),
-                )
-                .map_err(|e| StoreError::Backend(e.to_string()))?;
-
-            if db_epoch > self.epoch {
-                return Err(StoreError::Fenced {
-                    holder_epoch: self.epoch,
-                    db_epoch,
-                });
-            }
-            if self.epoch > db_epoch {
-                tx.execute(
-                    "INSERT INTO cortexkit_fence (id, epoch) VALUES (0, ?1) \
-                     ON CONFLICT(id) DO UPDATE SET epoch = excluded.epoch",
-                    rusqlite::params![self.epoch as i64],
-                )
-                .map_err(|e| StoreError::Backend(e.to_string()))?;
-            }
+            claim_fence(&tx, self.epoch)?;
 
             let out = f(&tx).map_err(|e| StoreError::Backend(e.to_string()))?;
             tx.commit()
@@ -209,23 +183,28 @@ mod sqlite_backend {
         ///
         /// Each namespace has an independent migration history. Versions at or
         /// below its watermark are silently skipped.
+        /// Every transaction checks the persisted fence before executing schema
+        /// changes.
         ///
         /// # Errors
         ///
-        /// Returns [`StoreError::Migration`] when schema-version setup, transaction setup, a migration statement, its version record, or transaction commit fails.
+        /// Returns [`StoreError::Fenced`] when a newer writer owns the database.
+        /// Returns [`StoreError::Backend`] when the fence check fails.
+        /// Returns [`StoreError::Migration`] if migration setup, SQL execution, recording, or commit fails.
         pub fn migrate(&self, namespace: &str, migrations: &[Migration]) -> Result<(), StoreError> {
             let mut guard = self.conn.lock().unwrap_or_else(|p| p.into_inner());
-            run_migrations(&mut guard, namespace, migrations)
+            run_migrations(&mut guard, self.epoch, namespace, migrations)
         }
     }
 
-    /// Open a module's sqlite store from its descriptor: acquire the single-writer
-    /// lease and open the file with durable pragmas. Migrations are applied
-    /// separately via [`SqliteStore::migrate`], so a multi-domain module can apply
-    /// several independent per-domain chains into its one database.
+    /// Open a module's SQLite store from its descriptor.
     ///
-    /// The lease is acquired before the file is opened, so a second live writer is
-    /// rejected (`StoreError::Lease`) rather than corrupting a shared file.
+    /// The returned store has already claimed its lease epoch in the database.
+    /// Call [`SqliteStore::migrate`] separately for each domain migration chain.
+    ///
+    /// The stored database fence becomes the lease floor. Deleting or restoring an
+    /// old lease sidecar cannot reissue an epoch represented in the database.
+    /// Databases created by older versions without a fence table use floor zero.
     ///
     /// The lease lives next to the database file (its parent directory), derived
     /// from the descriptor's path rather than passed in. This makes the
@@ -238,10 +217,11 @@ mod sqlite_backend {
     ///
     /// # Errors
     ///
-    /// Returns [`StoreError::UnsupportedBackend`] for non-SQLite descriptors,
-    /// [`StoreError::Io`] when the parent directory cannot be created, and
-    /// [`StoreError::Lease`] or [`StoreError::Backend`] when lease or SQLite setup
-    /// fails.
+    /// Returns [`StoreError::UnsupportedBackend`] for non-SQLite descriptors.
+    /// Returns [`StoreError::Io`] when the parent directory cannot be created.
+    /// Returns [`StoreError::Lease`] when lease acquisition fails.
+    /// Returns [`StoreError::Fenced`] if the database advances during open.
+    /// Returns [`StoreError::Backend`] when SQLite inspection, setup, or fence claim fails.
     pub fn open_sqlite(descriptor: &StorageDescriptor) -> Result<SqliteStore, StoreError> {
         let path = match &descriptor.backend {
             StorageBackend::Sqlite { path } => path.clone(),
@@ -254,12 +234,13 @@ mod sqlite_backend {
             .unwrap_or_else(|| PathBuf::from("."));
         std::fs::create_dir_all(&parent).map_err(StoreError::Io)?;
 
+        let epoch_floor = read_fence_epoch(Path::new(&path))?;
         let lease = FileLeaseStore::new(&parent)
-            .acquire(&lease_key(descriptor))
+            .acquire_above(&lease_key(descriptor), epoch_floor)
             .map_err(StoreError::Lease)?;
         let epoch = lease.epoch();
 
-        let conn = Connection::open(&path).map_err(|e| StoreError::Backend(e.to_string()))?;
+        let mut conn = Connection::open(&path).map_err(|e| StoreError::Backend(e.to_string()))?;
         // WAL permits concurrent readers. The busy timeout makes transient locks
         // wait rather than fail, and foreign-key enforcement is enabled.
         conn.pragma_update(None, "journal_mode", "WAL")
@@ -267,6 +248,14 @@ mod sqlite_backend {
         conn.busy_timeout(Duration::from_secs(5))
             .map_err(|e| StoreError::Backend(e.to_string()))?;
         conn.pragma_update(None, "foreign_keys", "ON")
+            .map_err(|e| StoreError::Backend(e.to_string()))?;
+
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|e| StoreError::Backend(e.to_string()))?;
+        ensure_fence_table(&tx)?;
+        claim_fence(&tx, epoch)?;
+        tx.commit()
             .map_err(|e| StoreError::Backend(e.to_string()))?;
 
         // Apply owner-only permissions after enabling WAL, which may create sibling
@@ -283,6 +272,85 @@ mod sqlite_backend {
         })
     }
 
+    fn read_fence_epoch(path: &Path) -> Result<u64, StoreError> {
+        if !path.try_exists().map_err(StoreError::Io)? {
+            return Ok(0);
+        }
+        let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .map_err(|e| StoreError::Backend(e.to_string()))?;
+        let has_fence: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'cortexkit_fence')",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|e| StoreError::Backend(e.to_string()))?;
+        if !has_fence {
+            return Ok(0);
+        }
+        let epoch: i64 = conn
+            .query_row(
+                "SELECT COALESCE((SELECT epoch FROM cortexkit_fence WHERE id = 0), 0)",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|e| StoreError::Backend(e.to_string()))?;
+        decode_fence_epoch(epoch)
+    }
+
+    /// Initializes fence storage before `SqliteStore` is exposed.
+    fn ensure_fence_table(tx: &rusqlite::Transaction<'_>) -> Result<(), StoreError> {
+        tx.execute_batch(
+            "CREATE TABLE IF NOT EXISTS cortexkit_fence (\
+                 id INTEGER PRIMARY KEY CHECK (id = 0), \
+                 epoch INTEGER NOT NULL CHECK (epoch >= 0))",
+        )
+        .map_err(|e| StoreError::Backend(e.to_string()))
+    }
+
+    /// Binds fence comparison and claim to the caller's protected transaction.
+    fn claim_fence(tx: &rusqlite::Transaction<'_>, holder_epoch: u64) -> Result<(), StoreError> {
+        let holder_epoch_sql = i64::try_from(holder_epoch).map_err(|_| {
+            StoreError::Backend(format!(
+                "lease epoch {holder_epoch} exceeds SQLite INTEGER maximum"
+            ))
+        })?;
+
+        let db_epoch_sql: i64 = tx
+            .query_row(
+                "SELECT COALESCE((SELECT epoch FROM cortexkit_fence WHERE id = 0), 0)",
+                [],
+                |r| r.get(0),
+            )
+            .map_err(|e| StoreError::Backend(e.to_string()))?;
+        let db_epoch = decode_fence_epoch(db_epoch_sql)?;
+
+        if db_epoch > holder_epoch {
+            return Err(StoreError::Fenced {
+                holder_epoch,
+                db_epoch,
+            });
+        }
+        if holder_epoch > db_epoch {
+            tx.execute(
+                "INSERT INTO cortexkit_fence (id, epoch) VALUES (0, ?1) \
+                 ON CONFLICT(id) DO UPDATE SET epoch = excluded.epoch",
+                rusqlite::params![holder_epoch_sql],
+            )
+            .map_err(|e| StoreError::Backend(e.to_string()))?;
+        }
+        Ok(())
+    }
+
+    /// Rejects negative SQLite integers instead of wrapping them into writer epochs.
+    fn decode_fence_epoch(epoch: i64) -> Result<u64, StoreError> {
+        u64::try_from(epoch).map_err(|_| {
+            StoreError::Backend(format!(
+                "database fence epoch {epoch} is outside the supported range"
+            ))
+        })
+    }
+
     /// Apply un-applied migrations for one `namespace` in ascending version order,
     /// each in its own transaction together with its version record, so a migration
     /// and the record that it ran commit atomically (a crash mid-migration leaves
@@ -292,10 +360,15 @@ mod sqlite_backend {
     /// domain chains in one database never collide or re-run each other.
     fn run_migrations(
         conn: &mut Connection,
+        holder_epoch: u64,
         namespace: &str,
         migrations: &[Migration],
     ) -> Result<(), StoreError> {
-        conn.execute_batch(
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|e| StoreError::Migration(e.to_string()))?;
+        claim_fence(&tx, holder_epoch)?;
+        tx.execute_batch(
             "CREATE TABLE IF NOT EXISTS cortexkit_schema_version (\
                  namespace TEXT NOT NULL, \
                  version INTEGER NOT NULL, \
@@ -305,12 +378,14 @@ mod sqlite_backend {
         )
         .map_err(|e| StoreError::Migration(e.to_string()))?;
 
-        let current: u32 = conn
+        let current: u32 = tx
             .query_row(
                 "SELECT COALESCE(MAX(version), 0) FROM cortexkit_schema_version WHERE namespace = ?1",
                 rusqlite::params![namespace],
                 |r| r.get(0),
             )
+            .map_err(|e| StoreError::Migration(e.to_string()))?;
+        tx.commit()
             .map_err(|e| StoreError::Migration(e.to_string()))?;
 
         let mut ordered: Vec<&Migration> = migrations.iter().collect();
@@ -321,8 +396,9 @@ mod sqlite_backend {
                 continue;
             }
             let tx = conn
-                .transaction()
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
                 .map_err(|e| StoreError::Migration(e.to_string()))?;
+            claim_fence(&tx, holder_epoch)?;
             tx.execute_batch(m.statements).map_err(|e| {
                 StoreError::Migration(format!(
                     "namespace '{namespace}' migration {}: {e}",
@@ -454,7 +530,22 @@ mod tests {
     }];
 
     #[test]
-    fn open_runs_migrations_and_seeds_once() {
+    fn open_claims_fence_before_return() {
+        let (root, d) = tmp();
+        let store = open_sqlite(&d).expect("open");
+        let claimed: i64 = store
+            .with_conn(|c| {
+                c.query_row("SELECT epoch FROM cortexkit_fence WHERE id = 0", [], |r| {
+                    r.get(0)
+                })
+            })
+            .expect("open claimed fence");
+        assert_eq!(claimed as u64, store.epoch());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn migrations_seed_once_across_reopen() {
         let (root, d) = tmp();
         {
             let store = open_sqlite(&d).expect("open");
@@ -475,6 +566,47 @@ mod tests {
             assert_eq!(store.epoch(), 2, "lease epoch is monotonic across opens");
         }
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn database_epoch_survives_repeated_lease_sidecar_loss() {
+        let (root, d) = tmp();
+        let first = open_sqlite(&d).expect("first open");
+        let first_epoch = first.epoch();
+        drop(first);
+
+        remove_lease_sidecar(&root);
+        let second = open_sqlite(&d).expect("open after first sidecar loss");
+        assert!(second.epoch() > first_epoch);
+        let second_epoch = second.epoch();
+        drop(second);
+
+        remove_lease_sidecar(&root);
+        let third = open_sqlite(&d).expect("open after second sidecar loss");
+        assert!(third.epoch() > second_epoch);
+        let db_epoch: i64 = third
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT epoch FROM cortexkit_fence WHERE id = 0",
+                    [],
+                    |row| row.get(0),
+                )
+            })
+            .expect("database fence");
+        assert_eq!(db_epoch as u64, third.epoch());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn remove_lease_sidecar(root: &std::path::Path) {
+        let lease = std::fs::read_dir(root)
+            .expect("read store directory")
+            .map(|entry| entry.expect("directory entry").path())
+            .find(|path| {
+                path.extension()
+                    .is_some_and(|extension| extension == "lease")
+            })
+            .expect("lease sidecar");
+        std::fs::remove_file(lease).expect("remove lease sidecar");
     }
 
     #[test]
@@ -607,8 +739,12 @@ mod tests {
     #[test]
     fn fenced_write_rolls_back_on_error() {
         let (root, d) = tmp();
-        let store = open_sqlite(&d).expect("open");
-        store.migrate("kv", FENCE_SCHEMA).expect("migrate");
+        let path = sqlite_path(&d);
+        open_sqlite(&d)
+            .expect("open")
+            .migrate("kv", FENCE_SCHEMA)
+            .expect("migrate");
+        let store = SqliteStore::for_test(rusqlite::Connection::open(path).unwrap(), 2);
         let r: Result<(), StoreError> = store.with_conn_fenced(|tx| {
             tx.execute("INSERT INTO kv (k, v) VALUES ('a', '1')", [])?;
             tx.query_row("SELECT * FROM does_not_exist", [], |_| Ok(()))?;
@@ -622,6 +758,74 @@ mod tests {
             .with_conn(|c| c.query_row("SELECT COUNT(*) FROM kv", [], |r| r.get(0)))
             .expect("count");
         assert_eq!(n, 0, "the failed fenced write rolled back");
+        let claimed: i64 = store
+            .with_conn(|c| {
+                c.query_row("SELECT epoch FROM cortexkit_fence WHERE id = 0", [], |r| {
+                    r.get(0)
+                })
+            })
+            .expect("read fence");
+        assert_eq!(
+            claimed, 1,
+            "the failed callback did not roll back its fence claim"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn legacy_database_without_fence_table_uses_zero_floor() {
+        let (root, d) = tmp();
+        let path = sqlite_path(&d);
+        std::fs::create_dir_all(&root).expect("create store directory");
+        let conn = rusqlite::Connection::open(&path).expect("create legacy database");
+        conn.execute_batch("CREATE TABLE legacy_data (id INTEGER PRIMARY KEY);")
+            .expect("create legacy schema");
+        drop(conn);
+
+        let store = open_sqlite(&d).expect("open legacy database");
+        assert_eq!(store.epoch(), 1, "missing fence table must use floor zero");
+        let claimed: i64 = store
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT epoch FROM cortexkit_fence WHERE id = 0",
+                    [],
+                    |row| row.get(0),
+                )
+            })
+            .expect("read claimed fence");
+        assert_eq!(claimed, 1);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn legacy_negative_database_fence_fails_closed() {
+        let (root, d) = tmp();
+        let path = sqlite_path(&d);
+        std::fs::create_dir_all(&root).expect("create store directory");
+        let conn = rusqlite::Connection::open(&path).expect("create legacy database");
+        conn.execute_batch(
+            "CREATE TABLE cortexkit_fence (id INTEGER PRIMARY KEY, epoch INTEGER NOT NULL); \
+             INSERT INTO cortexkit_fence (id, epoch) VALUES (0, -1);",
+        )
+        .expect("seed pre-fence-validation database");
+        drop(conn);
+
+        let error = match open_sqlite(&d) {
+            Err(error) => error,
+            Ok(_) => panic!("negative fence must fail closed"),
+        };
+        assert!(
+            matches!(error, StoreError::Backend(message) if message.contains("database fence epoch -1 is outside the supported range"))
+        );
+        let persisted: i64 = rusqlite::Connection::open(&path)
+            .expect("reopen legacy database")
+            .query_row(
+                "SELECT epoch FROM cortexkit_fence WHERE id = 0",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read unchanged negative fence");
+        assert_eq!(persisted, -1);
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -667,6 +871,39 @@ mod tests {
     }
 
     #[test]
+    fn superseded_writer_cannot_migrate() {
+        let (root, d) = tmp();
+        let path = sqlite_path(&d);
+        open_sqlite(&d).expect("seed database");
+
+        let replacement = SqliteStore::for_test(rusqlite::Connection::open(&path).unwrap(), 2);
+        replacement
+            .with_conn_fenced(|_| Ok(()))
+            .expect("replacement claim");
+        let stale = SqliteStore::for_test(rusqlite::Connection::open(&path).unwrap(), 1);
+        let migration = [Migration {
+            version: 1,
+            statements: "CREATE TABLE stale_schema (id INTEGER PRIMARY KEY);",
+        }];
+        assert!(matches!(
+            stale.migrate("stale", &migration),
+            Err(StoreError::Fenced { .. })
+        ));
+
+        let tables: i64 = replacement
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM sqlite_schema WHERE type = 'table' AND name = 'stale_schema'",
+                    [],
+                    |row| row.get(0),
+                )
+            })
+            .expect("schema state");
+        assert_eq!(tables, 0);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn equal_epoch_writer_is_not_fenced() {
         let (root, d) = tmp();
         let path = sqlite_path(&d);
@@ -685,6 +922,25 @@ mod tests {
                 .map(|_| ())
         })
         .expect("same epoch 5 still writes");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn epoch_above_sqlite_integer_range_fails() {
+        let (root, d) = tmp();
+        let path = sqlite_path(&d);
+        open_sqlite(&d).expect("seed database");
+        let too_large = SqliteStore::for_test(
+            rusqlite::Connection::open(&path).unwrap(),
+            (i64::MAX as u64) + 1,
+        );
+        let error = too_large
+            .with_conn_fenced(|_| Ok(()))
+            .expect_err("epochs above SQLite INTEGER range must fail");
+        assert!(
+            matches!(error, StoreError::Backend(message) if message.contains("exceeds SQLite INTEGER maximum"))
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 

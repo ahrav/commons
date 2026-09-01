@@ -3,11 +3,10 @@
 ## Provenance and scope
 
 - System: `crates/cortexkit-lease`
-- Revision: parent `610cd07b84f9d0d0f3e01afee0ee04c33420acb5` plus the U4 working-tree changes
-- Date: 2026-08-30
-- External-evidence answer: **unavailable**. Claustrum owns the real-daemon
-  two-process review, but that repository is not available in this workspace.
-  No review receipt was supplied; this remains an unresolved merge gate.
+- Revision: `01865dc6f99a45dd531faf330c853203434ab9c8` plus the U5 working-tree changes
+- Date: 2026-09-01
+- External-evidence answer: **partial**. The [durable consumer inventory](durable-consumer-inventory.md)
+  is the canonical record for external blockers and draft disposition.
 - In-repo references consulted:
   - `crates/cortexkit-lease/src/lib.rs`: implementation, claims, and unit checks.
   - `crates/cortexkit-store/src/lib.rs`: the in-repo file-lease consumer and fence enforcement point.
@@ -30,6 +29,7 @@ Supporting artifacts:
 - [Fault-to-property map](fault-map.md)
 - [Relationship map](relationships.md)
 - [Portfolio evaluation](portfolio.md)
+- [Durable consumer inventory](durable-consumer-inventory.md)
 - [Per-property evidence](evidence/)
 
 ## Property catalog
@@ -46,9 +46,7 @@ Supporting artifacts:
 - **Confidence:** high. The contract is explicit at `src/lib.rs:2-6`; `LeaseStore::acquire` delegates exclusion to `File::try_lock`.
 - **Existing check:** `acquire_then_second_holder_is_rejected`, same process and sequential; status **unaudited**.
 - **Impact:** Two writers can mutate one logical store. This is the crate's primary prohibited state.
-- **Open questions:** Claustrum's real-daemon two-process review remains an
-  unresolved merge gate. Its repository is unavailable locally, and no review
-  receipt is present. `(needs human input)`
+- **Open questions:** See the Claustrum blocker in the [durable consumer inventory](durable-consumer-inventory.md). `(needs human input)`
 - **Evidence:** [evidence/at-most-one-exclusive-holder-per-key.md](evidence/at-most-one-exclusive-holder-per-key.md)
 
 ### `shared-exclusive-exclusion-matrix`
@@ -85,13 +83,13 @@ Supporting artifacts:
 
 - **Type:** safety
 - **Status:** active
-- **Exercised:** yes for malformed input, exhaustion, and deterministic ordered prefix-write failures through `persist_epoch`; exact `File` failures, restore, process interruption, and power loss remain absent.
+- **Exercised:** yes for malformed input, exhaustion, deterministic ordered prefix-write failures through `persist_epoch`, and SQLite sidecar loss recovered from the database fence. Exact `File` failures, arbitrary restore, process interruption, and power loss remain absent.
 - **Guarantee:** Every successful exclusive acquisition returns an epoch strictly greater than every epoch previously returned for the same physical root and key.
-- **Check:** On each successful exclusive acquisition, `always(epoch > max_returned_epoch[(physical_root_identity, module_id, backend, scope_key)])`, then update the witness. `bump_epoch` performs checked increment and `persist_epoch` performs canonical persistence.
+- **Check:** On each successful exclusive acquisition, `always(epoch > max_returned_epoch[(physical_root_identity, module_id, backend, scope_key)])`, then update the witness. `bump_epoch_above` performs checked increment above persisted state and an optional resource floor; `persist_epoch` performs canonical persistence.
 - **Fault/timing angle:** Unsynced write loss, old-file restore, and machine power loss remain threats. Malformed input and a persisted `u64::MAX` fail closed in exercised local paths.
 - **Required faults and enabling state:** At least one prior successful acquisition, followed separately by each fault class. The maximum-value case requires the parser to observe `18446744073709551615` and repeated exclusive attempts to return `LeaseError::Io(InvalidData)` without changing bytes; counting to it is not required.
 - **Confidence:** high for bounded parsing, checked increment, and ordered-prefix behavior in the injected `Write + Seek` model; exact partial-`File` I/O and power-loss behavior remain unproved.
-- **Existing check:** `invalid_epoch_states_fail_closed` and `interrupted_persist_never_leaves_a_lower_parseable_epoch`, plus clean acquisition checks; status **unaudited**.
+- **Existing check:** `exclusive_epoch_exceeds_resource_floor`, `database_epoch_survives_repeated_lease_sidecar_loss`, `invalid_epoch_states_fail_closed`, and `interrupted_persist_never_leaves_a_lower_parseable_epoch`, plus clean acquisition checks; status **unaudited**.
 - **Impact:** Reused or regressed epochs let a superseded writer pass an equal-or-older fence or can permanently reject legitimate writers.
 - **Open questions:** What recovery behavior is required after an older valid lease file is restored?
 - **Evidence:** [evidence/writer-epoch-strictly-increases.md](evidence/writer-epoch-strictly-increases.md)
@@ -311,15 +309,15 @@ Supporting artifacts:
 
 - **Type:** safety
 - **Status:** active
-- **Exercised:** partial: SQLite's synthetic fenced path is covered; real handover, pre-claim window, unfenced SQLite paths, and PostgreSQL are missing.
+- **Exercised:** partial. SQLite and live PostgreSQL tests reject synthetic stale stores and preserve domain state. Real retained-connection handover and unfenced SQLite paths remain missing.
 - **Guarantee:** On write paths declared fence-protected, after a replacement writer claims epoch `n`, every write attempt from epoch `< n` is rejected before effects.
 - **Check:** `always(effects_begin => holder_epoch >= authoritative_epoch)`. For every stale attempt, assert an explicit fenced result and unchanged application state.
 - **Fault/timing angle:** A stale connection remains usable after its lease is released and a replacement acquires a newer epoch.
 - **Required faults and enabling state:** Real handover, retained old connection, replacement fence claim, then a late old-writer mutation. Run for every path declared fence-protected; fence-coverage completeness is a separate property.
-- **Confidence:** high that the crate claims it at `src/lib.rs:2-6`; high that SQLite implements one fenced path; high that PostgreSQL exposes an epoch but no in-repo fence check was found.
-- **Existing check:** `superseded_writer_is_fenced_out_after_handover`, `cortexkit-store/src/lib.rs:629-667`, synthetic `for_test` handles; status **unaudited**.
+- **Confidence:** high that both concrete fenced callbacks compare the persisted epoch and bind the comparison and callback effects to one transaction.
+- **Existing check:** `superseded_writer_is_fenced_out_after_handover`, `cortexkit-store/src/lib.rs:833-871`, and `superseded_writer_is_rejected_after_reopen`, `cortexkit-store-postgres/src/lib.rs:534-565`; both use synthetic stale stores and remain **unaudited**.
 - **Impact:** A superseded process can overwrite state owned by its replacement.
-- **Open questions:** Is PostgreSQL's session lock intentionally considered sufficient, making its epoch informational, or is the fence path missing? `(needs human input)`
+- **Open questions:** Which external write sites remain outside the concrete fenced callbacks? See `protected-write-set-is-fence-complete`.
 - **Evidence:** [evidence/stale-writer-write-is-rejected.md](evidence/stale-writer-write-is-rejected.md)
 
 ### `logical-store-has-single-lease-identity`
@@ -331,8 +329,8 @@ Supporting artifacts:
 - **Check:** `always(same_logical_store => lease_identity_a == lease_identity_b)` and `always(independent_stores => lease_identity_a != lease_identity_b)`, where identity includes canonical root plus all three key fields.
 - **Fault/timing angle:** The lease key excludes the SQLite database path, while the root is only its parent. Sibling databases with equal descriptors alias; one database opened with differing module or namespace values splits into independent locks.
 - **Required faults and enabling state:** Open the same SQLite database through descriptors differing in module or namespace; open it through cross-parent symlink or hardlink aliases; open two sibling database files under one parent with equal key fields.
-- **Confidence:** high on derivation facts (`cortexkit-store/src/lib.rs:69-75,245-260`); unknown whether descriptor authority prevents these combinations in deployment.
-- **Existing check:** `distinct_databases_do_not_falsely_contend`, `cortexkit-store/src/lib.rs:493-501`, uses different parent directories and does not exercise sibling files; status **unaudited**.
+- **Confidence:** high on derivation facts (`cortexkit-store/src/lib.rs:69-78,225-242`); unknown whether descriptor authority prevents these combinations in deployment.
+- **Existing check:** `distinct_databases_do_not_falsely_contend`, `cortexkit-store/src/lib.rs:625-633`, uses different parent directories and does not exercise sibling files; status **unaudited**.
 - **Impact:** One store can have two writers, or independent stores can falsely block each other.
 - **Open questions:** What component guarantees descriptor uniqueness and canonical database paths? `(needs human input)`
 - **Evidence:** [evidence/logical-store-has-single-lease-identity.md](evidence/logical-store-has-single-lease-identity.md)
@@ -371,30 +369,30 @@ Supporting artifacts:
 
 - **Type:** safety
 - **Status:** active
-- **Exercised:** not yet.
+- **Exercised:** partial. `open_claims_fence_before_return` verifies that `open_sqlite` does not return before stamping its epoch. No retained old connection races the interval between lease acquisition and the internal claim.
 - **Guarantee:** On declared fence-protected paths, from the instant a replacement's exclusive acquisition succeeds, no write from a prior epoch commits, even if that write began earlier.
 - **Check:** `always(old_epoch_effect_commits => replacement_not_yet_acquired_at_commit)`. After replacement acquisition, every old-epoch attempt or in-flight transaction must abort as fenced and leave application state unchanged.
-- **Fault/timing angle:** SQLite claims the database fence lazily in `with_conn_fenced`, not during `open_sqlite`; before the replacement's first fenced write, the stored fence can still equal the old writer's epoch.
-- **Required faults and enabling state:** Old connection retained after releasing its lease, replacement acquires a newer epoch but performs no fenced write, then old connection calls the fenced path.
-- **Confidence:** high from `cortexkit-store/src/lib.rs:162-205,245-284` and equal-epoch behavior at `:670-689`.
-- **Existing check:** none; the synthetic handover test claims epoch 2 before the stale attempt.
+- **Fault/timing angle:** `open_sqlite` acquires the file lease before it obtains the SQLite `IMMEDIATE` transaction used to claim the database fence. A retained old transaction can race inside that internal interval, although no replacement store is exposed before the claim commits.
+- **Required faults and enabling state:** Retain an old connection after releasing its lease, pause replacement open after lease acquisition, and race an old transaction against the replacement's `IMMEDIATE` claim.
+- **Confidence:** high that every returned store has claimed its epoch (`cortexkit-store/src/lib.rs:225-273,312-343`); the stronger acquisition-instant guarantee remains unproved.
+- **Existing check:** `open_claims_fence_before_return`, `cortexkit-store/src/lib.rs:533-545`, observes the claim before domain setup; status **unaudited**.
 - **Impact:** A superseded writer can commit during the handover window the fence is meant to close.
-- **Open questions:** Is fence claim intended at open, or is a pre-claim stale-write window accepted? `(needs human input)`
+- **Open questions:** Does the guarantee begin at internal file-lease acquisition or when `open_sqlite` returns? `(needs human input)`
 - **Evidence:** [evidence/replacement-fence-is-claimed-before-old-writer-writes.md](evidence/replacement-fence-is-claimed-before-old-writer-writes.md)
 
 ### `protected-write-set-is-fence-complete`
 
 - **Type:** safety
 - **Status:** active
-- **Exercised:** not yet; no write-site inventory exists.
+- **Exercised:** not yet. A default-branch inventory exists, but SQLite consumers still contain durable mutations through unrestricted `with_conn`.
 - **Guarantee:** Every durable mutation declared protected by lease fencing commits only after at least one authoritative fence check atomically bound to that mutation.
 - **Check:** For the enumerated protected write-site set, `always(protected_effect_commits => authoritative_atomic_fence_checks >= 1)`, with a source-level inventory proving no protected write path bypasses the checked transaction.
-- **Fault/timing angle:** `cortexkit-store` exposes unfenced `with_conn` and `migrate` alongside `with_conn_fenced`; PostgreSQL exposes `with_client` without an epoch comparison.
+- **Fault/timing angle:** `cortexkit-store` exposes unfenced `with_conn` alongside `with_conn_fenced`. Both backends fence migration SQL in the migration transaction. PostgreSQL restricts ordinary callbacks to a read-only transaction.
 - **Required faults and enabling state:** Exercise or inspect every public durable-write boundary and classify whether fencing is required by its contract.
-- **Confidence:** high that unfenced paths exist; their intended protection scope needs human authority.
-- **Existing check:** none. Existing fence tests cover only `with_conn_fenced`.
+- **Confidence:** high that unfenced SQLite mutations exist in Magic Context; their migration and the authoritative protected write set need external ownership.
+- **Existing check:** backend tests cover fenced callbacks, fenced migrations, and PostgreSQL read-only enforcement. The [durable consumer inventory](durable-consumer-inventory.md) records source receipts; no source-level completeness gate exists.
 - **Impact:** The module-level claim “every durable write carries the holder's epoch” can be false even when the fenced helper works.
-- **Open questions:** Which SQLite and PostgreSQL writes are contractually fence-protected? `(needs human input)`
+- **Open questions:** Which SQLite writes are contractually fence-protected, and when will the Magic Context mutations move to `with_conn_fenced`? `(needs human input)`
 - **Evidence:** [evidence/protected-write-set-is-fence-complete.md](evidence/protected-write-set-is-fence-complete.md)
 
 ### `lease-file-creation-is-never-permissive`

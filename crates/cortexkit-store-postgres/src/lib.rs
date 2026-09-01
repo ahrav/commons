@@ -20,6 +20,11 @@ pub enum StoreError {
     UnsupportedBackend(String),
     Migration(String),
     Backend(String),
+    /// The persisted database epoch belongs to a newer lease holder.
+    Fenced {
+        holder_epoch: i64,
+        db_epoch: i64,
+    },
 }
 
 impl std::fmt::Display for StoreError {
@@ -32,6 +37,14 @@ impl std::fmt::Display for StoreError {
             ),
             StoreError::Migration(m) => write!(f, "migration: {m}"),
             StoreError::Backend(m) => write!(f, "storage backend: {m}"),
+            StoreError::Fenced {
+                holder_epoch,
+                db_epoch,
+            } => write!(
+                f,
+                "fenced write rejected: this writer holds epoch {holder_epoch} but the \
+                 database was claimed by a newer writer at epoch {db_epoch}"
+            ),
         }
     }
 }
@@ -53,9 +66,8 @@ fn lease_key(descriptor: &StorageDescriptor) -> LeaseKey {
     )
 }
 
-/// A lease-guarded, migrated postgres store. Holds a session advisory lock on its
-/// connection for the store's lifetime (released when the connection drops, e.g.
-/// on crash). The module runs its domain queries via [`PostgresStore::with_client`].
+/// A PostgreSQL store that holds a session advisory lock until its connection
+/// closes.
 pub struct PostgresStore {
     client: std::sync::Mutex<Client>,
     epoch: i64,
@@ -69,23 +81,97 @@ impl PostgresStore {
         self.epoch
     }
 
-    /// Run a closure against the postgres client under the store mutex. The
-    /// module's domain trait implementation calls this for every query/transaction.
-    pub fn with_client<T>(
+    /// A read-only transaction gives the callback a consistent multi-statement snapshot while rejecting writes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::Backend`] when transaction setup, the callback, or commit fails.
+    pub fn with_client_read<T>(
         &self,
-        f: impl FnOnce(&mut Client) -> Result<T, postgres::Error>,
+        f: impl FnOnce(&mut postgres::Transaction<'_>) -> Result<T, postgres::Error>,
     ) -> Result<T, StoreError> {
         let mut guard = self.client.lock().unwrap_or_else(|p| p.into_inner());
-        f(&mut guard).map_err(|e| StoreError::Backend(e.to_string()))
+        let mut tx = guard
+            .build_transaction()
+            .read_only(true)
+            .start()
+            .map_err(backend_error)?;
+        let out = f(&mut tx).map_err(backend_error)?;
+        tx.commit().map_err(backend_error)?;
+        Ok(out)
+    }
+
+    /// A newer persisted epoch rejects the callback before domain effects begin.
+    /// The epoch check and callback effects share one transaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::Fenced`] when a newer writer owns the database.
+    /// Returns [`StoreError::Backend`] when transaction setup, the fence check, the callback, or commit fails.
+    pub fn with_client_fenced<T>(
+        &self,
+        f: impl FnOnce(&mut postgres::Transaction<'_>) -> Result<T, postgres::Error>,
+    ) -> Result<T, StoreError> {
+        let mut guard = self.client.lock().unwrap_or_else(|p| p.into_inner());
+        let mut tx = guard.transaction().map_err(backend_error)?;
+        check_fence(&mut tx, self.lease_key, self.epoch)?;
+        let out = f(&mut tx).map_err(backend_error)?;
+        tx.commit().map_err(backend_error)?;
+        Ok(out)
     }
 
     /// Apply a `namespace`'s migration chain to this database, once. Applied
     /// migrations are tracked per `(namespace, version)`, so a multi-domain module
     /// registers an independent chain per domain.
+    /// Migration SQL runs in the transaction that accepts the holder epoch through
+    /// `check_fence`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::Fenced`] when a newer writer owns the database.
+    /// Returns [`StoreError::Backend`] when the fence check fails.
+    /// Returns [`StoreError::Migration`] when migration setup, SQL, recording, or commit fails.
     pub fn migrate(&self, namespace: &str, migrations: &[Migration]) -> Result<(), StoreError> {
         let mut guard = self.client.lock().unwrap_or_else(|p| p.into_inner());
-        run_migrations(&mut guard, namespace, migrations)
+        run_migrations(
+            &mut guard,
+            self.lease_key,
+            self.epoch,
+            namespace,
+            migrations,
+        )
     }
+}
+
+/// Preserves PostgreSQL's server message instead of collapsing it to `db error`.
+fn backend_error(error: postgres::Error) -> StoreError {
+    let message = error.as_db_error().map_or_else(
+        || error.to_string(),
+        |db| format!("SQLSTATE {}: {}", db.code().code(), db.message()),
+    );
+    StoreError::Backend(message)
+}
+
+/// Locks the current lease row so the fence check remains bound to transaction effects.
+fn check_fence(
+    tx: &mut postgres::Transaction<'_>,
+    lease_key: i64,
+    holder_epoch: i64,
+) -> Result<(), StoreError> {
+    let db_epoch: i64 = tx
+        .query_one(
+            "SELECT epoch FROM cortexkit_lease WHERE lease_key = $1 FOR UPDATE",
+            &[&lease_key],
+        )
+        .map_err(backend_error)?
+        .get(0);
+    if db_epoch > holder_epoch {
+        return Err(StoreError::Fenced {
+            holder_epoch,
+            db_epoch,
+        });
+    }
+    Ok(())
 }
 
 impl Drop for PostgresStore {
@@ -104,6 +190,13 @@ impl Drop for PostgresStore {
 ///
 /// A second live writer is rejected (`StoreError::Lease`) because the advisory
 /// lock is already held by the first connection.
+///
+/// # Errors
+///
+/// Returns [`StoreError::UnsupportedBackend`] for non-PostgreSQL descriptors.
+/// Returns [`StoreError::Backend`] when connection or advisory-lock queries fail.
+/// Returns [`StoreError::Lease`] when another writer holds the advisory lock.
+/// Returns [`StoreError::Migration`] when infrastructure setup or epoch issuance fails.
 pub fn open_postgres(descriptor: &StorageDescriptor) -> Result<PostgresStore, StoreError> {
     let dsn = match &descriptor.backend {
         StorageBackend::Postgres { dsn, .. } => dsn.clone(),
@@ -183,15 +276,15 @@ fn ensure_infra_tables(client: &mut Client) -> Result<(), StoreError> {
 /// under the held advisory lock. The lease table is created by
 /// [`ensure_infra_tables`] before this runs.
 fn bump_epoch(client: &mut Client, lease_id: i64) -> Result<i64, StoreError> {
-    let row = client
+    client
         .query_one(
             "INSERT INTO cortexkit_lease (lease_key, epoch) VALUES ($1, 1) \
              ON CONFLICT (lease_key) DO UPDATE SET epoch = cortexkit_lease.epoch + 1 \
              RETURNING epoch",
             &[&lease_id],
         )
-        .map_err(|e| StoreError::Migration(e.to_string()))?;
-    Ok(row.get(0))
+        .map(|row| row.get(0))
+        .map_err(|e| StoreError::Migration(e.to_string()))
 }
 
 /// Apply un-applied migrations for one `namespace` in ascending version order,
@@ -199,18 +292,26 @@ fn bump_epoch(client: &mut Client, lease_id: i64) -> Result<i64, StoreError> {
 /// leaves it un-recorded and it re-runs cleanly. Keyed by `(namespace, version)`.
 fn run_migrations(
     client: &mut Client,
+    lease_key: i64,
+    holder_epoch: i64,
     namespace: &str,
     migrations: &[Migration],
 ) -> Result<(), StoreError> {
     // The schema-version table is bootstrapped race-safely in ensure_infra_tables
     // at open, so migrate() does not (re-)create it here.
-    let current: i32 = client
+    let mut tx = client
+        .transaction()
+        .map_err(|e| StoreError::Migration(e.to_string()))?;
+    check_fence(&mut tx, lease_key, holder_epoch)?;
+    let current: i32 = tx
         .query_one(
             "SELECT COALESCE(MAX(version), 0) FROM cortexkit_schema_version WHERE namespace = $1",
             &[&namespace],
         )
         .map_err(|e| StoreError::Migration(e.to_string()))?
         .get(0);
+    tx.commit()
+        .map_err(|e| StoreError::Migration(e.to_string()))?;
     let current = current as u32;
 
     let mut ordered: Vec<&Migration> = migrations.iter().collect();
@@ -223,6 +324,7 @@ fn run_migrations(
         let mut tx = client
             .transaction()
             .map_err(|e| StoreError::Migration(e.to_string()))?;
+        check_fence(&mut tx, lease_key, holder_epoch)?;
         tx.batch_execute(m.statements).map_err(|e| {
             StoreError::Migration(format!(
                 "namespace '{namespace}' migration {}: {e}",
@@ -298,8 +400,7 @@ mod tests {
 
     const M1: &[Migration] = &[Migration {
         version: 1,
-        statements:
-            "CREATE TABLE IF NOT EXISTS facts_probe (id INT PRIMARY KEY, name TEXT NOT NULL);",
+        statements: "SELECT 1;",
     }];
 
     #[test]
@@ -322,7 +423,7 @@ mod tests {
         }
 
         let applied: i64 = store
-            .with_client(|c| {
+            .with_client_read(|c| {
                 Ok(c.query_one(
                     "SELECT COUNT(*) FROM cortexkit_schema_version WHERE namespace = $1",
                     &[&ns],
@@ -334,10 +435,171 @@ mod tests {
             applied, 1,
             "exactly one migration recorded for the namespace"
         );
+    }
 
+    #[test]
+    fn read_only_callback_rejects_mutation_without_rows() {
+        let Some(dsn) = test_dsn() else {
+            return;
+        };
+        let ns = unique_ns("read_only");
+        let store = open_postgres(&descriptor(&dsn, &ns)).expect("open");
+        store.migrate(&ns, M1).expect("migrate");
+        let read_only_error = store
+            .with_client_read(|tx| {
+                tx.execute(
+                    "INSERT INTO cortexkit_schema_version \
+                     (namespace, version, applied_at_unix) VALUES ($1, 1, 0)",
+                    &[&format!("{ns}_probe")],
+                )?;
+                Ok(())
+            })
+            .expect_err("read-only callback mutated the database");
+        assert!(
+            matches!(read_only_error, StoreError::Backend(message) if message.starts_with("SQLSTATE 25006:")),
+            "read-only mutation must preserve SQLSTATE 25006"
+        );
+        let rows: i64 = store
+            .with_client_read(|tx| {
+                Ok(tx
+                    .query_one(
+                        "SELECT COUNT(*) FROM cortexkit_schema_version WHERE namespace = $1",
+                        &[&format!("{ns}_probe")],
+                    )?
+                    .get(0))
+            })
+            .expect("read unchanged rows");
+        assert_eq!(rows, 0);
+    }
+
+    #[test]
+    fn fenced_callback_error_rolls_back_rows() {
+        let Some(dsn) = test_dsn() else {
+            return;
+        };
+        let ns = unique_ns("rollback");
+        let store = open_postgres(&descriptor(&dsn, &ns)).expect("open");
+        store.migrate(&ns, M1).expect("migrate");
+        let callback_error = store
+            .with_client_fenced(|tx| {
+                tx.execute(
+                    "INSERT INTO cortexkit_schema_version \
+                     (namespace, version, applied_at_unix) VALUES ($1, 1, 0)",
+                    &[&format!("{ns}_probe")],
+                )?;
+                tx.batch_execute("SELECT * FROM cortexkit_missing_table")?;
+                Ok(())
+            })
+            .expect_err("callback error must abort the transaction");
+        assert!(matches!(callback_error, StoreError::Backend(_)));
+        let rows_after_error: i64 = store
+            .with_client_read(|tx| {
+                Ok(tx
+                    .query_one(
+                        "SELECT COUNT(*) FROM cortexkit_schema_version WHERE namespace = $1",
+                        &[&format!("{ns}_probe")],
+                    )?
+                    .get(0))
+            })
+            .expect("rollback state");
+        assert_eq!(
+            rows_after_error, 0,
+            "failed callback did not roll back its domain write"
+        );
+    }
+
+    #[test]
+    fn repeated_fenced_writes_at_current_epoch_succeed() {
+        let Some(dsn) = test_dsn() else {
+            return;
+        };
+        let ns = unique_ns("repeat");
+        let store = open_postgres(&descriptor(&dsn, &ns)).expect("open");
+        store.migrate(&ns, M1).expect("migrate");
+        for version in [1, 2] {
+            store
+                .with_client_fenced(|tx| {
+                    tx.execute(
+                        "INSERT INTO cortexkit_schema_version \
+                         (namespace, version, applied_at_unix) VALUES ($1, $2, 0)",
+                        &[&format!("{ns}_probe"), &version],
+                    )?;
+                    Ok(())
+                })
+                .expect("equal epoch write");
+        }
+    }
+
+    #[test]
+    fn superseded_writer_is_rejected_after_reopen() {
+        let Some(dsn) = test_dsn() else {
+            return;
+        };
+        let ns = unique_ns("stale_write");
+        let d = descriptor(&dsn, &ns);
+        let store = open_postgres(&d).expect("open");
+        let old_epoch = store.epoch();
+        let lease_key = store.lease_key;
         drop(store);
         let reopened = open_postgres(&d).expect("reopen after release");
-        assert!(reopened.epoch() >= 2, "epoch is monotonic across opens");
+        assert!(
+            reopened.epoch() > old_epoch,
+            "epoch is monotonic across opens"
+        );
+
+        let stale = PostgresStore {
+            client: std::sync::Mutex::new(Client::connect(&dsn, NoTls).expect("stale client")),
+            epoch: old_epoch,
+            lease_key,
+        };
+        match stale.with_client_fenced(|_| Ok(())) {
+            Err(StoreError::Fenced {
+                holder_epoch,
+                db_epoch,
+            }) => {
+                assert_eq!(holder_epoch, old_epoch);
+                assert_eq!(db_epoch, reopened.epoch());
+            }
+            other => panic!("expected stale writer rejection, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn superseded_writer_cannot_migrate() {
+        let Some(dsn) = test_dsn() else {
+            return;
+        };
+        let ns = unique_ns("stale_migrate");
+        let d = descriptor(&dsn, &ns);
+        let store = open_postgres(&d).expect("open");
+        let old_epoch = store.epoch();
+        let lease_key = store.lease_key;
+        drop(store);
+        let reopened = open_postgres(&d).expect("reopen");
+        let stale = PostgresStore {
+            client: std::sync::Mutex::new(Client::connect(&dsn, NoTls).expect("stale client")),
+            epoch: old_epoch,
+            lease_key,
+        };
+        let table = format!("stale_schema_{ns}");
+        let statements: &'static str =
+            Box::leak(format!("CREATE TABLE {table} (id INT PRIMARY KEY);").into_boxed_str());
+        let migrations = [Migration {
+            version: 1,
+            statements,
+        }];
+        assert!(matches!(
+            stale.migrate(&format!("{ns}_migration"), &migrations),
+            Err(StoreError::Fenced { .. })
+        ));
+        let exists: bool = reopened
+            .with_client_read(|tx| {
+                Ok(tx
+                    .query_one("SELECT to_regclass($1) IS NOT NULL", &[&table])?
+                    .get(0))
+            })
+            .expect("schema state");
+        assert!(!exists);
     }
 
     #[test]
@@ -361,7 +623,7 @@ mod tests {
             .migrate(&format!("{ns}_b"), B)
             .expect("b - same version, distinct namespace");
         let count: i64 = store
-            .with_client(|c| {
+            .with_client_read(|c| {
                 Ok(c.query_one(
                     "SELECT COUNT(*) FROM cortexkit_schema_version WHERE namespace IN ($1, $2)",
                     &[&format!("{ns}_a"), &format!("{ns}_b")],

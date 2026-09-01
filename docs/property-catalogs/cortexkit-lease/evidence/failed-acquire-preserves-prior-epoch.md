@@ -1,9 +1,9 @@
 # `failed-acquire-preserves-prior-epoch`
 
 - **Discovery:** lifecycle and I/O-failure passes.
-- **Primary evidence:** exclusive acquisition unlocks on persistence error (`LeaseStore::acquire`); `persist_epoch` never truncates and writes canonical digits from most to least significant (`crates/cortexkit-lease/src/lib.rs:379-387`).
+- **Primary evidence:** exclusive acquisition unlocks on persistence error (`LeaseStore::acquire`); `persist_epoch` never truncates and writes canonical digits from most to least significant (`crates/cortexkit-lease/src/lib.rs:395-403`).
 - **Discriminating fact:** a canonical positive-prefix overwrite leaves the old value, the new value, or a higher decimal splice. Short input is padded with non-decimal markers before conversion, so interruption after progress leaves malformed state unless the canonical write completes.
-- **Existing evidence:** `interrupted_persist_never_leaves_a_lower_parseable_epoch` injects short ordered writes through production `persist_epoch`, parses through production `read_epoch`, and proves any parseable aftermath is not lower (`crates/cortexkit-lease/src/lib.rs:615-669`).
+- **Existing evidence:** `interrupted_persist_never_leaves_a_lower_parseable_epoch` injects short ordered writes through production `persist_epoch`, parses through production `read_epoch`, and proves any parseable aftermath is not lower (`crates/cortexkit-lease/src/lib.rs:645-699`).
 - **Failure scenario:** real `File` error behavior is not exercised; non-returning process termination and power loss require separate evidence.
 - **Timing window:** after any positive write progress in `persist_epoch` and before the update completes.
 - **Instrumentation:** missing exact filesystem/device error through `File`; no production failpoint was added.
