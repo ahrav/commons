@@ -6,7 +6,7 @@ System path: `crates/cortexkit-lease` at revision `01865dc6f99a45dd531faf330c853
 
 `LeaseKey` contains `(module_id, backend, scope_key)` (`LeaseKey`). The fields are joined with `U+001F`, hashed with FNV-1a-64, and mapped to `<base_dir>/<16hex>.lease` (`LeaseKey::identity`, `fnv1a`, `fnv1a_hex`, and `FileLeaseStore::lease_path`).
 
-`open_lease_file` first opens an existing final path with Unix `O_NOFOLLOW | O_NONBLOCK` or Windows `FILE_FLAG_OPEN_REPARSE_POINT`. On `NotFound`, it creates a same-directory `NamedTempFile`, writes canonical epoch zero, and calls `persist_noclobber`; an `AlreadyExists` race reopens the winner within three attempts. A successful publication returns the already-open temporary-file inode. Descriptor metadata rejects nonregular files and Windows reparse points (`src/lib.rs:56-77,89-104,106-143`). Exclusive and shared acquisition then use only `File::try_lock` or `File::try_lock_shared`. Both methods classify `TryLockError::WouldBlock` as `LeaseError::Held` and unwrap `TryLockError::Error` into `LeaseError::Io` (`src/lib.rs:252-286,221-236`).
+`open_lease_file` first opens an existing final path with Unix `O_NOFOLLOW | O_NONBLOCK` or Windows `FILE_FLAG_OPEN_REPARSE_POINT`. On `NotFound`, it creates a same-directory `NamedTempFile`, writes canonical epoch zero, and calls `persist_noclobber`; an `AlreadyExists` race reopens the winner within three attempts. A successful publication returns the already-open temporary-file inode. Descriptor metadata rejects nonregular files and Windows reparse points (`src/lib.rs:56-77,89-104,106-143`). Exclusive and shared acquisition then use only `File::try_lock` or `File::try_lock_shared`. Both methods classify `TryLockError::WouldBlock` as `LeaseError::Held` and unwrap `TryLockError::Error` into `LeaseError::Io` (`src/lib.rs:252-286,320-342`).
 
 The crate has no network or database boundary. Its authority boundaries are the filesystem path and kernel lock table. `cortexkit-store` reads the SQLite fence as a resource floor, acquires above it, claims a strictly greater epoch before exposure, and rechecks it in fenced writes and migrations (`cortexkit-store/src/lib.rs:172-187,234-282,284-301,306-312,324-344,346-361,390-454`).
 
@@ -33,7 +33,7 @@ The epoch read-modify-write runs only after the exclusive lock succeeds. Shared 
 - Distinct module/backend/scope keys do not collide on a shared root (`LeaseKey::identity`, `FileLeaseStore::lease_path`).
 - Shared and exclusive holder modes exclude each other (`LeaseStore::acquire`, `LeaseStore::acquire_shared`).
 - Unix existing-file opens use `O_NOFOLLOW | O_NONBLOCK`, and permission changes apply through the opened descriptor. Windows existing-file opens use `FILE_FLAG_OPEN_REPARSE_POINT` and reject reparse-point metadata. New files are private `NamedTempFile` inodes initialized before no-clobber publication (`src/lib.rs:56-77,89-104,106-143`). Public `protect_file` remains path-based and Unix-only (`src/lib.rs:35-54`).
-- Genuine contention maps to `LeaseError::Held` through `TryLockError::WouldBlock` (`src/lib.rs:252-286,221-236`).
+- Genuine contention maps to `LeaseError::Held` through `TryLockError::WouldBlock` (`src/lib.rs:252-286,320-342`).
 
 These remain claims under test. Code disagreements are retained in the catalog.
 

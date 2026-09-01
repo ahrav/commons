@@ -117,8 +117,12 @@ impl PostgresStore {
             .read_only(true)
             .start()
             .map_err(backend_error)?;
-        let out = f(&mut tx).map_err(backend_error)?;
+        // An escape is durable; the callback's error is not. Check for the escape before
+        // propagating the error, or a callback that writes and then fails reports only
+        // its own failure while the unfenced write survives.
+        let out = f(&mut tx);
         require_read_only_transaction(&mut tx)?;
+        let out = out.map_err(backend_error)?;
         tx.commit().map_err(backend_error)?;
         Ok(out)
     }
@@ -141,8 +145,10 @@ impl PostgresStore {
         let mut guard = self.client.lock().unwrap_or_else(|p| p.into_inner());
         let mut tx = guard.transaction().map_err(backend_error)?;
         let witness = check_fence(&mut tx, self.lease_key, self.epoch)?;
-        let out = f(&mut tx).map_err(backend_error)?;
+        // See `with_client_read`: the escape outranks the callback's own error.
+        let out = f(&mut tx);
         require_same_transaction(&mut tx, &witness)?;
+        let out = out.map_err(backend_error)?;
         tx.commit().map_err(backend_error)?;
         Ok(out)
     }
@@ -261,17 +267,28 @@ struct TransactionWitness {
 /// Transaction-control SQL sent by the callback ends the fence-checked transaction.
 /// Later statements commit in autocommit without a fence, and `Transaction::commit`
 /// still reports success because `COMMIT` outside a transaction block is a warning.
+/// The server rejects every statement in an aborted transaction. A callback that had
+/// ended the transaction would leave the connection in autocommit, where these checks
+/// run normally, so this error proves the original block is still open and no statement
+/// escaped it. Reporting it would replace the callback's own diagnosis with
+/// "current transaction is aborted".
+fn transaction_block_still_open(error: &postgres::Error) -> bool {
+    error.code() == Some(&postgres::error::SqlState::IN_FAILED_SQL_TRANSACTION)
+}
+
 fn require_same_transaction(
     tx: &mut postgres::Transaction<'_>,
     witness: &TransactionWitness,
 ) -> Result<(), StoreError> {
-    let row = tx
-        .query_one(
-            "SELECT pg_current_xact_id_if_assigned()::text, \
-                    (SELECT epoch FROM cortexkit_lease WHERE lease_key = $1)",
-            &[&witness.lease_key],
-        )
-        .map_err(backend_error)?;
+    let row = match tx.query_one(
+        "SELECT pg_current_xact_id_if_assigned()::text, \
+                (SELECT epoch FROM cortexkit_lease WHERE lease_key = $1)",
+        &[&witness.lease_key],
+    ) {
+        Ok(row) => row,
+        Err(error) if transaction_block_still_open(&error) => return Ok(()),
+        Err(error) => return Err(backend_error(error)),
+    };
     let current: Option<String> = row.get(0);
     if current.as_deref() != Some(witness.xact_id.as_str()) {
         return Err(StoreError::Backend(
@@ -297,10 +314,11 @@ fn require_same_transaction(
 /// `transaction_read_only` reverts to the session default once the started transaction
 /// ends, so an implicit read-write transaction reports `off` here.
 fn require_read_only_transaction(tx: &mut postgres::Transaction<'_>) -> Result<(), StoreError> {
-    let read_only: String = tx
-        .query_one("SHOW transaction_read_only", &[])
-        .map_err(backend_error)?
-        .get(0);
+    let read_only: String = match tx.query_one("SHOW transaction_read_only", &[]) {
+        Ok(row) => row.get(0),
+        Err(error) if transaction_block_still_open(&error) => return Ok(()),
+        Err(error) => return Err(backend_error(error)),
+    };
     if read_only == "on" {
         return Ok(());
     }
@@ -504,17 +522,20 @@ fn run_migrations(
         }
         let mut tx = client.transaction().map_err(migration_error)?;
         let witness = check_fence(&mut tx, lease_key, holder_epoch)?;
-        tx.batch_execute(m.statements).map_err(|e| {
-            StoreError::Migration(format!(
-                "namespace '{namespace}' migration {}: {}",
-                m.version,
-                db_message(&e)
-            ))
-        })?;
+        // See `with_client_read`: a migration that escapes and then fails must report the
+        // escape, so the statement error is held until the transaction is validated.
+        let applied = tx.batch_execute(m.statements);
         require_same_transaction(&mut tx, &witness).map_err(|e| {
             StoreError::Migration(format!(
                 "namespace '{namespace}' migration {}: {e}",
                 m.version
+            ))
+        })?;
+        applied.map_err(|e| {
+            StoreError::Migration(format!(
+                "namespace '{namespace}' migration {}: {}",
+                m.version,
+                db_message(&e)
             ))
         })?;
         tx.execute(
@@ -665,6 +686,109 @@ mod tests {
         assert_eq!(recorded, 0, "the rejected migration recorded no version");
 
         let _ = store.with_client_unfenced(|c| c.batch_execute(&format!("DROP TABLE {table}")));
+    }
+
+    #[test]
+    fn a_failing_callback_cannot_hide_an_escape() {
+        let Some(dsn) = test_dsn() else {
+            return;
+        };
+        let ns = unique_ns("erresc");
+        let d = descriptor(&dsn, &ns);
+        let store = open_postgres(&d).expect("open");
+        let table = format!("erresc_{ns}");
+        store
+            .with_client_unfenced(|c| c.batch_execute(&format!("CREATE TABLE {table} (v int)")))
+            .expect("create");
+
+        // The callback escapes, writes, and only then fails. The escape is the durable
+        // effect, so it outranks the callback's own error in the report.
+        let fenced = store.with_client_fenced(|tx| {
+            tx.batch_execute(&format!("COMMIT; INSERT INTO {table} (v) VALUES (1)"))?;
+            tx.batch_execute("SELECT 1 / 0")?;
+            Ok(())
+        });
+        assert!(
+            matches!(&fenced, Err(StoreError::Backend(m)) if m.contains("ended the fence-checked transaction")),
+            "the escape is reported even though the callback returned an error, got {fenced:?}"
+        );
+
+        let read = store.with_client_read(|tx| {
+            tx.batch_execute(&format!("COMMIT; INSERT INTO {table} (v) VALUES (2)"))?;
+            tx.batch_execute("SELECT 1 / 0")?;
+            Ok(())
+        });
+        assert!(
+            matches!(&read, Err(StoreError::Backend(m)) if m.contains("no longer read-only")),
+            "the read escape is reported even though the callback returned an error, got {read:?}"
+        );
+
+        // A migration that escapes and then fails reports the escape, and records no version.
+        let migrated = store.migrate(
+            &ns,
+            &[Migration {
+                version: 1,
+                statements: "COMMIT; SELECT 1 / 0;",
+            }],
+        );
+        assert!(
+            matches!(&migrated, Err(StoreError::Migration(m)) if m.contains("ended the fence-checked transaction")),
+            "the migration escape is reported ahead of its statement error, got {migrated:?}"
+        );
+        let recorded: i64 = store
+            .with_client_read(|c| {
+                Ok(c.query_one(
+                    "SELECT COUNT(*) FROM cortexkit_schema_version WHERE namespace = $1",
+                    &[&ns],
+                )?
+                .get(0))
+            })
+            .expect("count");
+        assert_eq!(recorded, 0, "the rejected migration recorded no version");
+
+        let _ = store.with_client_unfenced(|c| c.batch_execute(&format!("DROP TABLE {table}")));
+    }
+
+    #[test]
+    fn a_failing_callback_that_stays_inside_reports_its_own_error() {
+        let Some(dsn) = test_dsn() else {
+            return;
+        };
+        let ns = unique_ns("errkeep");
+        let d = descriptor(&dsn, &ns);
+        let store = open_postgres(&d).expect("open");
+
+        // A callback that fails without escaping leaves an aborted transaction. Checking
+        // for an escape must not run a query that the abort rejects, or the callback's
+        // own diagnosis is replaced by "current transaction is aborted".
+        let fenced = store.with_client_fenced(|tx| {
+            tx.batch_execute("SELECT 1 / 0")?;
+            Ok(())
+        });
+        assert!(
+            matches!(&fenced, Err(StoreError::Backend(m))
+                if m.contains("division by zero") && !m.contains("aborted")),
+            "the callback's own error survives an aborted transaction, got {fenced:?}"
+        );
+
+        let read = store.with_client_read(|tx| {
+            tx.batch_execute("SELECT 1 / 0")?;
+            Ok(())
+        });
+        assert!(
+            matches!(&read, Err(StoreError::Backend(m))
+                if m.contains("division by zero") && !m.contains("aborted")),
+            "the read callback's own error survives an aborted transaction, got {read:?}"
+        );
+
+        // The store is still usable after both aborted transactions.
+        let alive: i32 = store
+            .with_client_read(|c| Ok(c.query_one("SELECT 1", &[])?.get(0)))
+            .expect("read after abort");
+        assert_eq!(
+            alive, 1,
+            "the connection recovers after an aborted callback"
+        );
     }
 
     #[test]
