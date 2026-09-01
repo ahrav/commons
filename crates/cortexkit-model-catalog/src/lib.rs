@@ -17,10 +17,21 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-/// Stores a rate in integer nanodollars per million tokens.
+/// Stores a non-negative rate measured in nanodollars (10^-9 USD) per million tokens.
 ///
 /// `$3` per million tokens is `3_000_000_000` nanodollars per million tokens.
-pub type RateNanosPerMtok = i64;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NanodollarsPerMillionTokens(i64);
+
+impl NanodollarsPerMillionTokens {
+    pub fn new(nanodollars: i64) -> Option<Self> {
+        (nanodollars >= 0).then_some(Self(nanodollars))
+    }
+
+    pub const fn nanodollars_per_million_tokens(self) -> i64 {
+        self.0
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CatalogParseError {
@@ -133,13 +144,13 @@ pub struct Limits {
 /// `None` = the catalog did not state a rate — NOT the same as zero (free).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct CostSchedule {
-    pub input: Option<RateNanosPerMtok>,
-    pub output: Option<RateNanosPerMtok>,
-    pub cache_read: Option<RateNanosPerMtok>,
-    pub cache_write: Option<RateNanosPerMtok>,
-    pub reasoning: Option<RateNanosPerMtok>,
-    pub input_audio: Option<RateNanosPerMtok>,
-    pub output_audio: Option<RateNanosPerMtok>,
+    pub input: Option<NanodollarsPerMillionTokens>,
+    pub output: Option<NanodollarsPerMillionTokens>,
+    pub cache_read: Option<NanodollarsPerMillionTokens>,
+    pub cache_write: Option<NanodollarsPerMillionTokens>,
+    pub reasoning: Option<NanodollarsPerMillionTokens>,
+    pub input_audio: Option<NanodollarsPerMillionTokens>,
+    pub output_audio: Option<NanodollarsPerMillionTokens>,
     /// Context-size pricing tiers, ascending by `min_context`. Empty = flat.
     pub tiers: Vec<CostTier>,
 }
@@ -148,10 +159,10 @@ pub struct CostSchedule {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct CostTier {
     pub min_context: u64,
-    pub input: Option<RateNanosPerMtok>,
-    pub output: Option<RateNanosPerMtok>,
-    pub cache_read: Option<RateNanosPerMtok>,
-    pub cache_write: Option<RateNanosPerMtok>,
+    pub input: Option<NanodollarsPerMillionTokens>,
+    pub output: Option<NanodollarsPerMillionTokens>,
+    pub cache_read: Option<NanodollarsPerMillionTokens>,
+    pub cache_write: Option<NanodollarsPerMillionTokens>,
 }
 
 impl CatalogDoc {
@@ -251,40 +262,30 @@ fn parse_cost(
     model: &str,
     cost: &Value,
 ) -> Result<CostSchedule, CatalogParseError> {
-    let convert = |field: &'static str, v: &Value| -> Result<RateNanosPerMtok, CatalogParseError> {
-        let nanos = dollars_to_nanos(v).map_err(|value| CatalogParseError::InexactRate {
-            provider: provider.to_string(),
-            model: model.to_string(),
-            field,
-            value,
-        })?;
-        if nanos < 0 {
-            return Err(CatalogParseError::NegativeRate {
+    let convert = |field: &'static str, v: &Value| {
+        let nanodollars =
+            dollars_to_nanodollars(v).map_err(|value| CatalogParseError::InexactRate {
+                provider: provider.to_string(),
+                model: model.to_string(),
+                field,
+                value,
+            })?;
+        NanodollarsPerMillionTokens::new(nanodollars).ok_or_else(|| {
+            CatalogParseError::NegativeRate {
                 provider: provider.to_string(),
                 model: model.to_string(),
                 field,
                 value: v.to_string(),
-            });
-        }
-        Ok(nanos)
+            }
+        })
     };
-    let rate = |field: &'static str| -> Result<Option<RateNanosPerMtok>, CatalogParseError> {
-        match cost.get(field) {
-            None | Some(Value::Null) => Ok(None),
-            Some(v) => convert(field, v).map(Some),
-        }
+    let rate = |source: &Value, field: &'static str| match source.get(field) {
+        None | Some(Value::Null) => Ok(None),
+        Some(v) => convert(field, v).map(Some),
     };
     let mut tiers = Vec::new();
     if let Some(list) = cost.get("tiers").and_then(Value::as_array) {
         for tier in list {
-            let trate =
-                |field: &'static str| -> Result<Option<RateNanosPerMtok>, CatalogParseError> {
-                    match tier.get(field) {
-                        None | Some(Value::Null) => Ok(None),
-                        Some(v) => convert(field, v).map(Some),
-                    }
-                };
-
             let tier_err = || CatalogParseError::MissingTierThreshold {
                 provider: provider.to_string(),
                 model: model.to_string(),
@@ -300,22 +301,22 @@ fn parse_cost(
                 .ok_or_else(tier_err)?;
             tiers.push(CostTier {
                 min_context,
-                input: trate("input")?,
-                output: trate("output")?,
-                cache_read: trate("cache_read")?,
-                cache_write: trate("cache_write")?,
+                input: rate(tier, "input")?,
+                output: rate(tier, "output")?,
+                cache_read: rate(tier, "cache_read")?,
+                cache_write: rate(tier, "cache_write")?,
             });
         }
         tiers.sort_by_key(|t| t.min_context);
     }
     Ok(CostSchedule {
-        input: rate("input")?,
-        output: rate("output")?,
-        cache_read: rate("cache_read")?,
-        cache_write: rate("cache_write")?,
-        reasoning: rate("reasoning")?,
-        input_audio: rate("input_audio")?,
-        output_audio: rate("output_audio")?,
+        input: rate(cost, "input")?,
+        output: rate(cost, "output")?,
+        cache_read: rate(cost, "cache_read")?,
+        cache_write: rate(cost, "cache_write")?,
+        reasoning: rate(cost, "reasoning")?,
+        input_audio: rate(cost, "input_audio")?,
+        output_audio: rate(cost, "output_audio")?,
         tiers,
     })
 }
@@ -330,12 +331,12 @@ fn parse_cost(
 /// The one dangerous case stays a loud error: a NONZERO rate that would
 /// round to ZERO (e.g. `1e-10`) is rejected — rounding it would fabricate a
 /// free model, the exact silent-$0 the fleet's money rules ban.
-fn dollars_to_nanos(v: &Value) -> Result<RateNanosPerMtok, String> {
+fn dollars_to_nanodollars(v: &Value) -> Result<i64, String> {
     let n = v.as_number().ok_or_else(|| v.to_string())?;
-    decimal_str_to_nanos(&n.to_string()).ok_or_else(|| n.to_string())
+    decimal_str_to_nanodollars(&n.to_string()).ok_or_else(|| n.to_string())
 }
 
-fn decimal_str_to_nanos(s: &str) -> Option<RateNanosPerMtok> {
+fn decimal_str_to_nanodollars(s: &str) -> Option<i64> {
     // Split off an exponent (serde prints e.g. 1e-7 for tiny rates).
     let (mantissa, exp) = match s.find(['e', 'E']) {
         Some(idx) => {
@@ -373,9 +374,6 @@ fn decimal_str_to_nanos(s: &str) -> Option<RateNanosPerMtok> {
         value.checked_mul(10i128.checked_pow(shift as u32)?)?
     } else {
         // Sub-nanodollar digits: round half-even at the money resolution.
-        // Upstream float artifacts ("0.8299999999999998") land here; the
-        // error is < 0.5 nano per Mtok. A NONZERO value rounding to ZERO is
-        // refused — that would fabricate a free model from a real price.
         let divisor = 10i128.checked_pow((-shift) as u32)?;
         let quot = value / divisor;
         let rem = value % divisor;
@@ -400,29 +398,47 @@ fn decimal_str_to_nanos(s: &str) -> Option<RateNanosPerMtok> {
         rounded
     };
     let scaled = if negative { -scaled } else { scaled };
-    RateNanosPerMtok::try_from(scaled).ok()
+    i64::try_from(scaled).ok()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn rate(nanodollars_per_million_tokens: i64) -> NanodollarsPerMillionTokens {
+        NanodollarsPerMillionTokens::new(nanodollars_per_million_tokens).unwrap()
+    }
+
+    #[test]
+    fn rate_construction_rejects_negatives() {
+        assert_eq!(NanodollarsPerMillionTokens::new(-1), None);
+        assert_eq!(rate(0).nanodollars_per_million_tokens(), 0);
+    }
+
+    #[test]
+    fn rate_accessor_preserves_nanodollars_per_million_tokens() {
+        assert_eq!(
+            rate(3_000_000_000).nanodollars_per_million_tokens(),
+            3_000_000_000
+        );
+    }
+
     #[test]
     fn decimal_scaling_is_exact() {
-        assert_eq!(decimal_str_to_nanos("3"), Some(3_000_000_000));
-        assert_eq!(decimal_str_to_nanos("3.75"), Some(3_750_000_000));
-        assert_eq!(decimal_str_to_nanos("0.3"), Some(300_000_000));
+        assert_eq!(decimal_str_to_nanodollars("3"), Some(3_000_000_000));
+        assert_eq!(decimal_str_to_nanodollars("3.75"), Some(3_750_000_000));
+        assert_eq!(decimal_str_to_nanodollars("0.3"), Some(300_000_000));
         // The classic float trap: 0.1 + 0.2 style artifacts cannot arise —
         // "0.07" scales as digits, not as a binary float.
-        assert_eq!(decimal_str_to_nanos("0.07"), Some(70_000_000));
-        assert_eq!(decimal_str_to_nanos("0"), Some(0));
+        assert_eq!(decimal_str_to_nanodollars("0.07"), Some(70_000_000));
+        assert_eq!(decimal_str_to_nanodollars("0"), Some(0));
         // Exponent forms (serde prints tiny rates this way).
-        assert_eq!(decimal_str_to_nanos("1e-7"), Some(100));
-        assert_eq!(decimal_str_to_nanos("2.5e-3"), Some(2_500_000));
+        assert_eq!(decimal_str_to_nanodollars("1e-7"), Some(100));
+        assert_eq!(decimal_str_to_nanodollars("2.5e-3"), Some(2_500_000));
         // A nonzero rate that would round to ZERO stays an ERROR — rounding
         // it would fabricate a free model from a real price.
-        assert_eq!(decimal_str_to_nanos("1e-10"), None);
-        assert_eq!(decimal_str_to_nanos("0.0000000001"), None);
+        assert_eq!(decimal_str_to_nanodollars("1e-10"), None);
+        assert_eq!(decimal_str_to_nanodollars("0.0000000001"), None);
     }
 
     #[test]
@@ -430,22 +446,22 @@ mod tests {
         // Real models.dev data: IEEE-754 shortest-roundtrip artifacts from
         // the upstream pipeline. The intended decimal is recovered exactly.
         assert_eq!(
-            decimal_str_to_nanos("0.8299999999999998"),
+            decimal_str_to_nanodollars("0.8299999999999998"),
             Some(830_000_000)
         );
         assert_eq!(
-            decimal_str_to_nanos("1.7999999999999998"),
+            decimal_str_to_nanodollars("1.7999999999999998"),
             Some(1_800_000_000)
         );
         assert_eq!(
-            decimal_str_to_nanos("0.49299999999999994"),
+            decimal_str_to_nanodollars("0.49299999999999994"),
             Some(493_000_000)
         );
         // Half-even at the boundary digit: 10 fractional digits ...5 exact.
-        assert_eq!(decimal_str_to_nanos("0.0000000015"), Some(2)); // 1.5 → 2 (even)
-        assert_eq!(decimal_str_to_nanos("0.0000000025"), Some(2)); // 2.5 → 2 (even)
-                                                                   // True zero stays zero (zero is not "rounded to zero").
-        assert_eq!(decimal_str_to_nanos("0.0000000000"), Some(0));
+        assert_eq!(decimal_str_to_nanodollars("0.0000000015"), Some(2)); // 1.5 → 2 (even)
+        assert_eq!(decimal_str_to_nanodollars("0.0000000025"), Some(2)); // 2.5 → 2 (even)
+                                                                         // True zero stays zero (zero is not "rounded to zero").
+        assert_eq!(decimal_str_to_nanodollars("0.0000000000"), Some(0));
     }
 
     #[test]
@@ -455,11 +471,11 @@ mod tests {
         // i128::MAX/2 — rem*2 would wrap without the checked multiply (debug:
         // panic; release: a wrapped compare). Must be a loud None instead.
         let s = "0.00000000086000000000000000000000000000000000000";
-        assert_eq!(decimal_str_to_nanos(s), None);
+        assert_eq!(decimal_str_to_nanodollars(s), None);
         // Sane long-fraction values still round normally (no overreach): 29
         // sub-nano digits with a small significand stay in checked range.
         assert_eq!(
-            decimal_str_to_nanos("0.99999999999999999999999999999999999999"),
+            decimal_str_to_nanodollars("0.99999999999999999999999999999999999999"),
             Some(1_000_000_000)
         );
     }
@@ -505,10 +521,10 @@ mod tests {
         assert_eq!(provider.name.as_deref(), Some("Anthropic"));
         assert!(model.capabilities.reasoning);
         assert_eq!(model.limits.context, Some(200_000));
-        assert_eq!(model.cost.input, Some(3_000_000_000));
-        assert_eq!(model.cost.output, Some(15_000_000_000));
-        assert_eq!(model.cost.cache_read, Some(300_000_000));
-        assert_eq!(model.cost.cache_write, Some(3_750_000_000));
+        assert_eq!(model.cost.input, Some(rate(3_000_000_000)));
+        assert_eq!(model.cost.output, Some(rate(15_000_000_000)));
+        assert_eq!(model.cost.cache_read, Some(rate(300_000_000)));
+        assert_eq!(model.cost.cache_write, Some(rate(3_750_000_000)));
         // No published reasoning rate: None, NOT zero.
         assert_eq!(model.cost.reasoning, None);
     }
@@ -522,12 +538,23 @@ mod tests {
     }
 
     #[test]
+    fn parse_distinguishes_explicit_zero_from_absent_rate() {
+        let doc =
+            CatalogDoc::parse(r#"{ "p": { "models": { "m": { "cost": { "input": 0 } } } } }"#)
+                .unwrap();
+        let (_, model) = doc.model("p", "m").unwrap();
+
+        assert_eq!(model.cost.input, Some(rate(0)));
+        assert_eq!(model.cost.output, None);
+    }
+
+    #[test]
     fn tiers_parse_sorted() {
         let doc = CatalogDoc::parse(snapshot()).unwrap();
         let (_, model) = doc.model("somehost", "tiered").unwrap();
         assert_eq!(model.cost.tiers.len(), 1);
         assert_eq!(model.cost.tiers[0].min_context, 200_000);
-        assert_eq!(model.cost.tiers[0].input, Some(2_500_000_000));
+        assert_eq!(model.cost.tiers[0].input, Some(rate(2_500_000_000)));
     }
 
     /// Thresholds use `tier.tier.size`; missing thresholds must not default to zero.
