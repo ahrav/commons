@@ -133,7 +133,7 @@ Supporting artifacts:
 - **Check:** Around each forced post-lock failure, `always(after_epoch_bytes parse to a value >= before_epoch)`. This checks durable state, not only that the lock was released.
 - **Fault/timing angle:** `ENOSPC`, `EDQUOT`, or returned `EIO` after a positive write prefix. Non-returning termination and power loss belong to crash recovery, not this property.
 - **Required faults and enabling state:** A prior nonzero epoch and an injected error after positive progress, with acquisition returning `Err`.
-- **Confidence:** `interrupted_persist_never_leaves_a_lower_parseable_epoch` exercises the helper's padding and fixed-width write order, but it does not prove exact `File` behavior under a real device error.
+- **Confidence:** `interrupted_persist_never_leaves_a_lower_parseable_epoch` exercises the helper's padding and fixed-width write order for legacy-width and canonical-width prior states and asserts how many prefixes stay parseable, but it does not prove exact `File` behavior under a real device error.
 - **Existing check:** `interrupted_persist_never_leaves_a_lower_parseable_epoch`; status **unaudited**.
 - **Impact:** A transient storage error turns into permanent fence regression.
 - **Open questions:** Which real filesystem fault mechanism can exercise the same positive-prefix error through `File` without adding a production failpoint?

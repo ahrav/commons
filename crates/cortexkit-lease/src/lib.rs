@@ -205,7 +205,14 @@ impl std::fmt::Display for LeaseError {
     }
 }
 
-impl std::error::Error for LeaseError {}
+impl std::error::Error for LeaseError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            LeaseError::Held { .. } => None,
+            LeaseError::Io(e) => Some(e),
+        }
+    }
+}
 
 pub trait LeaseStore: Send + Sync {
     /// Dropping [`LeaseHandle`] releases exclusive ownership.
@@ -339,17 +346,53 @@ fn invalid_epoch(message: impl Into<String>) -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::InvalidData, message.into())
 }
 
+/// Adds path and operation context to an epoch failure without erasing it.
+///
+/// `std::io::Error::new(kind, String)` discards the original error payload.
+/// `raw_os_error()` then returns `None` and the source chain ends there.
+/// Holding the original error and reporting it through
+/// [`std::error::Error::source`] keeps the errno reachable, which lets a caller
+/// separate `ENOSPC` from `EDQUOT` and apply fault-specific handling.
+#[derive(Debug)]
+struct EpochError {
+    path: PathBuf,
+    operation: &'static str,
+    source: std::io::Error,
+}
+
+impl std::fmt::Display for EpochError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "failed to {} lease epoch at {}: {}",
+            self.operation,
+            self.path.display(),
+            self.source
+        )
+    }
+}
+
+impl std::error::Error for EpochError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
 fn epoch_path_error(
     path: &std::path::Path,
-    operation: &str,
+    operation: &'static str,
     error: std::io::Error,
 ) -> std::io::Error {
+    // `std::io::Error`'s own `source` forwards to the payload's `source`. The
+    // original error is reachable only because `EpochError` reports it.
+    let kind = error.kind();
     std::io::Error::new(
-        error.kind(),
-        format!(
-            "failed to {operation} lease epoch at {}: {error}",
-            path.display()
-        ),
+        kind,
+        EpochError {
+            path: path.to_path_buf(),
+            operation,
+            source: error,
+        },
     )
 }
 
@@ -372,10 +415,16 @@ fn read_epoch(file: &mut (impl Read + Seek)) -> std::io::Result<u64> {
             "lease epoch is not an unsigned decimal integer",
         ));
     }
-    std::str::from_utf8(&bytes)
-        .map_err(|_| invalid_epoch("lease epoch is not an unsigned decimal integer"))?
-        .parse()
-        .map_err(|_| invalid_epoch("lease epoch is outside the u64 range"))
+    // Every byte is an ASCII digit, so accumulate directly. A `str` hop would
+    // add an unreachable UTF-8 error arm that no input can exercise.
+    bytes
+        .iter()
+        .try_fold(0u64, |accumulated, digit| {
+            accumulated
+                .checked_mul(10)?
+                .checked_add(u64::from(digit - b'0'))
+        })
+        .ok_or_else(|| invalid_epoch("lease epoch is outside the u64 range"))
 }
 
 /// The caller holds the exclusive lock while this function updates the epoch above persisted state and `epoch_floor`.
@@ -504,6 +553,9 @@ mod tests {
         use std::sync::{mpsc, Arc, Barrier, Condvar, Mutex};
 
         const HOLDERS: usize = 8;
+        // libtest has no per-test timeout, so an unbounded wait turns a worker
+        // that dies before reporting into a hung suite with no diagnostics.
+        const WAIT_LIMIT: std::time::Duration = std::time::Duration::from_secs(30);
         let (store, _dir) = tmp_store();
         let store = Arc::new(store);
         let start = Arc::new(Barrier::new(HOLDERS + 1));
@@ -528,16 +580,22 @@ mod tests {
                 .expect("report acquisition");
                 if result.is_ok() {
                     let (released, wake) = &*release;
-                    let mut released = released.lock().expect("lock release flag");
-                    while !*released {
-                        released = wake.wait(released).expect("wait for release");
-                    }
+                    let (_guard, timeout) = wake
+                        .wait_timeout_while(
+                            released.lock().expect("lock release flag"),
+                            WAIT_LIMIT,
+                            |released| !*released,
+                        )
+                        .expect("wait for release");
+                    assert!(!timeout.timed_out(), "release signal timed out");
                 }
             }));
         }
         drop(tx);
         start.wait();
-        let results: Vec<_> = rx.iter().take(HOLDERS).collect();
+        let results: Vec<_> = (0..HOLDERS)
+            .map(|_| rx.recv_timeout(WAIT_LIMIT).expect("shared holder report"))
+            .collect();
         {
             let (released, wake) = &*release;
             *released.lock().expect("lock release flag") = true;
@@ -616,6 +674,34 @@ mod tests {
     }
 
     #[test]
+    fn epoch_errors_keep_the_underlying_os_error() {
+        let errno = 28;
+        let path = std::path::Path::new("/leases/scope.lease");
+        let source = std::io::Error::from_raw_os_error(errno);
+        let kind = source.kind();
+        let message = source.to_string();
+
+        let wrapped = epoch_path_error(path, "bump", source);
+
+        assert_eq!(wrapped.kind(), kind);
+        assert_eq!(
+            wrapped.to_string(),
+            format!("failed to bump lease epoch at /leases/scope.lease: {message}")
+        );
+
+        // A caller that reads only the outer error sees no errno. The original
+        // error has to stay reachable through `source`.
+        assert_eq!(wrapped.raw_os_error(), None);
+
+        let error = LeaseError::Io(wrapped);
+        let underlying = std::error::Error::source(&error)
+            .and_then(std::error::Error::source)
+            .and_then(|source| source.downcast_ref::<std::io::Error>())
+            .expect("original io::Error reachable from LeaseError");
+        assert_eq!(underlying.raw_os_error(), Some(errno));
+    }
+
+    #[test]
     fn maximum_epoch_is_readable_but_exhausted() {
         let (store, _dir) = tmp_store();
         let k = key("maximum");
@@ -677,25 +763,82 @@ mod tests {
         }
 
         // This models ordered prefix writes only, not File, device, or power-loss behavior.
-        let total_write_len = (EPOCH_WIDTH - 2) + EPOCH_WIDTH;
-        for limit in 0..total_write_len {
-            let mut writer = ShortWriter {
-                inner: std::io::Cursor::new(b"41".to_vec()),
-                remaining: limit,
-            };
-            persist_epoch(&mut writer, 42).expect_err("short write must fail");
-            if let Ok(parsed) = read_epoch(&mut writer) {
-                assert!(parsed >= 41, "prefix write rolled epoch back");
-            }
+        struct Case {
+            seed: &'static [u8],
+            previous: u64,
+            next: u64,
+            expected_bytes: &'static [u8],
+            /// Counts parseable short-write states so the monotonicity assertion
+            /// cannot pass vacuously.
+            expected_parseable: usize,
         }
 
-        let mut writer = ShortWriter {
-            inner: std::io::Cursor::new(b"41".to_vec()),
-            remaining: total_write_len,
-        };
-        persist_epoch(&mut writer, 42).expect("complete write");
-        assert_eq!(read_epoch(&mut writer).expect("read complete epoch"), 42);
-        assert_eq!(writer.inner.into_inner(), b"00000000000000000042");
+        let cases = [
+            Case {
+                seed: b"41",
+                previous: 41,
+                next: 42,
+                expected_bytes: b"00000000000000000042",
+                expected_parseable: 1,
+            },
+            Case {
+                seed: b"99",
+                previous: 99,
+                next: 100,
+                expected_bytes: b"00000000000000000100",
+                expected_parseable: 1,
+            },
+            Case {
+                seed: b"00000000000000000041",
+                previous: 41,
+                next: 42,
+                expected_bytes: b"00000000000000000042",
+                expected_parseable: EPOCH_WIDTH,
+            },
+            Case {
+                seed: b"00000000000000000099",
+                previous: 99,
+                next: 100,
+                expected_bytes: b"00000000000000000100",
+                expected_parseable: EPOCH_WIDTH,
+            },
+        ];
+
+        for case in cases {
+            let total_write_len = (EPOCH_WIDTH - case.seed.len()) + EPOCH_WIDTH;
+            let mut parseable = 0usize;
+            for limit in 0..total_write_len {
+                let mut writer = ShortWriter {
+                    inner: std::io::Cursor::new(case.seed.to_vec()),
+                    remaining: limit,
+                };
+                persist_epoch(&mut writer, case.next).expect_err("short write must fail");
+                if let Ok(parsed) = read_epoch(&mut writer) {
+                    parseable += 1;
+                    assert!(
+                        parsed >= case.previous,
+                        "prefix write rolled epoch back: seed {:?}, limit {limit}, parsed {parsed}",
+                        case.seed
+                    );
+                }
+            }
+            assert_eq!(
+                parseable, case.expected_parseable,
+                "prefix-write oracle observed {parseable} parseable states for seed {:?}, expected {}",
+                case.seed, case.expected_parseable
+            );
+
+            let mut writer = ShortWriter {
+                inner: std::io::Cursor::new(case.seed.to_vec()),
+                remaining: total_write_len,
+            };
+            persist_epoch(&mut writer, case.next).expect("complete write");
+            assert_eq!(
+                read_epoch(&mut writer).expect("read complete epoch"),
+                case.next
+            );
+            assert_eq!(writer.inner.into_inner(), case.expected_bytes);
+        }
     }
 
     #[cfg(unix)]
