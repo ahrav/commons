@@ -4,43 +4,45 @@ All statuses are **unaudited**. Test adequacy belongs to `/testing:invariant-tes
 
 ## Production checks and guards
 
-No production `assert!`, `debug_assert!`, `panic!`, or equivalent invariant battery exists in `src/lib.rs:1-359`.
+No production `assert!`, `debug_assert!`, `panic!`, or equivalent invariant battery exists in `src/lib.rs:1-407`.
 
 | Location | Check or branch | Semantics/message | Linked claims |
 |---|---|---|---|
-| `src/lib.rs:62-66` | `symlink_metadata` errors | Missing path returns `Ok`; other metadata errors propagate. | Optional sidecars may be absent. |
-| `src/lib.rs:67-75` | Non-regular-file refusal | `InvalidInput`: “is not a regular file; refusing to change its permissions”. | Symlinks and other non-files are refused. |
-| `src/lib.rs:76-78` | Mode normalization | If low permission bits differ, set `0600`. | Unix owner-only file. |
-| `src/lib.rs:80-82` | Non-Unix branch | Returns `Ok` without checking or changing the path. | Platform contract remains open. |
-| `src/lib.rs:240-254` | Directory/open/protect error propagation | Maps failures to `LeaseError::Io`; uses `truncate(false)`. | Preserve epoch on open; harden every acquisition. |
-| `src/lib.rs:256-263` | Exclusive try-lock classification | Standard-library `File::try_lock`; `TryLockError::WouldBlock` becomes `Held`, while `TryLockError::Error` becomes `Io`. | Exclusive liveness gate and error taxonomy. |
-| `src/lib.rs:265-269` | Epoch-bump error cleanup | Best-effort standard-library `File::unlock`, then `Io`. | Failed acquisition does not leak lock; state restoration is absent. |
-| `src/lib.rs:278-287` | Shared directory/open/protect propagation | Same as exclusive path. | Shared reader setup. |
-| `src/lib.rs:293-299` | Shared try-lock classification | Standard-library `File::try_lock_shared`; `TryLockError::WouldBlock` becomes `Held`, while `TryLockError::Error` becomes `Io`. | Shared/exclusive matrix. |
-| `src/lib.rs:301-306` | Epoch-read error cleanup | Best-effort standard-library `File::unlock`, then `Io`. | Read failure does not leak lock. |
-| `src/lib.rs:233-236` | Handle `Drop` | Best-effort standard-library `File::unlock`; error discarded; descriptor then closes. | Drop releases lease. |
-| `src/lib.rs:319-324` | Epoch parse on shared path | Any valid-UTF-8 parse failure becomes zero. | New/empty file reads as zero; corruption is not guarded. |
-| `src/lib.rs:328-339` | Epoch update | Parse-or-zero, saturating increment, truncate, write, flush. | Monotonic persisted epoch; overflow and interruption are unguarded. |
-| `src/lib.rs:112-123,204-210,341-358` | Identity/path derivation | Public separator-joined identity and FNV functions feed the private `.lease` path helper. | Stable namespaced identity. |
-| `src/lib.rs:134,168` | Trait bounds | Handles and stores are `Send + Sync`. | Cross-thread use compiles. |
+| `protect_file` (`src/lib.rs:35-54`) | Public path hardening | Unix `symlink_metadata` rejects non-regular paths; missing paths return `Ok`; `set_permissions` is path-based and does not open caller-owned files. | Static symlinks are not followed on Unix; trusted parent-directory ownership is a caller precondition. |
+| `protect_open_file` (`src/lib.rs:56-77`) | Descriptor-relative lease-file checks | Non-regular descriptors return `InvalidInput`; Unix regular files are set to `0600`; Windows reparse points are rejected. | Lease acquisition validates and hardens its owned descriptor. |
+| `lease_open_options`, `open_lease_file` (`src/lib.rs:89-143`) | Lease-file publication/open | Opens an existing final path first. On `NotFound`, it initializes a same-directory temporary inode to epoch zero and publishes with `persist_noclobber`; an `AlreadyExists` race reopens the winner within three attempts. | No empty final pathname is published; links, FIFOs, and reparse points fail closed. |
+| `LeaseStore::acquire` (`src/lib.rs:273-296`) | Exclusive acquisition | Uses `try_lock`, classifies contention, and increments a validated epoch. | Exclusive liveness gate and error taxonomy. |
+| `LeaseStore::acquire_shared` (`src/lib.rs:298-320`) | Shared acquisition | Uses `try_lock_shared` and reads without mutation. | Concurrent shared-first acquisition and exclusion matrix. |
+| `FileLeaseHandle::drop` (`src/lib.rs:267-269`) | Handle `Drop` | Best-effort `File::unlock`; error discarded; descriptor then closes. | Drop releases lease. |
+| `read_epoch` (`src/lib.rs:342-370`) | Bounded epoch parse | Reads at most 21 bytes into a bounded vector; existing empty state and anything except 1-20 ASCII digits in `u64` range are rejected. | Malformed, empty, oversized, and overflowing state fails closed. |
+| `bump_epoch`, `persist_epoch` (`src/lib.rs:373-393`) | Epoch update | Checked increment; no truncate; fixed-width decimal overwrite with invalid-marker conversion only for 1-19 byte legacy states. | Exhaustion errors; ordered prefix writes cannot leave a lower parseable value in the injected model. |
+| `LeaseKey::identity`, `FileLeaseStore::lease_path`, `fnv1a`, `fnv1a_hex` | Identity/path derivation | Public separator-joined identity and FNV functions feed the private `.lease` path helper. | Stable namespaced identity. |
+| `LeaseHandle`, `LeaseStore` | Trait bounds | Handles and stores are `Send + Sync`. | Cross-thread use compiles. |
 
-## In-crate claim-bearing tests (13)
+## In-crate claim-bearing tests (20)
 
 | Test | Location | Claim and exact oracle | Platform | Status |
 |---|---|---|---|---|
-| `an_acquired_lease_file_is_owner_only` | `src/lib.rs:398-424` | `mode == 0600`; message: lease stayed group/world writable. | Unix | unaudited |
-| `protect_file_refuses_a_symlink_and_leaves_its_target_untouched` | `src/lib.rs:435-466` | `protect_file` errors and target remains `0644`; messages cover refusal and target chmod. | Unix | unaudited |
-| `protect_file_ignores_a_missing_path` | `src/lib.rs:473-480` | Missing path returns `Ok`. | All; trivial on non-Unix | unaudited |
-| `identity_hash_derivation_is_stable` | `src/lib.rs:482-488` | Pins one public identity string and its exact `fnv1a_hex` filename digest. | All | unaudited |
-| `acquire_then_second_holder_is_rejected` | `src/lib.rs:491-506` | Second live exclusive is `Held`; re-acquired epoch is greater. | All | unaudited |
-| `distinct_scopes_do_not_conflict` | `src/lib.rs:509-517` | Both acquire and both start at epoch 1. | All | unaudited |
-| `distinct_modules_do_not_conflict_on_same_scope` | `src/lib.rs:520-532` | Both `.expect` calls succeed; second message says modules must not conflict. | All | unaudited |
-| `distinct_backends_do_not_conflict_on_same_scope` | `src/lib.rs:535-545` | Both `.expect` calls succeed. | All | unaudited |
-| `shared_holders_coexist_but_block_exclusive` | `src/lib.rs:548-579` | Two shared holders coexist; exclusive remains `Held` until last drop. | All | unaudited |
-| `exclusive_holder_blocks_shared` | `src/lib.rs:582-597` | Shared is `Held` under exclusive, then succeeds after drop. | All | unaudited |
-| `shared_acquisition_does_not_bump_the_write_epoch` | `src/lib.rs:600-624` | Writer 1, shared 1/1, writer 2. | All | unaudited |
-| `shared_lease_across_processes_blocks_exclusive` | `src/lib.rs:632-691` | Python child holds shared lock; parent exclusive is `Held`, shared succeeds, exclusive succeeds after child exits. | Unix | unaudited |
-| `epoch_persists_across_store_instances` | `src/lib.rs:694-706` | Fresh store instance observes epochs 1 then 2. | All | unaudited |
+| `fresh_exclusive_initializes_to_one` | `src/lib.rs:434-457` | A fresh key returns epoch 1, writes exactly 20 decimal digits, and the published Unix file is `0600`. | All | unaudited |
+| `shared_first_initializes_canonical_zero` | `src/lib.rs:460-476` | Shared-first creation observes canonical zero, blocks exclusive, then permits writer epoch 1 after drop. | All | unaudited |
+| `concurrent_shared_first_acquisitions_coexist` | `src/lib.rs:479-541` | Eight synchronized fresh-key shared acquisitions all coexist at epoch zero. Report collection and holder release are both deadline-bounded, so a holder that dies before reporting fails the check instead of hanging the suite. | All | unaudited |
+| `legacy_decimal_epoch_is_canonicalized` | `src/lib.rs:544-556` | Variable-width decimal 41 becomes epoch 42 in fixed-width form. | All | unaudited |
+| `invalid_epoch_states_fail_closed` | `src/lib.rs:559-601` | Empty, malformed, oversized, and overflowing states return `LeaseError::Io(InvalidData)` through both acquisition modes and preserve bytes. | All | unaudited |
+| `maximum_epoch_is_readable_but_exhausted` | `src/lib.rs:604-627` | Shared acquisition reads `u64::MAX`; exclusive acquisition reports exhaustion and preserves bytes. | All | unaudited |
+| `interrupted_persist_never_leaves_a_lower_parseable_epoch` | `src/lib.rs:630-741` | Injected ordered prefix-write failures exercise production `persist_epoch` and `read_epoch` for legacy-width and canonical-width prior states, including a carry; any parseable aftermath is not lower, completion is fixed-width, and the count of parseable aftermaths is asserted per case. | All, in-memory `Read + Write + Seek` seam | unaudited |
+| `acquisition_refuses_symlink_and_leaves_target_untouched` | `src/lib.rs:745-770` | Exclusive and shared acquisition fail; target content and mode remain unchanged. | Unix | unaudited |
+| `acquisition_refuses_fifo_without_blocking` | `src/lib.rs:774-792` | Both modes reject a Unix FIFO opened with `O_NONBLOCK`. | Unix | unaudited |
+| `an_acquired_lease_file_is_owner_only` | `src/lib.rs:798-822` | `mode == 0600`; message: lease stayed group/world writable. | Unix | unaudited |
+| `protect_file_refuses_a_symlink_and_leaves_its_target_untouched` | `src/lib.rs:833-859` | `protect_file` returns `InvalidInput` and target remains `0644`. | Unix | unaudited |
+| `protect_file_ignores_a_missing_path` | `src/lib.rs:866-870` | Missing path returns `Ok`. | All; trivial on non-Unix | unaudited |
+| `identity_hash_derivation_is_stable` | `src/lib.rs:875-878` | Pins one public identity string and exact filename digest. | All | unaudited |
+| `acquire_then_second_holder_is_rejected` | `src/lib.rs:881-895` | Second live exclusive is `Held`; re-acquired epoch is greater. | All | unaudited |
+| `distinct_identity_axes_do_not_conflict` | `src/lib.rs:898-917` | Distinct scopes, modules, and backends acquire independently at epoch 1. | All | unaudited |
+| `shared_holders_coexist_but_block_exclusive` | `src/lib.rs:920-950` | Two shared holders coexist; exclusive remains `Held` until last drop. | All | unaudited |
+| `exclusive_holder_blocks_shared` | `src/lib.rs:953-967` | Shared is `Held` under exclusive, then succeeds after drop. | All | unaudited |
+| `shared_acquisition_does_not_bump_the_write_epoch` | `src/lib.rs:970-993` | Writer 1, shared 1/1, writer 2. | All | unaudited |
+| `shared_lease_across_processes_blocks_exclusive` | `src/lib.rs:1001-1059` | Python child holds shared lock; parent exclusive is `Held`, shared succeeds, exclusive succeeds after child exits. | Unix | unaudited |
+| `epoch_persists_across_store_instances` | `src/lib.rs:1062-1073` | Fresh store instance observes epochs 1 then 2. | All | unaudited |
 
 ## Adjacent in-repo checks
 
@@ -63,13 +65,14 @@ The handover checks use `SqliteStore::for_test` (`cortexkit-store/src/lib.rs:105
 
 - Process death without unwind.
 - Power-loss durability or directory-entry durability.
-- I/O failure after epoch truncation.
-- Malformed, oversized, restored, or maximum epoch files.
+- Real `File` I/O failure after a positive write prefix.
+- Runtime Windows reparse-point and lock-conversion behavior; Windows is compile-checked only.
+- Restored older valid epoch files.
 - Live lease-file unlink or replacement.
 - Cross-process exclusive-versus-exclusive contention.
 - Adversarial key fields or hash collisions.
 - Deployed network/overlay filesystem semantics.
 - Shared-handle epoch use at consumer write sites.
-- Golden lease-path vectors or cross-version overlap.
+- Expanded golden lease-path vectors or cross-version overlap.
 - Situation-coverage assertions (`sometimes`/`reachable` equivalents).
 - Property, fuzz, model-checking, Miri, or failpoint harnesses.

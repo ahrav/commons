@@ -21,7 +21,7 @@ use cortexkit_lease::{LeaseError, LeaseKey, LeaseStore};
 
 #[derive(Debug)]
 pub enum StoreError {
-    /// A live writer already holds this module's store.
+    /// A conflicting live holder prevented acquisition, or lease I/O failed.
     Lease(LeaseError),
     /// The descriptor asked for a backend this build was not compiled with.
     UnsupportedBackend(String),
