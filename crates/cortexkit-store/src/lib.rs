@@ -385,22 +385,50 @@ mod sqlite_backend {
             | AuthAction::Savepoint { .. }
             | AuthAction::Attach { .. }
             | AuthAction::Detach { .. } => Authorization::Deny,
-            AuthAction::Insert { table_name }
-            | AuthAction::Update { table_name, .. }
-            | AuthAction::Delete { table_name }
-            | AuthAction::DropTable { table_name }
-            | AuthAction::AlterTable { table_name, .. }
-                if is_infrastructure_table(table_name) =>
-            {
-                Authorization::Deny
-            }
-            _ => Authorization::Allow,
+            action => match infrastructure_target(&action) {
+                Some(_) => Authorization::Deny,
+                None => Authorization::Allow,
+            },
         }
     }
 
+    /// Reads leave the row's authority intact, so they stay allowed. Every other action
+    /// naming an infrastructure table is refused, including the schema operations that
+    /// reach the row indirectly: a `BEFORE UPDATE` trigger raising `IGNORE` suppresses a
+    /// later opener's fence claim while that claim still reports success.
+    fn infrastructure_target<'a>(action: &rusqlite::hooks::AuthAction<'a>) -> Option<&'a str> {
+        use rusqlite::hooks::AuthAction;
+        let table = match *action {
+            AuthAction::Read { .. } | AuthAction::Select => return None,
+            AuthAction::Insert { table_name }
+            | AuthAction::Update { table_name, .. }
+            | AuthAction::Delete { table_name }
+            | AuthAction::CreateTable { table_name }
+            | AuthAction::CreateTempTable { table_name }
+            | AuthAction::DropTable { table_name }
+            | AuthAction::DropTempTable { table_name }
+            | AuthAction::AlterTable { table_name, .. }
+            | AuthAction::CreateIndex { table_name, .. }
+            | AuthAction::CreateTempIndex { table_name, .. }
+            | AuthAction::DropIndex { table_name, .. }
+            | AuthAction::DropTempIndex { table_name, .. }
+            | AuthAction::CreateTrigger { table_name, .. }
+            | AuthAction::CreateTempTrigger { table_name, .. }
+            | AuthAction::DropTrigger { table_name, .. }
+            | AuthAction::DropTempTrigger { table_name, .. }
+            | AuthAction::Reindex {
+                index_name: table_name,
+            }
+            | AuthAction::Analyze { table_name } => table_name,
+            _ => return None,
+        };
+        is_infrastructure_table(table).then_some(table)
+    }
+
     /// The fence row carries the authority a fenced write is checked against, and the
-    /// version table records which migrations ran. A callback that lowered either would
-    /// let a superseded writer reclaim the database or re-run a migration.
+    /// version table records which migrations ran. A callback that changed either, or the
+    /// schema reaching either, would let a superseded writer reclaim the database or
+    /// re-run a migration.
     fn is_infrastructure_table(table_name: &str) -> bool {
         table_name.eq_ignore_ascii_case("cortexkit_fence")
             || table_name.eq_ignore_ascii_case("cortexkit_schema_version")
@@ -1304,6 +1332,12 @@ mod tests {
             "DELETE FROM cortexkit_fence WHERE id = 0",
             "INSERT INTO cortexkit_schema_version (namespace, version, applied_at_unix) \
              VALUES ('kv', 99, 0)",
+            // A trigger reaches the row without naming it in a DML statement: raising
+            // IGNORE on update suppresses a later opener's claim while it still succeeds.
+            "CREATE TRIGGER freeze_fence BEFORE UPDATE ON cortexkit_fence \
+             BEGIN SELECT RAISE(IGNORE); END",
+            "DROP TABLE cortexkit_fence",
+            "CREATE INDEX fence_idx ON cortexkit_fence (epoch)",
         ] {
             let r = store.with_conn_fenced(|tx| tx.execute(sql, []).map(|_| ()));
             assert!(
@@ -1311,6 +1345,18 @@ mod tests {
                 "`{sql}` is denied inside a fenced callback, got {r:?}"
             );
         }
+
+        let objects: i64 = store
+            .with_conn(|c| {
+                c.query_row(
+                    "SELECT COUNT(*) FROM sqlite_schema WHERE name IN \
+                     ('freeze_fence', 'fence_idx')",
+                    [],
+                    |r| r.get(0),
+                )
+            })
+            .expect("schema lookup");
+        assert_eq!(objects, 0, "no denied schema object was created");
 
         let stored: i64 = store
             .with_conn(|c| {

@@ -418,17 +418,41 @@ fn ensure_infra_tables(client: &mut Client) -> Result<(), StoreError> {
 /// under the held advisory lock. The lease table is created by
 /// [`ensure_infra_tables`] before this runs.
 fn bump_epoch(client: &mut Client, lease_id: i64) -> Result<i64, StoreError> {
-    let epoch: i64 = client
+    let mut tx = client.transaction().map_err(migration_error)?;
+    let previous: i64 = tx
+        .query_one(
+            "SELECT COALESCE((SELECT epoch FROM cortexkit_lease WHERE lease_key = $1 \
+             FOR UPDATE), 0)",
+            &[&lease_id],
+        )
+        .map_err(migration_error)?
+        .get(0);
+    let epoch: i64 = tx
         .query_one(
             "INSERT INTO cortexkit_lease (lease_key, epoch) VALUES ($1, 1) \
              ON CONFLICT (lease_key) DO UPDATE SET epoch = cortexkit_lease.epoch + 1 \
              RETURNING epoch",
             &[&lease_id],
         )
-        .map(|row| row.get(0))
-        .map_err(migration_error)?;
+        .map_err(migration_error)?
+        .get(0);
     require_nonnegative_epoch(epoch)?;
+    require_epoch_advanced(previous, epoch)?;
+    tx.commit().map_err(migration_error)?;
     Ok(epoch)
+}
+
+/// A rule or `BEFORE UPDATE` trigger on the lease table can return the old row, so the
+/// issuing statement reports success while handing out an epoch a live writer still holds.
+/// Two holders would then share an epoch and both pass `check_fence`.
+fn require_epoch_advanced(previous: i64, issued: i64) -> Result<(), StoreError> {
+    if issued <= previous {
+        return Err(StoreError::Migration(format!(
+            "lease epoch did not advance: the row held {previous} and issued {issued}; \
+             a rule or trigger on cortexkit_lease can suppress the increment"
+        )));
+    }
+    Ok(())
 }
 
 /// Apply un-applied migrations for one `namespace` in ascending version order,
@@ -812,6 +836,26 @@ mod tests {
             intact, epoch,
             "both rejected callbacks rolled back, so the fence row still holds this epoch"
         );
+    }
+
+    #[test]
+    fn a_suppressed_epoch_increment_is_rejected() {
+        // A rule or `BEFORE UPDATE` trigger on cortexkit_lease can return the old row, so
+        // the issuing statement reports success while handing out an epoch a live writer
+        // still holds. Installing one would break every concurrent test on the shared
+        // table, so the rule is exercised directly.
+        assert!(require_epoch_advanced(0, 1).is_ok(), "a fresh row issues 1");
+        assert!(
+            require_epoch_advanced(4, 5).is_ok(),
+            "an increment advances"
+        );
+        for (previous, issued) in [(5_i64, 5_i64), (5, 4), (5, 0)] {
+            let r = require_epoch_advanced(previous, issued);
+            assert!(
+                matches!(&r, Err(StoreError::Migration(m)) if m.contains("did not advance")),
+                "issuing {issued} while the row held {previous} is rejected, got {r:?}"
+            );
+        }
     }
 
     #[test]
