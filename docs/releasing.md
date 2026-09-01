@@ -5,16 +5,17 @@ triggered by pushing a tag; there is no manual publish step.
 
 ## Procedure
 
-1. Bump the crate's version in its `Cargo.toml` and merge to `master`.
+1. Bump the crate's version in its `Cargo.toml` and merge to `main`.
 2. Wait for CI to pass on that commit.
 3. Tag it `<crate>-v<version>` — for example `cortexkit-paths-v0.1.1` — and push
    the tag.
 
 The workflow re-runs the full test matrix (Linux, macOS, Windows) before
 publishing, reusing the CI workflow rather than copying it, so a release cannot
-ship code that would fail CI. It then parses the crate and version out of the tag
-and refuses to publish if they disagree with that crate's `Cargo.toml`, which
-catches tagging a stale version.
+ship code that would fail CI. It then parses the crate and version out of the tag,
+resolves the package through `cargo metadata`, and refuses to publish if Cargo's
+version disagrees with the tag. This catches unknown crates and stale versions
+without scraping manifest text.
 
 ## Tag shape does not matter
 

@@ -43,6 +43,10 @@ jobs:
       - name: Test
         run: cargo test --locked --workspace --all-targets
 
+      - name: Test release tag resolver
+        if: matrix.os == 'ubuntu-latest'
+        run: bash .github/scripts/test-resolve-release-tag.sh
+
       # Runs only for pull requests: the gate compares the PR base and head
       # SHAs, and push/tag events lack a reliably resolvable base.
       - name: Require a push-seal version bump for represented wire changes
