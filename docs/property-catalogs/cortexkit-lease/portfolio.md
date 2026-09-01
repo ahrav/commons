@@ -9,8 +9,8 @@ Fresh-context evaluation ran after the initial 22-record catalog was written. It
 | Lease root and key were not bound to one logical store. | Added `logical-store-has-single-lease-identity`. |
 | Effects performed before lock success were absent. | Added `failed-acquisition-does-not-mutate-lease-state`. |
 | Drop-time release was claimed in the model but had no record. | Added `handle-drop-releases-lease`. |
-| SQLite had a post-acquire, pre-fence-claim stale-write window. | Added `replacement-fence-is-claimed-before-old-writer-writes`. Open now claims before exposure; the stronger acquisition-instant property remains unresolved. |
-| Unfenced write APIs made the protected write set unclear. | Added `protected-write-set-is-fence-complete` and narrowed `stale-writer-write-is-rejected`. PostgreSQL now separates read-only and fenced callbacks; SQLite consumer migration remains open. |
+| SQLite had a post-acquire, pre-fence-claim stale-write window. | Added `replacement-fence-is-claimed-before-old-writer-writes`. Open now claims a strictly greater epoch before exposure, so a stale floor cannot reissue a stored epoch; the stronger acquisition-instant property remains unresolved. |
+| Unfenced write APIs made the protected write set unclear. | Added `protected-write-set-is-fence-complete` and narrowed `stale-writer-write-is-rejected`. PostgreSQL now separates read-only, fenced, and explicitly unfenced maintenance callbacks; SQLite consumer migration remains open. |
 | Steady-state mode, creation-window exposure, and symlink following were conflated. | Added `lease-file-creation-is-never-permissive` and `acquisition-does-not-follow-symlink`; narrowed the original permission records. |
 | Parked dual-store migration rule was inconsistently in scope. | Explicitly excluded the unbuilt migration and linked its durability prerequisite in `relationships.md`. |
 
@@ -40,7 +40,7 @@ Fresh-context evaluation ran after the initial 22-record catalog was written. It
 
 ### Shared-root topology
 
-The lease crate requires a shared root (`src/lib.rs:10-14`), the in-repo SQLite consumer derives a root from each database parent (`cortexkit-store/src/lib.rs:225-242`), and the density measurement implies an external high-cardinality shared root (`docs/lease-store-density.md:7-11`). This unresolved topology changes the impact of key aliasing, density, and filesystem-scope properties.
+The lease crate requires a shared root (`src/lib.rs:10-14`), the in-repo SQLite consumer derives a root from each database parent (`cortexkit-store/src/lib.rs:234-250`), and the density measurement implies an external high-cardinality shared root (`docs/lease-store-density.md:7-11`). This unresolved topology changes the impact of key aliasing, density, and filesystem-scope properties.
 
 ### Contract catalog versus current implementation
 

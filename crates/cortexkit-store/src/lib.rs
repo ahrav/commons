@@ -39,6 +39,9 @@ pub enum StoreError {
     /// writer has been superseded — for example a draining old instance attempting a
     /// late write after a replacement took the lease. The write was not applied.
     Fenced { holder_epoch: u64, db_epoch: u64 },
+    /// An out-of-range database epoch prevents proving monotonic fencing. The store
+    /// refuses to open until an operator resets `cortexkit_fence.epoch`.
+    FenceCorrupt { db_epoch: i64 },
 }
 
 impl std::fmt::Display for StoreError {
@@ -59,6 +62,11 @@ impl std::fmt::Display for StoreError {
                 f,
                 "fenced write rejected: this writer holds epoch {holder_epoch} but the \
                  database was claimed by a newer writer at epoch {db_epoch}"
+            ),
+            StoreError::FenceCorrupt { db_epoch } => write!(
+                f,
+                "database fence epoch {db_epoch} is outside the supported range; reset \
+                 cortexkit_fence.epoch to at least the highest epoch a writer has used"
             ),
         }
     }
@@ -221,6 +229,7 @@ mod sqlite_backend {
     /// Returns [`StoreError::Io`] when the parent directory cannot be created.
     /// Returns [`StoreError::Lease`] when lease acquisition fails.
     /// Returns [`StoreError::Fenced`] if the database advances during open.
+    /// Returns [`StoreError::FenceCorrupt`] if the stored fence epoch is out of range.
     /// Returns [`StoreError::Backend`] when SQLite inspection, setup, or fence claim fails.
     pub fn open_sqlite(descriptor: &StorageDescriptor) -> Result<SqliteStore, StoreError> {
         let path = match &descriptor.backend {
@@ -254,7 +263,7 @@ mod sqlite_backend {
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
             .map_err(|e| StoreError::Backend(e.to_string()))?;
         ensure_fence_table(&tx)?;
-        claim_fence(&tx, epoch)?;
+        claim_fence_strict(&tx, epoch)?;
         tx.commit()
             .map_err(|e| StoreError::Backend(e.to_string()))?;
 
@@ -288,12 +297,16 @@ mod sqlite_backend {
         if !has_fence {
             return Ok(0);
         }
+        read_fence_epoch_in(&conn)
+    }
+
+    const FENCE_EPOCH_SQL: &str =
+        "SELECT COALESCE((SELECT epoch FROM cortexkit_fence WHERE id = 0), 0)";
+
+    /// The caller guarantees that `cortexkit_fence` exists.
+    fn read_fence_epoch_in(conn: &Connection) -> Result<u64, StoreError> {
         let epoch: i64 = conn
-            .query_row(
-                "SELECT COALESCE((SELECT epoch FROM cortexkit_fence WHERE id = 0), 0)",
-                [],
-                |row| row.get(0),
-            )
+            .query_row(FENCE_EPOCH_SQL, [], |row| row.get(0))
             .map_err(|e| StoreError::Backend(e.to_string()))?;
         decode_fence_epoch(epoch)
     }
@@ -309,21 +322,14 @@ mod sqlite_backend {
     }
 
     /// Binds fence comparison and claim to the caller's protected transaction.
-    fn claim_fence(tx: &rusqlite::Transaction<'_>, holder_epoch: u64) -> Result<(), StoreError> {
-        let holder_epoch_sql = i64::try_from(holder_epoch).map_err(|_| {
-            StoreError::Backend(format!(
-                "lease epoch {holder_epoch} exceeds SQLite INTEGER maximum"
-            ))
-        })?;
-
-        let db_epoch_sql: i64 = tx
-            .query_row(
-                "SELECT COALESCE((SELECT epoch FROM cortexkit_fence WHERE id = 0), 0)",
-                [],
-                |r| r.get(0),
-            )
-            .map_err(|e| StoreError::Backend(e.to_string()))?;
-        let db_epoch = decode_fence_epoch(db_epoch_sql)?;
+    ///
+    /// An epoch equal to the stored epoch permits repeated writes.
+    pub(crate) fn claim_fence(
+        tx: &rusqlite::Transaction<'_>,
+        holder_epoch: u64,
+    ) -> Result<(), StoreError> {
+        let holder_epoch_sql = fence_epoch_sql_value(holder_epoch)?;
+        let db_epoch = read_fence_epoch_in(tx)?;
 
         if db_epoch > holder_epoch {
             return Err(StoreError::Fenced {
@@ -332,23 +338,53 @@ mod sqlite_backend {
             });
         }
         if holder_epoch > db_epoch {
-            tx.execute(
-                "INSERT INTO cortexkit_fence (id, epoch) VALUES (0, ?1) \
-                 ON CONFLICT(id) DO UPDATE SET epoch = excluded.epoch",
-                rusqlite::params![holder_epoch_sql],
-            )
-            .map_err(|e| StoreError::Backend(e.to_string()))?;
+            write_fence(tx, holder_epoch_sql)?;
         }
         Ok(())
     }
 
-    /// Rejects negative SQLite integers instead of wrapping them into writer epochs.
-    fn decode_fence_epoch(epoch: i64) -> Result<u64, StoreError> {
-        u64::try_from(epoch).map_err(|_| {
+    /// A stale externally derived floor can otherwise reissue the stored epoch.
+    pub(crate) fn claim_fence_strict(
+        tx: &rusqlite::Transaction<'_>,
+        holder_epoch: u64,
+    ) -> Result<(), StoreError> {
+        let holder_epoch_sql = fence_epoch_sql_value(holder_epoch)?;
+        let db_epoch = read_fence_epoch_in(tx)?;
+
+        if holder_epoch <= db_epoch {
+            return Err(StoreError::Fenced {
+                holder_epoch,
+                db_epoch,
+            });
+        }
+        write_fence(tx, holder_epoch_sql)
+    }
+
+    /// `i64::try_from` rejects unrepresentable epochs before any database access.
+    fn fence_epoch_sql_value(holder_epoch: u64) -> Result<i64, StoreError> {
+        i64::try_from(holder_epoch).map_err(|_| {
             StoreError::Backend(format!(
-                "database fence epoch {epoch} is outside the supported range"
+                "lease epoch {holder_epoch} exceeds SQLite INTEGER maximum"
             ))
         })
+    }
+
+    fn write_fence(
+        tx: &rusqlite::Transaction<'_>,
+        holder_epoch_sql: i64,
+    ) -> Result<(), StoreError> {
+        tx.execute(
+            "INSERT INTO cortexkit_fence (id, epoch) VALUES (0, ?1) \
+             ON CONFLICT(id) DO UPDATE SET epoch = excluded.epoch",
+            rusqlite::params![holder_epoch_sql],
+        )
+        .map(|_| ())
+        .map_err(|e| StoreError::Backend(e.to_string()))
+    }
+
+    /// Rejects negative SQLite integers instead of wrapping them into writer epochs.
+    fn decode_fence_epoch(epoch: i64) -> Result<u64, StoreError> {
+        u64::try_from(epoch).map_err(|_| StoreError::FenceCorrupt { db_epoch: epoch })
     }
 
     /// Apply un-applied migrations for one `namespace` in ascending version order,
@@ -430,6 +466,7 @@ pub use sqlite_backend::{open_sqlite, SqliteStore};
 
 #[cfg(all(test, feature = "sqlite"))]
 mod tests {
+    use super::sqlite_backend::{claim_fence, claim_fence_strict};
     use super::*;
 
     /// Reopening covers pre-existing permissive files. A first open cannot test
@@ -541,6 +578,49 @@ mod tests {
             })
             .expect("open claimed fence");
         assert_eq!(claimed as u64, store.epoch());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Models the interleaving where a floor read before lease acquisition goes stale:
+    /// an opener issues the epoch the database already stores. `claim_fence` authorizes
+    /// that equal epoch, which would place two holders on one epoch, so open uses
+    /// `claim_fence_strict` instead.
+    #[test]
+    fn open_claim_rejects_an_epoch_the_database_already_stores() {
+        let (root, d) = tmp();
+        let path = sqlite_path(&d);
+        open_sqlite(&d).expect("seed database");
+
+        let mut conn = rusqlite::Connection::open(&path).expect("reopen database");
+        let stored: u64 = conn
+            .query_row(
+                "SELECT epoch FROM cortexkit_fence WHERE id = 0",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .map(|epoch| epoch as u64)
+            .expect("stored fence");
+
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .expect("claim transaction");
+        match claim_fence_strict(&tx, stored) {
+            Err(StoreError::Fenced {
+                holder_epoch,
+                db_epoch,
+            }) => {
+                assert_eq!(holder_epoch, stored);
+                assert_eq!(db_epoch, stored);
+            }
+            other => panic!("expected an equal epoch to be rejected, got {other:?}"),
+        }
+        assert!(
+            claim_fence(&tx, stored).is_ok(),
+            "an equal epoch stays authorized for a holder that already claimed it"
+        );
+        claim_fence_strict(&tx, stored + 1).expect("a strictly greater epoch claims");
+        drop(tx);
+
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -814,9 +894,7 @@ mod tests {
             Err(error) => error,
             Ok(_) => panic!("negative fence must fail closed"),
         };
-        assert!(
-            matches!(error, StoreError::Backend(message) if message.contains("database fence epoch -1 is outside the supported range"))
-        );
+        assert!(matches!(error, StoreError::FenceCorrupt { db_epoch } if db_epoch == -1));
         let persisted: i64 = rusqlite::Connection::open(&path)
             .expect("reopen legacy database")
             .query_row(

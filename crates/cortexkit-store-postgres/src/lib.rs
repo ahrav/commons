@@ -83,6 +83,11 @@ impl PostgresStore {
 
     /// The transaction rejects writes but otherwise uses the server's configured isolation level.
     ///
+    /// The enclosing `START TRANSACTION READ ONLY` and `COMMIT` cost two round trips
+    /// beyond the callback's own statements, and the callback's locks and snapshot
+    /// persist until it returns. Callbacks therefore keep non-database work out and
+    /// send a single read through [`Self::with_client_unfenced`] instead.
+    ///
     /// # Errors
     ///
     /// Returns [`StoreError::Backend`] when transaction setup, the callback, or commit fails.
@@ -120,6 +125,27 @@ impl PostgresStore {
         Ok(out)
     }
 
+    /// Runs the callback in autocommit, with no transaction and no fence check.
+    ///
+    /// PostgreSQL forbids `VACUUM` and the `CONCURRENTLY` index forms inside a
+    /// transaction block, which puts them out of reach of
+    /// [`Self::with_client_read`] and [`Self::with_client_fenced`]. Maintenance
+    /// statements reach the lease-holding connection through this method rather than
+    /// a second connection outside the lease. Callers must not perform
+    /// fence-protected durable mutations here; PostgreSQL does not enforce that
+    /// restriction.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::Backend`] when the callback fails.
+    pub fn with_client_unfenced<T>(
+        &self,
+        f: impl FnOnce(&mut Client) -> Result<T, postgres::Error>,
+    ) -> Result<T, StoreError> {
+        let mut guard = self.client.lock().unwrap_or_else(|p| p.into_inner());
+        f(&mut guard).map_err(backend_error)
+    }
+
     /// Apply a `namespace`'s migration chain to this database, once. Applied
     /// migrations are tracked per `(namespace, version)`, so a multi-domain module
     /// registers an independent chain per domain.
@@ -144,12 +170,20 @@ impl PostgresStore {
 }
 
 /// Preserves PostgreSQL's server message instead of collapsing it to `db error`.
-fn backend_error(error: postgres::Error) -> StoreError {
-    let message = error.as_db_error().map_or_else(
+/// A server primary message can quote offending column values.
+fn db_message(error: &postgres::Error) -> String {
+    error.as_db_error().map_or_else(
         || error.to_string(),
         |db| format!("SQLSTATE {}: {}", db.code().code(), db.message()),
-    );
-    StoreError::Backend(message)
+    )
+}
+
+fn backend_error(error: postgres::Error) -> StoreError {
+    StoreError::Backend(db_message(&error))
+}
+
+fn migration_error(error: postgres::Error) -> StoreError {
+    StoreError::Migration(db_message(&error))
 }
 
 /// Locks the current lease row so the fence check remains bound to transaction effects.
@@ -203,14 +237,13 @@ pub fn open_postgres(descriptor: &StorageDescriptor) -> Result<PostgresStore, St
         other => return Err(StoreError::UnsupportedBackend(other.label().to_string())),
     };
 
-    let mut client =
-        Client::connect(&dsn, NoTls).map_err(|e| StoreError::Backend(e.to_string()))?;
+    let mut client = Client::connect(&dsn, NoTls).map_err(backend_error)?;
 
     let lease_id = advisory_key(&lease_key(descriptor));
 
     let acquired: bool = client
         .query_one("SELECT pg_try_advisory_lock($1)", &[&lease_id])
-        .map_err(|e| StoreError::Backend(e.to_string()))?
+        .map_err(backend_error)?
         .get(0);
     if !acquired {
         return Err(StoreError::Lease(LeaseError::Held {
@@ -249,11 +282,9 @@ const INFRA_BOOTSTRAP_LOCK: i64 = 0x636b_5f69_6e66_7261;
 /// not-concurrency-safe `CREATE TABLE IF NOT EXISTS` runs one at a time; the lock
 /// releases when this transaction commits.
 fn ensure_infra_tables(client: &mut Client) -> Result<(), StoreError> {
-    let mut tx = client
-        .transaction()
-        .map_err(|e| StoreError::Migration(e.to_string()))?;
+    let mut tx = client.transaction().map_err(migration_error)?;
     tx.execute("SELECT pg_advisory_xact_lock($1)", &[&INFRA_BOOTSTRAP_LOCK])
-        .map_err(|e| StoreError::Migration(e.to_string()))?;
+        .map_err(migration_error)?;
     tx.batch_execute(
         "CREATE TABLE IF NOT EXISTS cortexkit_lease (\
              lease_key BIGINT PRIMARY KEY, \
@@ -266,9 +297,8 @@ fn ensure_infra_tables(client: &mut Client) -> Result<(), StoreError> {
              PRIMARY KEY (namespace, version)\
          );",
     )
-    .map_err(|e| StoreError::Migration(e.to_string()))?;
-    tx.commit()
-        .map_err(|e| StoreError::Migration(e.to_string()))?;
+    .map_err(migration_error)?;
+    tx.commit().map_err(migration_error)?;
     Ok(())
 }
 
@@ -284,7 +314,7 @@ fn bump_epoch(client: &mut Client, lease_id: i64) -> Result<i64, StoreError> {
             &[&lease_id],
         )
         .map(|row| row.get(0))
-        .map_err(|e| StoreError::Migration(e.to_string()))
+        .map_err(migration_error)
 }
 
 /// Apply un-applied migrations for one `namespace` in ascending version order,
@@ -299,19 +329,16 @@ fn run_migrations(
 ) -> Result<(), StoreError> {
     // The schema-version table is bootstrapped race-safely in ensure_infra_tables
     // at open, so migrate() does not (re-)create it here.
-    let mut tx = client
-        .transaction()
-        .map_err(|e| StoreError::Migration(e.to_string()))?;
+    let mut tx = client.transaction().map_err(migration_error)?;
     check_fence(&mut tx, lease_key, holder_epoch)?;
     let current: i32 = tx
         .query_one(
             "SELECT COALESCE(MAX(version), 0) FROM cortexkit_schema_version WHERE namespace = $1",
             &[&namespace],
         )
-        .map_err(|e| StoreError::Migration(e.to_string()))?
+        .map_err(migration_error)?
         .get(0);
-    tx.commit()
-        .map_err(|e| StoreError::Migration(e.to_string()))?;
+    tx.commit().map_err(migration_error)?;
     let current = current as u32;
 
     let mut ordered: Vec<&Migration> = migrations.iter().collect();
@@ -321,14 +348,13 @@ fn run_migrations(
         if m.version <= current {
             continue;
         }
-        let mut tx = client
-            .transaction()
-            .map_err(|e| StoreError::Migration(e.to_string()))?;
+        let mut tx = client.transaction().map_err(migration_error)?;
         check_fence(&mut tx, lease_key, holder_epoch)?;
         tx.batch_execute(m.statements).map_err(|e| {
             StoreError::Migration(format!(
-                "namespace '{namespace}' migration {}: {e}",
-                m.version
+                "namespace '{namespace}' migration {}: {}",
+                m.version,
+                db_message(&e)
             ))
         })?;
         tx.execute(
@@ -336,9 +362,8 @@ fn run_migrations(
              VALUES ($1, $2, $3)",
             &[&namespace, &(m.version as i32), &now_unix()],
         )
-        .map_err(|e| StoreError::Migration(e.to_string()))?;
-        tx.commit()
-            .map_err(|e| StoreError::Migration(e.to_string()))?;
+        .map_err(migration_error)?;
+        tx.commit().map_err(migration_error)?;
     }
     Ok(())
 }
@@ -435,6 +460,28 @@ mod tests {
             applied, 1,
             "exactly one migration recorded for the namespace"
         );
+    }
+
+    #[test]
+    fn unfenced_callback_runs_statements_a_transaction_forbids() {
+        let Some(dsn) = test_dsn() else {
+            return;
+        };
+        let ns = unique_ns("maintenance");
+        let store = open_postgres(&descriptor(&dsn, &ns)).expect("open");
+        store.migrate(&ns, M1).expect("migrate");
+
+        let blocked = store
+            .with_client_fenced(|tx| tx.batch_execute("VACUUM cortexkit_schema_version"))
+            .expect_err("a transaction block must reject VACUUM");
+        assert!(
+            matches!(blocked, StoreError::Backend(ref message) if message.starts_with("SQLSTATE 25001:")),
+            "expected SQLSTATE 25001 inside a transaction, got {blocked:?}"
+        );
+
+        store
+            .with_client_unfenced(|client| client.batch_execute("VACUUM cortexkit_schema_version"))
+            .expect("autocommit maintenance reaches the lease-holding connection");
     }
 
     #[test]
