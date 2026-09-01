@@ -141,8 +141,9 @@ mod sqlite_backend {
         /// `PRAGMA query_only` makes database writes fail with `SQLITE_READONLY`,
         /// which keeps every durable write on the fenced path
         /// ([`Self::with_conn_fenced`]). An authorizer denies setting `query_only`,
-        /// `synchronous`, and `journal_mode`, so the callback cannot lift the guard or
-        /// weaken fence durability; reading those pragmas stays allowed.
+        /// `synchronous`, `journal_mode`, `locking_mode`, and `writable_schema`, so the
+        /// callback cannot lift the guard, weaken fence durability, or take a lock that
+        /// blocks a replacement's fence-floor read; reading those pragmas stays allowed.
         ///
         /// # Errors
         ///
@@ -287,7 +288,8 @@ mod sqlite_backend {
         use rusqlite::hooks::{AuthAction, Authorization};
         match context.action {
             AuthAction::Pragma {
-                pragma_name: "query_only" | "synchronous" | "journal_mode",
+                pragma_name:
+                    "query_only" | "synchronous" | "journal_mode" | "locking_mode" | "writable_schema",
                 pragma_value: Some(_),
             } => Authorization::Deny,
             _ => Authorization::Allow,
@@ -1073,6 +1075,13 @@ mod tests {
             matches!(&bypass, Err(StoreError::Backend(m)) if m.contains("not authorized")),
             "clearing the guard is denied before any write runs, got {bypass:?}"
         );
+        for pragma in ["journal_mode", "locking_mode", "writable_schema"] {
+            let denied = store.with_conn(|c| c.pragma_update(None, pragma, "EXCLUSIVE"));
+            assert!(
+                matches!(&denied, Err(StoreError::Backend(m)) if m.contains("not authorized")),
+                "setting {pragma} from a read callback is denied, got {denied:?}"
+            );
+        }
         let n: i64 = store
             .with_conn(|c| c.query_row("SELECT COUNT(*) FROM kv", [], |r| r.get(0)))
             .expect("count");

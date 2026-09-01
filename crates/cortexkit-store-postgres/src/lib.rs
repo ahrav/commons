@@ -231,7 +231,11 @@ fn check_fence(
             db_epoch,
         });
     }
-    Ok(TransactionWitness(row.get(1)))
+    Ok(TransactionWitness {
+        xact_id: row.get(1),
+        lease_key,
+        epoch: db_epoch,
+    })
 }
 
 /// Negative epochs compare older than every positive holder epoch, bypassing fencing.
@@ -242,8 +246,12 @@ fn require_nonnegative_epoch(db_epoch: i64) -> Result<(), StoreError> {
     Ok(())
 }
 
-/// The transaction id assigned when the fence row was locked.
-struct TransactionWitness(String);
+/// The transaction id assigned when the fence row was locked, and the row it locked.
+struct TransactionWitness {
+    xact_id: String,
+    lease_key: i64,
+    epoch: i64,
+}
 
 /// Transaction-control SQL sent by the callback ends the fence-checked transaction.
 /// Later statements commit in autocommit without a fence, and `Transaction::commit`
@@ -252,18 +260,33 @@ fn require_same_transaction(
     tx: &mut postgres::Transaction<'_>,
     witness: &TransactionWitness,
 ) -> Result<(), StoreError> {
-    let current: Option<String> = tx
-        .query_one("SELECT pg_current_xact_id_if_assigned()::text", &[])
-        .map_err(backend_error)?
-        .get(0);
-    if current.as_deref() == Some(witness.0.as_str()) {
-        return Ok(());
+    let row = tx
+        .query_one(
+            "SELECT pg_current_xact_id_if_assigned()::text, \
+                    (SELECT epoch FROM cortexkit_lease WHERE lease_key = $1)",
+            &[&witness.lease_key],
+        )
+        .map_err(backend_error)?;
+    let current: Option<String> = row.get(0);
+    if current.as_deref() != Some(witness.xact_id.as_str()) {
+        return Err(StoreError::Backend(
+            "the callback ended the fence-checked transaction; effects after that commit ran \
+             unfenced"
+                .to_string(),
+        ));
     }
-    Err(StoreError::Backend(
-        "the callback ended the fence-checked transaction; effects after that commit ran \
-         unfenced"
-            .to_string(),
-    ))
+    // Nothing reserves cortexkit_lease against callback SQL, and a deleted or lowered
+    // row would let a later open reissue an epoch a stale writer still holds.
+    let epoch: Option<i64> = row.get(1);
+    if epoch != Some(witness.epoch) {
+        return Err(StoreError::Backend(format!(
+            "the callback changed the lease row this write was fenced against: epoch was \
+             {} and is now {}",
+            witness.epoch,
+            epoch.map_or_else(|| "absent".to_string(), |e| e.to_string())
+        )));
+    }
+    Ok(())
 }
 
 /// `transaction_read_only` reverts to the session default once the started transaction
@@ -691,6 +714,53 @@ mod tests {
         assert!(
             matches!(fenced, Err(StoreError::FenceCorrupt { db_epoch: -5 })),
             "a negative epoch fails closed rather than authorizing the write, got {fenced:?}"
+        );
+    }
+
+    #[test]
+    fn a_callback_cannot_damage_the_lease_row_it_is_fenced_against() {
+        let Some(dsn) = test_dsn() else {
+            return;
+        };
+        let ns = unique_ns("leaserow");
+        let d = descriptor(&dsn, &ns);
+        let store = open_postgres(&d).expect("open");
+        let key = store.lease_key;
+        let epoch = store.epoch();
+
+        let deleted = store.with_client_fenced(|tx| {
+            tx.execute("DELETE FROM cortexkit_lease WHERE lease_key = $1", &[&key])?;
+            Ok(())
+        });
+        assert!(
+            matches!(&deleted, Err(StoreError::Backend(m)) if m.contains("changed the lease row")),
+            "deleting the fence row is rejected, got {deleted:?}"
+        );
+
+        let lowered = store.with_client_fenced(|tx| {
+            tx.execute(
+                "UPDATE cortexkit_lease SET epoch = 0 WHERE lease_key = $1",
+                &[&key],
+            )?;
+            Ok(())
+        });
+        assert!(
+            matches!(&lowered, Err(StoreError::Backend(m)) if m.contains("changed the lease row")),
+            "lowering the fence row is rejected, got {lowered:?}"
+        );
+
+        let intact: i64 = store
+            .with_client_read(|c| {
+                Ok(c.query_one(
+                    "SELECT epoch FROM cortexkit_lease WHERE lease_key = $1",
+                    &[&key],
+                )?
+                .get(0))
+            })
+            .expect("read the lease row");
+        assert_eq!(
+            intact, epoch,
+            "both rejected callbacks rolled back, so the fence row still holds this epoch"
         );
     }
 
