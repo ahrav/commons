@@ -1,7 +1,7 @@
 # `shared-exclusive-exclusion-matrix`
 
 - **Discovery:** concurrency and lifecycle passes.
-- **Primary evidence:** `LeaseStore::acquire` uses `File::try_lock`; `LeaseStore::acquire_shared` uses `File::try_lock_shared`; both map `WouldBlock` to `Held`.
+- **Primary evidence:** `FileLeaseStore::acquire` uses `File::try_lock`; `FileLeaseStore::acquire_shared` uses `File::try_lock_shared`; both map `WouldBlock` to `Held`.
 - **Existing evidence:** `shared_holders_coexist_but_block_exclusive`, `exclusive_holder_blocks_shared`, and `shared_lease_across_processes_blocks_exclusive`, including the discriminating step where one of two shared holders drops and exclusive remains blocked. `concurrent_shared_first_acquisitions_coexist` covers synchronized publication/open races on a fresh key.
 - **Failure scenario:** process-scoped lock emulation or premature unlock lets exclusive coexist with a remaining shared holder.
 - **Timing window:** exclusive attempt after the first shared holder drops but before the last drops.

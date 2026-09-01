@@ -9,7 +9,7 @@ description = "Postgres backend mechanics (open, native single-writer lease, ver
 
 [dependencies]
 cortexkit-store-types = { version = "0.1.1", path = "../cortexkit-store-types" }
-cortexkit-lease = { version = "0.2.1", path = "../cortexkit-lease" }
+cortexkit-lease = { version = "0.3.0", path = "../cortexkit-lease" }
 # Synchronous blocking driver: the store API is synchronous, so the blocking
 # client avoids an async-runtime bridge and confines postgres types to this crate.
 postgres = "0.19"

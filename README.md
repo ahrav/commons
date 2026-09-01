@@ -51,7 +51,9 @@ Bump on any change to observable behaviour or emitted bytes. Not for comments or
 tests — a version that moves for prose trains readers to bump reflexively, which
 is how it stops meaning anything.
 
-### `cortexkit-lease` 0.2 compatibility
+### `cortexkit-lease` 0.3 API and 0.2 state compatibility
+
+Version 0.3 removes `LeaseStore` and `LeaseHandle`; `FileLeaseStore` methods return `HeldFileLease` directly, PostgreSQL keeps its native session lock, and the 0.2 lease path and epoch format remain unchanged.
 
 Version 0.2 never publishes an empty final lease file: it initializes epoch zero
 in a same-directory temporary file and publishes that inode without replacing an

@@ -13,5 +13,5 @@ sqlite = ["dep:rusqlite"]
 
 [dependencies]
 cortexkit-store-types = { version = "0.1.1", path = "../cortexkit-store-types" }
-cortexkit-lease = { version = "0.2.1", path = "../cortexkit-lease" }
+cortexkit-lease = { version = "0.3.0", path = "../cortexkit-lease" }
 rusqlite = { version = "0.39", features = ["bundled", "hooks"], optional = true }
