@@ -151,17 +151,11 @@ mod sqlite_backend {
             f: impl FnOnce(&Connection) -> rusqlite::Result<T>,
         ) -> Result<T, StoreError> {
             let guard = self.conn.lock().unwrap_or_else(|p| p.into_inner());
-            guard
-                .pragma_update(None, "query_only", "ON")
-                .map_err(|e| StoreError::Backend(e.to_string()))?;
+            let read_only = QueryOnlyGuard::enable(&guard)?;
             let out = f(&guard);
-            // Always clear `query_only` after the callback; later fenced writes
-            // share this connection.
-            let restored = guard.pragma_update(None, "query_only", "OFF");
+            let restored = read_only.restore();
             let out = out.map_err(|e| StoreError::Backend(e.to_string()))?;
-            restored.map_err(|e| {
-                StoreError::Backend(format!("failed to clear read-only guard: {e}"))
-            })?;
+            restored?;
             Ok(out)
         }
 
@@ -233,6 +227,41 @@ mod sqlite_backend {
         pub fn migrate(&self, namespace: &str, migrations: &[Migration]) -> Result<(), StoreError> {
             let mut guard = self.conn.lock().unwrap_or_else(|p| p.into_inner());
             run_migrations(&mut guard, self.epoch, namespace, migrations)
+        }
+    }
+
+    /// Clearing `query_only` in `Drop` prevents a reused connection from rejecting
+    /// later writes with `SQLITE_READONLY`.
+    struct QueryOnlyGuard<'c> {
+        /// `None` once cleared, so `Drop` never repeats a restore whose failure
+        /// [`Self::restore`] already reported.
+        conn: Option<&'c Connection>,
+    }
+
+    impl<'c> QueryOnlyGuard<'c> {
+        fn enable(conn: &'c Connection) -> Result<Self, StoreError> {
+            conn.pragma_update(None, "query_only", "ON")
+                .map_err(|e| StoreError::Backend(e.to_string()))?;
+            Ok(Self { conn: Some(conn) })
+        }
+
+        /// Reports a failed clear to the caller, which `Drop` cannot do.
+        fn restore(mut self) -> Result<(), StoreError> {
+            match self.conn.take() {
+                Some(conn) => conn.pragma_update(None, "query_only", "OFF").map_err(|e| {
+                    StoreError::Backend(format!("failed to clear read-only guard: {e}"))
+                }),
+                None => Ok(()),
+            }
+        }
+    }
+
+    impl Drop for QueryOnlyGuard<'_> {
+        fn drop(&mut self) {
+            if let Some(conn) = self.conn.take() {
+                // Drop ignores cleanup errors because it cannot return them.
+                let _ = conn.pragma_update(None, "query_only", "OFF");
+            }
         }
     }
 
@@ -887,6 +916,29 @@ mod tests {
             .with_conn(|c| c.query_row("PRAGMA synchronous", [], |r| r.get(0)))
             .expect("read synchronous");
         assert_eq!(sync, 2, "fence durability requires synchronous=FULL");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_panicking_read_does_not_strand_the_connection_read_only() {
+        let (root, d) = tmp();
+        let store = open_sqlite(&d).expect("open");
+        store.migrate("kv", FENCE_SCHEMA).expect("migrate");
+
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            store.with_conn(|_| -> rusqlite::Result<()> { panic!("callback panics") })
+        }));
+        assert!(panicked.is_err(), "the callback's panic propagates");
+
+        store
+            .with_conn_fenced(|tx| {
+                tx.execute("INSERT INTO kv (k, v) VALUES ('after-panic', '1')", [])
+                    .map(|_| ())
+            })
+            .expect("a fenced write after a panicking read is still authorized");
+        store
+            .with_conn_unfenced(|c| c.execute_batch("VACUUM"))
+            .expect("maintenance after a panicking read still reaches the database");
         let _ = std::fs::remove_dir_all(&root);
     }
 
