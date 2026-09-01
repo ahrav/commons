@@ -14,8 +14,8 @@ No production `assert!`, `debug_assert!`, `panic!`, or equivalent invariant batt
 | `LeaseStore::acquire` (`src/lib.rs:273-296`) | Exclusive acquisition | Uses `try_lock`, classifies contention, and increments a validated epoch. | Exclusive liveness gate and error taxonomy. |
 | `LeaseStore::acquire_shared` (`src/lib.rs:298-320`) | Shared acquisition | Uses `try_lock_shared` and reads without mutation. | Concurrent shared-first acquisition and exclusion matrix. |
 | `FileLeaseHandle::drop` (`src/lib.rs:267-269`) | Handle `Drop` | Best-effort `File::unlock`; error discarded; descriptor then closes. | Drop releases lease. |
-| `read_epoch` (`src/lib.rs:342-364`) | Bounded epoch parse | Reads at most 21 bytes into a bounded vector; existing empty state and anything except 1-20 ASCII digits in `u64` range are rejected. | Malformed, empty, oversized, and overflowing state fails closed. |
-| `bump_epoch`, `persist_epoch` (`src/lib.rs:367-387`) | Epoch update | Checked increment; no truncate; fixed-width decimal overwrite with invalid-marker conversion only for 1-19 byte legacy states. | Exhaustion errors; ordered prefix writes cannot leave a lower parseable value in the injected model. |
+| `read_epoch` (`src/lib.rs:342-370`) | Bounded epoch parse | Reads at most 21 bytes into a bounded vector; existing empty state and anything except 1-20 ASCII digits in `u64` range are rejected. | Malformed, empty, oversized, and overflowing state fails closed. |
+| `bump_epoch`, `persist_epoch` (`src/lib.rs:373-393`) | Epoch update | Checked increment; no truncate; fixed-width decimal overwrite with invalid-marker conversion only for 1-19 byte legacy states. | Exhaustion errors; ordered prefix writes cannot leave a lower parseable value in the injected model. |
 | `LeaseKey::identity`, `FileLeaseStore::lease_path`, `fnv1a`, `fnv1a_hex` | Identity/path derivation | Public separator-joined identity and FNV functions feed the private `.lease` path helper. | Stable namespaced identity. |
 | `LeaseHandle`, `LeaseStore` | Trait bounds | Handles and stores are `Send + Sync`. | Cross-thread use compiles. |
 
@@ -23,26 +23,26 @@ No production `assert!`, `debug_assert!`, `panic!`, or equivalent invariant batt
 
 | Test | Location | Claim and exact oracle | Platform | Status |
 |---|---|---|---|---|
-| `fresh_exclusive_initializes_to_one` | `src/lib.rs:428-451` | A fresh key returns epoch 1, writes exactly 20 decimal digits, and the published Unix file is `0600`. | All | unaudited |
-| `shared_first_initializes_canonical_zero` | `src/lib.rs:454-470` | Shared-first creation observes canonical zero, blocks exclusive, then permits writer epoch 1 after drop. | All | unaudited |
-| `concurrent_shared_first_acquisitions_coexist` | `src/lib.rs:473-526` | Eight synchronized fresh-key shared acquisitions all coexist at epoch zero. | All | unaudited |
-| `legacy_decimal_epoch_is_canonicalized` | `src/lib.rs:529-541` | Variable-width decimal 41 becomes epoch 42 in fixed-width form. | All | unaudited |
-| `invalid_epoch_states_fail_closed` | `src/lib.rs:544-586` | Empty, malformed, oversized, and overflowing states return `LeaseError::Io(InvalidData)` through both acquisition modes and preserve bytes. | All | unaudited |
-| `maximum_epoch_is_readable_but_exhausted` | `src/lib.rs:589-612` | Shared acquisition reads `u64::MAX`; exclusive acquisition reports exhaustion and preserves bytes. | All | unaudited |
-| `interrupted_persist_never_leaves_a_lower_parseable_epoch` | `src/lib.rs:615-669` | Injected ordered prefix-write failures exercise production `persist_epoch` and `read_epoch`; any parseable aftermath is not lower, and completion is fixed-width. | All, in-memory `Read + Write + Seek` seam | unaudited |
-| `acquisition_refuses_symlink_and_leaves_target_untouched` | `src/lib.rs:673-698` | Exclusive and shared acquisition fail; target content and mode remain unchanged. | Unix | unaudited |
-| `acquisition_refuses_fifo_without_blocking` | `src/lib.rs:702-720` | Both modes reject a Unix FIFO opened with `O_NONBLOCK`. | Unix | unaudited |
-| `an_acquired_lease_file_is_owner_only` | `src/lib.rs:726-750` | `mode == 0600`; message: lease stayed group/world writable. | Unix | unaudited |
-| `protect_file_refuses_a_symlink_and_leaves_its_target_untouched` | `src/lib.rs:761-787` | `protect_file` returns `InvalidInput` and target remains `0644`. | Unix | unaudited |
-| `protect_file_ignores_a_missing_path` | `src/lib.rs:794-798` | Missing path returns `Ok`. | All; trivial on non-Unix | unaudited |
-| `identity_hash_derivation_is_stable` | `src/lib.rs:803-806` | Pins one public identity string and exact filename digest. | All | unaudited |
-| `acquire_then_second_holder_is_rejected` | `src/lib.rs:809-823` | Second live exclusive is `Held`; re-acquired epoch is greater. | All | unaudited |
-| `distinct_identity_axes_do_not_conflict` | `src/lib.rs:826-845` | Distinct scopes, modules, and backends acquire independently at epoch 1. | All | unaudited |
-| `shared_holders_coexist_but_block_exclusive` | `src/lib.rs:848-878` | Two shared holders coexist; exclusive remains `Held` until last drop. | All | unaudited |
-| `exclusive_holder_blocks_shared` | `src/lib.rs:881-895` | Shared is `Held` under exclusive, then succeeds after drop. | All | unaudited |
-| `shared_acquisition_does_not_bump_the_write_epoch` | `src/lib.rs:898-921` | Writer 1, shared 1/1, writer 2. | All | unaudited |
-| `shared_lease_across_processes_blocks_exclusive` | `src/lib.rs:929-987` | Python child holds shared lock; parent exclusive is `Held`, shared succeeds, exclusive succeeds after child exits. | Unix | unaudited |
-| `epoch_persists_across_store_instances` | `src/lib.rs:990-1001` | Fresh store instance observes epochs 1 then 2. | All | unaudited |
+| `fresh_exclusive_initializes_to_one` | `src/lib.rs:434-457` | A fresh key returns epoch 1, writes exactly 20 decimal digits, and the published Unix file is `0600`. | All | unaudited |
+| `shared_first_initializes_canonical_zero` | `src/lib.rs:460-476` | Shared-first creation observes canonical zero, blocks exclusive, then permits writer epoch 1 after drop. | All | unaudited |
+| `concurrent_shared_first_acquisitions_coexist` | `src/lib.rs:479-541` | Eight synchronized fresh-key shared acquisitions all coexist at epoch zero. Report collection and holder release are both deadline-bounded, so a holder that dies before reporting fails the check instead of hanging the suite. | All | unaudited |
+| `legacy_decimal_epoch_is_canonicalized` | `src/lib.rs:544-556` | Variable-width decimal 41 becomes epoch 42 in fixed-width form. | All | unaudited |
+| `invalid_epoch_states_fail_closed` | `src/lib.rs:559-601` | Empty, malformed, oversized, and overflowing states return `LeaseError::Io(InvalidData)` through both acquisition modes and preserve bytes. | All | unaudited |
+| `maximum_epoch_is_readable_but_exhausted` | `src/lib.rs:604-627` | Shared acquisition reads `u64::MAX`; exclusive acquisition reports exhaustion and preserves bytes. | All | unaudited |
+| `interrupted_persist_never_leaves_a_lower_parseable_epoch` | `src/lib.rs:630-741` | Injected ordered prefix-write failures exercise production `persist_epoch` and `read_epoch` for legacy-width and canonical-width prior states, including a carry; any parseable aftermath is not lower, completion is fixed-width, and the count of parseable aftermaths is asserted per case. | All, in-memory `Read + Write + Seek` seam | unaudited |
+| `acquisition_refuses_symlink_and_leaves_target_untouched` | `src/lib.rs:745-770` | Exclusive and shared acquisition fail; target content and mode remain unchanged. | Unix | unaudited |
+| `acquisition_refuses_fifo_without_blocking` | `src/lib.rs:774-792` | Both modes reject a Unix FIFO opened with `O_NONBLOCK`. | Unix | unaudited |
+| `an_acquired_lease_file_is_owner_only` | `src/lib.rs:798-822` | `mode == 0600`; message: lease stayed group/world writable. | Unix | unaudited |
+| `protect_file_refuses_a_symlink_and_leaves_its_target_untouched` | `src/lib.rs:833-859` | `protect_file` returns `InvalidInput` and target remains `0644`. | Unix | unaudited |
+| `protect_file_ignores_a_missing_path` | `src/lib.rs:866-870` | Missing path returns `Ok`. | All; trivial on non-Unix | unaudited |
+| `identity_hash_derivation_is_stable` | `src/lib.rs:875-878` | Pins one public identity string and exact filename digest. | All | unaudited |
+| `acquire_then_second_holder_is_rejected` | `src/lib.rs:881-895` | Second live exclusive is `Held`; re-acquired epoch is greater. | All | unaudited |
+| `distinct_identity_axes_do_not_conflict` | `src/lib.rs:898-917` | Distinct scopes, modules, and backends acquire independently at epoch 1. | All | unaudited |
+| `shared_holders_coexist_but_block_exclusive` | `src/lib.rs:920-950` | Two shared holders coexist; exclusive remains `Held` until last drop. | All | unaudited |
+| `exclusive_holder_blocks_shared` | `src/lib.rs:953-967` | Shared is `Held` under exclusive, then succeeds after drop. | All | unaudited |
+| `shared_acquisition_does_not_bump_the_write_epoch` | `src/lib.rs:970-993` | Writer 1, shared 1/1, writer 2. | All | unaudited |
+| `shared_lease_across_processes_blocks_exclusive` | `src/lib.rs:1001-1059` | Python child holds shared lock; parent exclusive is `Held`, shared succeeds, exclusive succeeds after child exits. | Unix | unaudited |
+| `epoch_persists_across_store_instances` | `src/lib.rs:1062-1073` | Fresh store instance observes epochs 1 then 2. | All | unaudited |
 
 ## Adjacent in-repo checks
 

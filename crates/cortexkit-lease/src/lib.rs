@@ -357,10 +357,16 @@ fn read_epoch(file: &mut (impl Read + Seek)) -> std::io::Result<u64> {
             "lease epoch is not an unsigned decimal integer",
         ));
     }
-    std::str::from_utf8(&bytes)
-        .map_err(|_| invalid_epoch("lease epoch is not an unsigned decimal integer"))?
-        .parse()
-        .map_err(|_| invalid_epoch("lease epoch is outside the u64 range"))
+    // Every byte is an ASCII digit, so accumulate directly. A `str` hop would
+    // add an unreachable UTF-8 error arm that no input can exercise.
+    bytes
+        .iter()
+        .try_fold(0u64, |accumulated, digit| {
+            accumulated
+                .checked_mul(10)?
+                .checked_add(u64::from(digit - b'0'))
+        })
+        .ok_or_else(|| invalid_epoch("lease epoch is outside the u64 range"))
 }
 
 /// Caller holds an exclusive lock while incrementing persisted epoch.
@@ -474,6 +480,9 @@ mod tests {
         use std::sync::{mpsc, Arc, Barrier, Condvar, Mutex};
 
         const HOLDERS: usize = 8;
+        // libtest has no per-test timeout, so an unbounded wait turns a worker
+        // that dies before reporting into a hung suite with no diagnostics.
+        const WAIT_LIMIT: std::time::Duration = std::time::Duration::from_secs(30);
         let (store, _dir) = tmp_store();
         let store = Arc::new(store);
         let start = Arc::new(Barrier::new(HOLDERS + 1));
@@ -498,16 +507,22 @@ mod tests {
                 .expect("report acquisition");
                 if result.is_ok() {
                     let (released, wake) = &*release;
-                    let mut released = released.lock().expect("lock release flag");
-                    while !*released {
-                        released = wake.wait(released).expect("wait for release");
-                    }
+                    let (_guard, timeout) = wake
+                        .wait_timeout_while(
+                            released.lock().expect("lock release flag"),
+                            WAIT_LIMIT,
+                            |released| !*released,
+                        )
+                        .expect("wait for release");
+                    assert!(!timeout.timed_out(), "release signal timed out");
                 }
             }));
         }
         drop(tx);
         start.wait();
-        let results: Vec<_> = rx.iter().take(HOLDERS).collect();
+        let results: Vec<_> = (0..HOLDERS)
+            .map(|_| rx.recv_timeout(WAIT_LIMIT).expect("shared holder report"))
+            .collect();
         {
             let (released, wake) = &*release;
             *released.lock().expect("lock release flag") = true;
@@ -647,25 +662,82 @@ mod tests {
         }
 
         // This models ordered prefix writes only, not File, device, or power-loss behavior.
-        let total_write_len = (EPOCH_WIDTH - 2) + EPOCH_WIDTH;
-        for limit in 0..total_write_len {
-            let mut writer = ShortWriter {
-                inner: std::io::Cursor::new(b"41".to_vec()),
-                remaining: limit,
-            };
-            persist_epoch(&mut writer, 42).expect_err("short write must fail");
-            if let Ok(parsed) = read_epoch(&mut writer) {
-                assert!(parsed >= 41, "prefix write rolled epoch back");
-            }
+        struct Case {
+            seed: &'static [u8],
+            previous: u64,
+            next: u64,
+            expected_bytes: &'static [u8],
+            /// Counts parseable short-write states so the monotonicity assertion
+            /// cannot pass vacuously.
+            expected_parseable: usize,
         }
 
-        let mut writer = ShortWriter {
-            inner: std::io::Cursor::new(b"41".to_vec()),
-            remaining: total_write_len,
-        };
-        persist_epoch(&mut writer, 42).expect("complete write");
-        assert_eq!(read_epoch(&mut writer).expect("read complete epoch"), 42);
-        assert_eq!(writer.inner.into_inner(), b"00000000000000000042");
+        let cases = [
+            Case {
+                seed: b"41",
+                previous: 41,
+                next: 42,
+                expected_bytes: b"00000000000000000042",
+                expected_parseable: 1,
+            },
+            Case {
+                seed: b"99",
+                previous: 99,
+                next: 100,
+                expected_bytes: b"00000000000000000100",
+                expected_parseable: 1,
+            },
+            Case {
+                seed: b"00000000000000000041",
+                previous: 41,
+                next: 42,
+                expected_bytes: b"00000000000000000042",
+                expected_parseable: EPOCH_WIDTH,
+            },
+            Case {
+                seed: b"00000000000000000099",
+                previous: 99,
+                next: 100,
+                expected_bytes: b"00000000000000000100",
+                expected_parseable: EPOCH_WIDTH,
+            },
+        ];
+
+        for case in cases {
+            let total_write_len = (EPOCH_WIDTH - case.seed.len()) + EPOCH_WIDTH;
+            let mut parseable = 0usize;
+            for limit in 0..total_write_len {
+                let mut writer = ShortWriter {
+                    inner: std::io::Cursor::new(case.seed.to_vec()),
+                    remaining: limit,
+                };
+                persist_epoch(&mut writer, case.next).expect_err("short write must fail");
+                if let Ok(parsed) = read_epoch(&mut writer) {
+                    parseable += 1;
+                    assert!(
+                        parsed >= case.previous,
+                        "prefix write rolled epoch back: seed {:?}, limit {limit}, parsed {parsed}",
+                        case.seed
+                    );
+                }
+            }
+            assert_eq!(
+                parseable, case.expected_parseable,
+                "prefix-write oracle observed {parseable} parseable states for seed {:?}, expected {}",
+                case.seed, case.expected_parseable
+            );
+
+            let mut writer = ShortWriter {
+                inner: std::io::Cursor::new(case.seed.to_vec()),
+                remaining: total_write_len,
+            };
+            persist_epoch(&mut writer, case.next).expect("complete write");
+            assert_eq!(
+                read_epoch(&mut writer).expect("read complete epoch"),
+                case.next
+            );
+            assert_eq!(writer.inner.into_inner(), case.expected_bytes);
+        }
     }
 
     #[cfg(unix)]
