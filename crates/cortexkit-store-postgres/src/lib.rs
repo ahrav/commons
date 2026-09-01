@@ -25,9 +25,11 @@ pub enum StoreError {
         holder_epoch: i64,
         db_epoch: i64,
     },
-    /// A negative persisted epoch prevents proving monotonic fencing, because every
-    /// positive holder epoch compares as newer. The store refuses to authorize writes
-    /// until an operator resets `cortexkit_lease.epoch`.
+    /// The persisted epoch cannot be reconciled with this holder's: it is negative, or
+    /// it is below the epoch `open_postgres` stamped, which no later write lowers.
+    /// Authorizing the write would also authorize a superseded writer whose epoch
+    /// exceeds the regressed value, so the store refuses until an operator resets
+    /// `cortexkit_lease.epoch`.
     FenceCorrupt {
         db_epoch: i64,
     },
@@ -53,8 +55,8 @@ impl std::fmt::Display for StoreError {
             ),
             StoreError::FenceCorrupt { db_epoch } => write!(
                 f,
-                "database fence epoch {db_epoch} is negative; reset cortexkit_lease.epoch to \
-                 at least the highest epoch a writer has used"
+                "database fence epoch {db_epoch} cannot be reconciled with this writer; \
+                 reset cortexkit_lease.epoch to at least the highest epoch a writer has used"
             ),
         }
     }
@@ -130,7 +132,7 @@ impl PostgresStore {
     /// # Errors
     ///
     /// Returns [`StoreError::Fenced`] when a newer writer owns the database.
-    /// Returns [`StoreError::FenceCorrupt`] when the persisted epoch is negative.
+    /// Returns [`StoreError::FenceCorrupt`] when the persisted epoch is negative or below this holder's.
     /// Returns [`StoreError::Backend`] when transaction setup, the callback, commit, or a backend fence-check operation fails, or when the callback ended the transaction.
     pub fn with_client_fenced<T>(
         &self,
@@ -227,6 +229,12 @@ fn check_fence(
             holder_epoch,
             db_epoch,
         });
+    }
+    // `bump_epoch` stamps the holder's epoch at open and no later write lowers it, so a
+    // stored value below it means the row regressed. Accepting it would let a superseded
+    // writer whose epoch is also above the regressed value commit after handover.
+    if db_epoch < holder_epoch {
+        return Err(StoreError::FenceCorrupt { db_epoch });
     }
     Ok(TransactionWitness {
         xact_id: row.get(1),
@@ -711,6 +719,51 @@ mod tests {
         assert!(
             matches!(fenced, Err(StoreError::FenceCorrupt { db_epoch: -5 })),
             "a negative epoch fails closed rather than authorizing the write, got {fenced:?}"
+        );
+    }
+
+    #[test]
+    fn a_regressed_positive_epoch_fails_closed() {
+        let Some(dsn) = test_dsn() else {
+            return;
+        };
+        let ns = unique_ns("regress");
+        let d = descriptor(&dsn, &ns);
+        // Reopen twice so the stamped epoch is above 1 and a lower positive value exists.
+        drop(open_postgres(&d).expect("open"));
+        drop(open_postgres(&d).expect("reopen"));
+        let store = open_postgres(&d).expect("reopen again");
+        let key = store.lease_key;
+        let stamped = store.epoch();
+        assert!(
+            stamped >= 3,
+            "expected a stamped epoch above 1, got {stamped}"
+        );
+
+        store
+            .with_client_unfenced(|c| {
+                c.execute(
+                    "UPDATE cortexkit_lease SET epoch = 1 WHERE lease_key = $1",
+                    &[&key],
+                )
+            })
+            .expect("regress the row");
+
+        let fenced = store.with_client_fenced(|_| Ok(()));
+        assert!(
+            matches!(fenced, Err(StoreError::FenceCorrupt { db_epoch: 1 })),
+            "a positive epoch below the one stamped at open fails closed, got {fenced:?}"
+        );
+
+        let stale = PostgresStore {
+            client: std::sync::Mutex::new(Client::connect(&dsn, NoTls).expect("client")),
+            epoch: stamped - 1,
+            lease_key: key,
+        };
+        let stale_write = stale.with_client_fenced(|_| Ok(()));
+        assert!(
+            matches!(stale_write, Err(StoreError::FenceCorrupt { db_epoch: 1 })),
+            "a superseded writer above the regressed value is rejected too, got {stale_write:?}"
         );
     }
 

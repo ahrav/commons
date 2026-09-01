@@ -140,10 +140,11 @@ mod sqlite_backend {
         /// `with_conn` permits read-only queries and connection-local configuration.
         /// `PRAGMA query_only` makes database writes fail with `SQLITE_READONLY`,
         /// which keeps every durable write on the fenced path
-        /// ([`Self::with_conn_fenced`]). The callback additionally runs without the
-        /// capability to reconfigure or leave its scope: pragma writes, transaction
-        /// control, savepoints, and `ATTACH`/`DETACH` are denied. Pragma reads and
-        /// ordinary queries are unaffected.
+        /// ([`Self::with_conn_fenced`]). The callback receives a [`GuardedConn`] rather
+        /// than the connection, so it cannot replace the guard, set pragmas, run
+        /// statement batches, or control transactions. Statements that reach the database
+        /// are additionally checked: pragma writes, transaction control, savepoints,
+        /// `ATTACH`/`DETACH`, and writes to the fence and version tables are denied.
         ///
         /// # Errors
         ///
@@ -151,11 +152,11 @@ mod sqlite_backend {
         /// write or a denied statement, or if the scope cannot be installed or released.
         pub fn with_conn<T>(
             &self,
-            f: impl FnOnce(&Connection) -> rusqlite::Result<T>,
+            f: impl FnOnce(&GuardedConn<'_>) -> rusqlite::Result<T>,
         ) -> Result<T, StoreError> {
             let guard = self.conn.lock().unwrap_or_else(|p| p.into_inner());
             let scope = CallbackScope::read_only(&guard)?;
-            let out = f(&guard);
+            let out = f(&GuardedConn::new(&guard));
             let restored = scope.release();
             let out = out.map_err(|e| StoreError::Backend(e.to_string()))?;
             restored?;
@@ -193,9 +194,12 @@ mod sqlite_backend {
         /// database for this epoch and runs `f`, committing atomically. Returning an
         /// error from `f` rolls the transaction back.
         ///
-        /// The callback cannot leave the fence-checked transaction: transaction control,
-        /// savepoints, pragma writes, and `ATTACH`/`DETACH` are denied for its duration,
-        /// so no statement of its can commit outside the checked transaction.
+        /// The callback receives a [`GuardedConn`], so it holds neither the transaction
+        /// nor the connection and cannot commit, replace the guard, or set pragmas.
+        /// Transaction control, savepoints, `ATTACH`/`DETACH`, and writes to the fence
+        /// and version tables are denied for its duration, so no statement of its can
+        /// commit outside the checked transaction or alter the authority that checked
+        /// it.
         ///
         /// # Errors
         ///
@@ -203,7 +207,7 @@ mod sqlite_backend {
         /// Returns [`StoreError::Backend`] if transaction setup, fence access, the callback, a denied statement, the durability pin, the scope, or commit fails.
         pub fn with_conn_fenced<T>(
             &self,
-            f: impl FnOnce(&rusqlite::Transaction) -> rusqlite::Result<T>,
+            f: impl FnOnce(&GuardedConn<'_>) -> rusqlite::Result<T>,
         ) -> Result<T, StoreError> {
             let mut guard = self.conn.lock().unwrap_or_else(|p| p.into_inner());
             pin_fence_durability(&guard)?;
@@ -214,7 +218,7 @@ mod sqlite_backend {
             claim_fence(&tx, self.epoch)?;
 
             let scope = CallbackScope::writable(&tx)?;
-            let out = f(&tx);
+            let out = f(&GuardedConn::new(&tx));
             scope.release()?;
             let out = out.map_err(|e| StoreError::Backend(e.to_string()))?;
             tx.commit()
@@ -238,6 +242,58 @@ mod sqlite_backend {
         pub fn migrate(&self, namespace: &str, migrations: &[Migration]) -> Result<(), StoreError> {
             let mut guard = self.conn.lock().unwrap_or_else(|p| p.into_inner());
             run_migrations(&mut guard, self.epoch, namespace, migrations)
+        }
+    }
+
+    /// A callback that holds `&Connection` can call `Connection::authorizer` and replace
+    /// the guard installed for it, because that method takes `&self`. No authorizer,
+    /// pragma, or statement rule can survive that, so a guarded callback receives this
+    /// handle instead: it forwards ordinary statements and omits authorizer control,
+    /// pragma writes, statement batches, and transaction control.
+    pub struct GuardedConn<'a> {
+        conn: &'a Connection,
+    }
+
+    impl<'a> GuardedConn<'a> {
+        fn new(conn: &'a Connection) -> Self {
+            Self { conn }
+        }
+
+        /// # Errors
+        ///
+        /// Returns the SQLite error from preparing or running `sql`, or from `f`.
+        pub fn query_row<T, P, F>(&self, sql: &str, params: P, f: F) -> rusqlite::Result<T>
+        where
+            P: rusqlite::Params,
+            F: FnOnce(&rusqlite::Row<'_>) -> rusqlite::Result<T>,
+        {
+            self.conn.query_row(sql, params, f)
+        }
+
+        /// # Errors
+        ///
+        /// Returns the SQLite error from preparing or running `sql`.
+        pub fn execute<P: rusqlite::Params>(
+            &self,
+            sql: &str,
+            params: P,
+        ) -> rusqlite::Result<usize> {
+            self.conn.execute(sql, params)
+        }
+
+        /// # Errors
+        ///
+        /// Returns the SQLite error from preparing `sql`.
+        pub fn prepare(&self, sql: &str) -> rusqlite::Result<rusqlite::Statement<'a>> {
+            self.conn.prepare(sql)
+        }
+
+        pub fn last_insert_rowid(&self) -> i64 {
+            self.conn.last_insert_rowid()
+        }
+
+        pub fn changes(&self) -> u64 {
+            self.conn.changes()
         }
     }
 
@@ -329,8 +385,25 @@ mod sqlite_backend {
             | AuthAction::Savepoint { .. }
             | AuthAction::Attach { .. }
             | AuthAction::Detach { .. } => Authorization::Deny,
+            AuthAction::Insert { table_name }
+            | AuthAction::Update { table_name, .. }
+            | AuthAction::Delete { table_name }
+            | AuthAction::DropTable { table_name }
+            | AuthAction::AlterTable { table_name, .. }
+                if is_infrastructure_table(table_name) =>
+            {
+                Authorization::Deny
+            }
             _ => Authorization::Allow,
         }
+    }
+
+    /// The fence row carries the authority a fenced write is checked against, and the
+    /// version table records which migrations ran. A callback that lowered either would
+    /// let a superseded writer reclaim the database or re-run a migration.
+    fn is_infrastructure_table(table_name: &str) -> bool {
+        table_name.eq_ignore_ascii_case("cortexkit_fence")
+            || table_name.eq_ignore_ascii_case("cortexkit_schema_version")
     }
 
     /// `with_conn_unfenced` remains unrestricted by contract, so `synchronous` and the
@@ -1043,7 +1116,7 @@ mod tests {
         let store = open_sqlite(&d).expect("open");
         store.migrate("kv", FENCE_SCHEMA).expect("migrate");
 
-        let lowered = store.with_conn(|c| c.pragma_update(None, "synchronous", "OFF"));
+        let lowered = store.with_conn(|c| c.execute("PRAGMA synchronous = OFF", []));
         assert!(
             matches!(&lowered, Err(StoreError::Backend(m)) if m.contains("not authorized")),
             "the read guard denies lowering synchronous, got {lowered:?}"
@@ -1111,7 +1184,7 @@ mod tests {
         store.migrate("kv", FENCE_SCHEMA).expect("migrate");
 
         let bypass = store.with_conn(|c| {
-            c.pragma_update(None, "query_only", "OFF")?;
+            c.execute("PRAGMA query_only = OFF", [])?;
             c.execute("INSERT INTO kv (k, v) VALUES ('bypass', '1')", [])
                 .map(|_| ())
         });
@@ -1120,7 +1193,8 @@ mod tests {
             "clearing the guard is denied before any write runs, got {bypass:?}"
         );
         for pragma in ["journal_mode", "locking_mode", "writable_schema"] {
-            let denied = store.with_conn(|c| c.pragma_update(None, pragma, "EXCLUSIVE"));
+            let denied =
+                store.with_conn(|c| c.execute(&format!("PRAGMA {pragma} = EXCLUSIVE"), []));
             assert!(
                 matches!(&denied, Err(StoreError::Backend(m)) if m.contains("not authorized")),
                 "setting {pragma} from a read callback is denied, got {denied:?}"
@@ -1129,7 +1203,7 @@ mod tests {
         // SQLite pragma names are case-insensitive.
         for spelling in ["QUERY_ONLY", "Query_Only", "qUeRy_OnLy"] {
             let denied = store.with_conn(|c| {
-                c.execute_batch(&format!("PRAGMA {spelling}=OFF"))?;
+                c.execute(&format!("PRAGMA {spelling} = OFF"), [])?;
                 c.execute("INSERT INTO kv (k, v) VALUES ('cased', '1')", [])
                     .map(|_| ())
             });
@@ -1167,9 +1241,9 @@ mod tests {
 
         for control in ["COMMIT", "ROLLBACK", "SAVEPOINT s", "BEGIN"] {
             let r = store.with_conn_fenced(|tx| {
-                tx.execute_batch(&format!(
-                    "{control}; INSERT INTO kv (k, v) VALUES ('escaped', '1')"
-                ))?;
+                tx.execute(control, [])?;
+                tx.execute("INSERT INTO kv (k, v) VALUES ('escaped', '1')", [])
+                    .map(|_| ())?;
                 Ok(())
             });
             assert!(
@@ -1219,11 +1293,55 @@ mod tests {
     }
 
     #[test]
+    fn a_callback_cannot_damage_the_fence_row_it_is_checked_against() {
+        let (root, d) = tmp();
+        let store = open_sqlite(&d).expect("open");
+        store.migrate("kv", FENCE_SCHEMA).expect("migrate");
+        let epoch = store.epoch();
+
+        for sql in [
+            "UPDATE cortexkit_fence SET epoch = 0 WHERE id = 0",
+            "DELETE FROM cortexkit_fence WHERE id = 0",
+            "INSERT INTO cortexkit_schema_version (namespace, version, applied_at_unix) \
+             VALUES ('kv', 99, 0)",
+        ] {
+            let r = store.with_conn_fenced(|tx| tx.execute(sql, []).map(|_| ()));
+            assert!(
+                matches!(&r, Err(StoreError::Backend(m)) if m.contains("not authorized")),
+                "`{sql}` is denied inside a fenced callback, got {r:?}"
+            );
+        }
+
+        let stored: i64 = store
+            .with_conn(|c| {
+                c.query_row("SELECT epoch FROM cortexkit_fence WHERE id = 0", [], |r| {
+                    r.get(0)
+                })
+            })
+            .expect("read the fence row");
+        assert_eq!(
+            stored, epoch as i64,
+            "the fence row still carries the epoch the callbacks were checked against"
+        );
+
+        let migration = &[Migration {
+            version: 8,
+            statements: "UPDATE cortexkit_fence SET epoch = 0 WHERE id = 0;",
+        }];
+        let m = store.migrate("fencerow", migration);
+        assert!(
+            matches!(&m, Err(StoreError::Migration(msg)) if msg.contains("not authorized")),
+            "a migration that lowers the fence row is denied, got {m:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn maintenance_runs_through_the_unfenced_path() {
         let (root, d) = tmp();
         let store = open_sqlite(&d).expect("open");
         store.migrate("kv", FENCE_SCHEMA).expect("migrate");
-        let r = store.with_conn(|c| c.execute_batch("VACUUM"));
+        let r = store.with_conn(|c| c.execute("VACUUM", []));
         assert!(
             matches!(&r, Err(StoreError::Backend(m)) if m.contains("authorization denied")),
             "VACUUM must not pass the read callback scope, got {r:?}"
