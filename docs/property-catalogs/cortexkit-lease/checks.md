@@ -14,7 +14,7 @@ No production `assert!`, `debug_assert!`, `panic!`, or equivalent invariant batt
 | `FileLeaseStore::acquire_above`, `LeaseStore::acquire` (`src/lib.rs:260-286,316-318`) | Exclusive acquisition | Uses `try_lock`, classifies contention, and issues an epoch above the persisted value and a caller-supplied floor. Trait acquisition reuses floor zero. | Exclusive liveness gate, error taxonomy, and durable-resource epoch recovery. |
 | `LeaseStore::acquire_shared` (`src/lib.rs:320-342`) | Shared acquisition | Uses `try_lock_shared` and reads without mutation. | Concurrent shared-first acquisition and exclusion matrix. |
 | `FileLeaseHandle::drop` (`src/lib.rs:310-312`) | Handle `Drop` | Best-effort `File::unlock`; error discarded; descriptor then closes. | Drop releases lease. |
-| `read_epoch` (`src/lib.rs:400-428`) | Bounded epoch parse | Reads at most 21 bytes into a bounded vector; existing empty state and anything except 1-20 ASCII digits in `u64` range are rejected. | Malformed, empty, oversized, and overflowing state fails closed. |
+| `read_epoch` (`src/lib.rs:399-428`) | Bounded epoch parse | Reads at most 21 bytes into a bounded vector; existing empty state and anything except 1-20 ASCII digits in `u64` range are rejected. | Malformed, empty, oversized, and overflowing state fails closed. |
 | `bump_epoch_above`, `persist_epoch` (`src/lib.rs:431-439,444-452`) | Epoch update | Checked increment above both persisted state and floor; no truncate; fixed-width decimal overwrite with invalid-marker conversion only for 1-19 byte legacy states. | Exhaustion errors; ordered prefix writes cannot leave a lower parseable value in the injected model. |
 | `LeaseKey::identity`, `FileLeaseStore::lease_path`, `fnv1a`, `fnv1a_hex` | Identity/path derivation | Public separator-joined identity and FNV functions feed the private `.lease` path helper. | Stable namespaced identity. |
 | `LeaseHandle`, `LeaseStore` | Trait bounds | Handles and stores are `Send + Sync`. | Cross-thread use compiles. |
@@ -32,18 +32,18 @@ No production `assert!`, `debug_assert!`, `panic!`, or equivalent invariant batt
 | `epoch_errors_keep_the_underlying_os_error` | `src/lib.rs:676-702` | Epoch error context preserves the original `io::Error` and raw OS error through the source chain. | All | unaudited |
 | `maximum_epoch_is_readable_but_exhausted` | `src/lib.rs:704-728` | Shared acquisition reads `u64::MAX`; exclusive acquisition reports exhaustion and preserves bytes. | All | unaudited |
 | `interrupted_persist_never_leaves_a_lower_parseable_epoch` | `src/lib.rs:730-842` | Injected ordered prefix-write failures exercise production `persist_epoch` and `read_epoch` for legacy-width and canonical-width prior states, including a carry; any parseable aftermath is not lower, completion is fixed-width, and the count of parseable aftermaths is asserted per case. | All, in-memory `Read + Write + Seek` seam | unaudited |
-| `acquisition_refuses_symlink_and_leaves_target_untouched` | `src/lib.rs:844-871` | Exclusive and shared acquisition fail; target content and mode remain unchanged. | Unix | unaudited |
-| `acquisition_refuses_fifo_without_blocking` | `src/lib.rs:873-893` | Both modes reject a Unix FIFO opened with `O_NONBLOCK`. | Unix | unaudited |
-| `an_acquired_lease_file_is_owner_only` | `src/lib.rs:895-923` | `mode == 0600`; message: lease stayed group/world writable. | Unix | unaudited |
-| `protect_file_refuses_a_symlink_and_leaves_its_target_untouched` | `src/lib.rs:925-960` | `protect_file` returns `InvalidInput` and target remains `0644`. | Unix | unaudited |
-| `protect_file_ignores_a_missing_path` | `src/lib.rs:962-971` | Missing path returns `Ok`. | All; trivial on non-Unix | unaudited |
-| `identity_hash_derivation_is_stable` | `src/lib.rs:973-979` | Pins one public identity string and exact filename digest. | All | unaudited |
+| `acquisition_refuses_symlink_and_leaves_target_untouched` | `src/lib.rs:845-871` | Exclusive and shared acquisition fail; target content and mode remain unchanged. | Unix | unaudited |
+| `acquisition_refuses_fifo_without_blocking` | `src/lib.rs:874-893` | Both modes reject a Unix FIFO opened with `O_NONBLOCK`. | Unix | unaudited |
+| `an_acquired_lease_file_is_owner_only` | `src/lib.rs:898-923` | `mode == 0600`; message: lease stayed group/world writable. | Unix | unaudited |
+| `protect_file_refuses_a_symlink_and_leaves_its_target_untouched` | `src/lib.rs:933-960` | `protect_file` returns `InvalidInput` and target remains `0644`. | Unix | unaudited |
+| `protect_file_ignores_a_missing_path` | `src/lib.rs:966-971` | Missing path returns `Ok`. | All; trivial on non-Unix | unaudited |
+| `identity_hash_derivation_is_stable` | `src/lib.rs:975-979` | Pins one public identity string and exact filename digest. | All | unaudited |
 | `acquire_then_second_holder_is_rejected` | `src/lib.rs:981-996` | Second live exclusive is `Held`; re-acquired epoch is greater. | All | unaudited |
 | `distinct_identity_axes_do_not_conflict` | `src/lib.rs:998-1018` | Distinct scopes, modules, and backends acquire independently at epoch 1. | All | unaudited |
 | `shared_holders_coexist_but_block_exclusive` | `src/lib.rs:1020-1051` | Two shared holders coexist; exclusive remains `Held` until last drop. | All | unaudited |
 | `exclusive_holder_blocks_shared` | `src/lib.rs:1053-1068` | Shared is `Held` under exclusive, then succeeds after drop. | All | unaudited |
 | `shared_acquisition_does_not_bump_the_write_epoch` | `src/lib.rs:1070-1094` | Writer 1, shared 1/1, writer 2. | All | unaudited |
-| `shared_lease_across_processes_blocks_exclusive` | `src/lib.rs:1096-1160` | Python child holds shared lock; parent exclusive is `Held`, shared succeeds, exclusive succeeds after child exits. | Unix | unaudited |
+| `shared_lease_across_processes_blocks_exclusive` | `src/lib.rs:1101-1160` | Python child holds shared lock; parent exclusive is `Held`, shared succeeds, exclusive succeeds after child exits. | Unix | unaudited |
 | `epoch_persists_across_store_instances` | `src/lib.rs:1162-1174` | Fresh store instance observes epochs 1 then 2. | All | unaudited |
 
 ## Adjacent in-repo checks
