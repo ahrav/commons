@@ -127,9 +127,6 @@ impl PostgresStore {
     /// Callbacks must not send transaction-control SQL.
     /// Ending the fence-checked transaction inside the callback fails the store operation.
     ///
-    /// Callbacks must not send transaction-control SQL.
-    /// Ending the fence-checked transaction inside the callback fails the store operation.
-    ///
     /// # Errors
     ///
     /// Returns [`StoreError::Fenced`] when a newer writer owns the database.

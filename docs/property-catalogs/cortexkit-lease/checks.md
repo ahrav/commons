@@ -73,19 +73,19 @@ These are outside the target crate but explicitly exercise or consume its contra
 | `superseded_writer_cannot_migrate` | `cortexkit-store/src/lib.rs:1369-1400` | Synthetic stale migration is fenced before its schema SQL executes. | unaudited |
 | `equal_epoch_writer_is_not_fenced` | `cortexkit-store/src/lib.rs:1402-1423` | Equal epoch can continue writing. | unaudited |
 | `epoch_above_sqlite_integer_range_fails` | `cortexkit-store/src/lib.rs:1425-1441` | Epochs above SQLite's signed integer range fail instead of wrapping. | unaudited |
-| `open_migrate_and_single_writer` | `cortexkit-store-postgres/src/lib.rs:546-578` | Live PostgreSQL covers migration and session exclusion. Requires `CORTEXKIT_TEST_PG_DSN`; CI has a required live job. | unaudited |
-| `read_only_callback_rejects_mutation_without_rows` | `cortexkit-store-postgres/src/lib.rs:789-822` | Read-only mutation reports SQLSTATE `25006` and leaves rows unchanged. | unaudited |
-| `a_callback_cannot_damage_the_lease_row_it_is_fenced_against` | `cortexkit-store-postgres/src/lib.rs:720-765` | A fenced callback that deletes or lowers its own lease row is rejected and rolled back. | unaudited |
-| `a_callback_that_ends_the_transaction_is_rejected` | `cortexkit-store-postgres/src/lib.rs:580-623` | A fenced callback or migration that sends `COMMIT` is rejected instead of reporting success. | unaudited |
-| `a_read_callback_cannot_escape_read_only_mode` | `cortexkit-store-postgres/src/lib.rs:625-685` | A read callback that sends `COMMIT` or `SET TRANSACTION READ WRITE` is rejected; only the autocommitted write survives. | unaudited |
-| `a_negative_epoch_fails_closed` | `cortexkit-store-postgres/src/lib.rs:687-718` | The lease table rejects a negative epoch, and a negative epoch reaching the fence returns `FenceCorrupt`. | unaudited |
-| `unfenced_callback_runs_statements_a_transaction_forbids` | `cortexkit-store-postgres/src/lib.rs:767-787` | `VACUUM` reports SQLSTATE `25001` inside a fenced transaction and succeeds through the autocommit callback. | unaudited |
-| `fenced_callback_error_rolls_back_rows` | `cortexkit-store-postgres/src/lib.rs:824-858` | Callback failure rolls back domain rows. | unaudited |
-| `repeated_fenced_writes_at_current_epoch_succeed` | `cortexkit-store-postgres/src/lib.rs:860-880` | Repeated writes at the current lease epoch succeed. | unaudited |
-| `superseded_writer_is_rejected_after_reopen` | `cortexkit-store-postgres/src/lib.rs:882-914` | Synthetic stale callback is rejected after reopen. | unaudited |
-| `superseded_writer_cannot_migrate` | `cortexkit-store-postgres/src/lib.rs:916-952` | Synthetic stale migration is fenced before its schema SQL executes. | unaudited |
-| `independent_namespace_chains` | `cortexkit-store-postgres/src/lib.rs:954-984` | Independent migrations both apply. | unaudited |
-| `advisory_key_derivation_is_stable` | `cortexkit-store-postgres/src/lib.rs:988-992` | Pins one advisory bigint derived through public `LeaseKey::identity` and `fnv1a`. | unaudited |
+| `open_migrate_and_single_writer` | `cortexkit-store-postgres/src/lib.rs:543-575` | Live PostgreSQL covers migration and session exclusion. Requires `CORTEXKIT_TEST_PG_DSN`; CI has a required live job. | unaudited |
+| `read_only_callback_rejects_mutation_without_rows` | `cortexkit-store-postgres/src/lib.rs:786-819` | Read-only mutation reports SQLSTATE `25006` and leaves rows unchanged. | unaudited |
+| `a_callback_cannot_damage_the_lease_row_it_is_fenced_against` | `cortexkit-store-postgres/src/lib.rs:717-762` | A fenced callback that deletes or lowers its own lease row is rejected and rolled back. | unaudited |
+| `a_callback_that_ends_the_transaction_is_rejected` | `cortexkit-store-postgres/src/lib.rs:577-620` | A fenced callback or migration that sends `COMMIT` is rejected instead of reporting success. | unaudited |
+| `a_read_callback_cannot_escape_read_only_mode` | `cortexkit-store-postgres/src/lib.rs:622-682` | A read callback that sends `COMMIT` or `SET TRANSACTION READ WRITE` is rejected; only the autocommitted write survives. | unaudited |
+| `a_negative_epoch_fails_closed` | `cortexkit-store-postgres/src/lib.rs:684-715` | The lease table rejects a negative epoch, and a negative epoch reaching the fence returns `FenceCorrupt`. | unaudited |
+| `unfenced_callback_runs_statements_a_transaction_forbids` | `cortexkit-store-postgres/src/lib.rs:764-784` | `VACUUM` reports SQLSTATE `25001` inside a fenced transaction and succeeds through the autocommit callback. | unaudited |
+| `fenced_callback_error_rolls_back_rows` | `cortexkit-store-postgres/src/lib.rs:821-855` | Callback failure rolls back domain rows. | unaudited |
+| `repeated_fenced_writes_at_current_epoch_succeed` | `cortexkit-store-postgres/src/lib.rs:857-877` | Repeated writes at the current lease epoch succeed. | unaudited |
+| `superseded_writer_is_rejected_after_reopen` | `cortexkit-store-postgres/src/lib.rs:879-911` | Synthetic stale callback is rejected after reopen. | unaudited |
+| `superseded_writer_cannot_migrate` | `cortexkit-store-postgres/src/lib.rs:913-949` | Synthetic stale migration is fenced before its schema SQL executes. | unaudited |
+| `independent_namespace_chains` | `cortexkit-store-postgres/src/lib.rs:951-981` | Independent migrations both apply. | unaudited |
+| `advisory_key_derivation_is_stable` | `cortexkit-store-postgres/src/lib.rs:985-989` | Pins one advisory bigint derived through public `LeaseKey::identity` and `fnv1a`. | unaudited |
 
 The handover checks use synthetic stores that bypass real lease acquisition. They check fence logic against real database transactions, not an end-to-end retained-connection handover.
 
