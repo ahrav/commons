@@ -1,11 +1,11 @@
 [package]
 name = "cortexkit-store-types"
-version = "0.1.0"
+version = "0.1.1"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-description = "Dependency-light storage descriptor types: the wire/config contract for CortexKit module storage."
+description = "Shared storage descriptor and migration types for CortexKit."
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }

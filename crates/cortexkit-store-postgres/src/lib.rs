@@ -12,15 +12,7 @@ use cortexkit_lease::{fnv1a, LeaseError, LeaseKey};
 use cortexkit_store_types::{StorageBackend, StorageDescriptor};
 use postgres::{Client, NoTls};
 
-pub use cortexkit_store_types::{Isolation, StorageBackend as Backend};
-
-/// An ordered schema migration: DDL and/or seed `INSERT`s applied exactly once,
-/// in ascending `version` order, tracked per `(namespace, version)`.
-#[derive(Debug, Clone, Copy)]
-pub struct Migration {
-    pub version: u32,
-    pub statements: &'static str,
-}
+pub use cortexkit_store_types::{Isolation, Migration, StorageBackend as Backend};
 
 #[derive(Debug)]
 pub enum StoreError {
