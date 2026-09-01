@@ -23,9 +23,18 @@ the reason the epoch file must outlive its actor (see lease crate docs:
 advisory-lock + persisted epoch CAS; the file is never unlinked, by design,
 to avoid the unlink-inode race).
 
+The U4 `cortexkit-lease` 0.2 breaking-revision trigger fired. The migration
+remains parked because packed-table dual-write rollout requires consumer
+coordination that is unavailable for this change. Combining that layout
+migration with independent lease-state safety hardening would make both changes
+harder to verify.
+
 ~1 GiB/year of block-amplified small files is real but not worth risking a
 fencing invariant on this fleet's timeline. The measurement is done and
 recorded so the future decision starts from evidence.
+
+Process death during temporary-file publication can leave a stale `.tmp` orphan;
+it does not replace the final lease path.
 
 ## Re-open triggers (any one), each watched by the seat that can see it
 

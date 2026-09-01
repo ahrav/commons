@@ -9,8 +9,9 @@ Maintained by the **subc** seat: direction, review, and releases.
 Two crates carry a standing review obligation to the **claustrum** (vault) seat,
 who must be routed any change to:
 
-- `cortexkit-store` / `cortexkit-lease` — they run the only real-daemon test
-  exercising the single-writer lease across two processes.
+- `cortexkit-store` / `cortexkit-lease` — changes carry an external review and
+  real-daemon coverage obligation. A claustrum review receipt remains a merge
+  gate because no qualifying test exists in this repository or was supplied.
 - **`cortexkit-paths` canonicalization** — see the warning below.
 
 That is a duty carried, not a veto held.
@@ -49,6 +50,24 @@ entire channel.
 Bump on any change to observable behaviour or emitted bytes. Not for comments or
 tests — a version that moves for prose trains readers to bump reflexively, which
 is how it stops meaning anything.
+
+### `cortexkit-lease` 0.2 compatibility
+
+Version 0.2 never publishes an empty final lease file: it initializes epoch zero
+in a same-directory temporary file and publishes that inode without replacing an
+existing path. Existing empty lease files fail with `InvalidData`. Versions
+0.1.x can still create an empty file during a mixed-version rollout. Upgrade
+every consumer that shares a lease root before any consumer starts using 0.2.
+
+Do not recover an invalid epoch by deleting its lease file. Deletion resets the
+counter and is unsafe when a database or another consumer retains a fence. After
+stopping every holder for that key, choose a decimal `u64` greater than every
+persisted consumer fence. Write exactly 20 ASCII digits with no newline, then
+restart only upgraded consumers:
+
+```sh
+printf '%020s' "$epoch" | tr ' ' 0 > "$lease_file"
+```
 
 ## Crates
 

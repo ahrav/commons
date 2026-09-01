@@ -56,7 +56,7 @@ The steady-state mode property does not dominate path-target stability. A test c
 
 ### Lease-root topology (unresolved shared dependency)
 
-`distinct-lease-keys-do-not-alias`, `lease-file-growth-trigger-is-observed`, `filesystem-lock-scope-matches-deployment`, and `logical-store-has-single-lease-identity` depend on whether a consumer places many logical stores under one root. The lease crate describes a shared root (`src/lib.rs:26-28`); the in-repo SQLite consumer derives one root per database parent (`cortexkit-store/src/lib.rs:245-260`); the density measurement implies at least one external consumer uses a high-cardinality shared root (`docs/lease-store-density.md:7-11`). Impact remains conditional until deployment topology is supplied.
+`distinct-lease-keys-do-not-alias`, `lease-file-growth-trigger-is-observed`, `filesystem-lock-scope-matches-deployment`, and `logical-store-has-single-lease-identity` depend on whether a consumer places many logical stores under one root. The lease crate describes a shared root (`src/lib.rs:10-14`); the in-repo SQLite consumer derives one root per database parent (`cortexkit-store/src/lib.rs:245-260`); the density measurement implies at least one external consumer uses a high-cardinality shared root (`docs/lease-store-density.md:7-11`). Impact remains conditional until deployment topology is supplied.
 
 ### Resource mechanism
 
@@ -66,12 +66,12 @@ The steady-state mode property does not dominate path-target stability. A test c
 
 The never-unlink rule protects exclusion but causes accumulation. Cleanup pressure therefore increases the chance of introducing the exact replacement fault that inode stability forbids.
 
-The parked dual-store migration at `docs/lease-store-density.md:44-51` is out of scope because it is not implemented. Its stated dual-durability premise depends on `returned-epoch-is-crash-durable`, which current code contradicts.
+The parked dual-store migration at `docs/lease-store-density.md:53-60` is out of scope because it is not implemented. Its stated dual-durability premise depends on `returned-epoch-is-crash-durable`, which current code contradicts.
 
 ## Coverage relationships
 
 - `cross-process-exclusive-race-is-reached` prevents vacuous evidence for `at-most-one-exclusive-holder-per-key`.
-- `epoch-update-interruption-window-is-reached` prevents vacuous evidence for crash atomicity. Returned-error state preservation requires an injected I/O error instead.
+- `epoch-update-interruption-window-is-reached` prevents vacuous evidence for process-interruption behavior. Returned-error state preservation requires an injected I/O error instead.
 - `live-lease-file-replacement-is-reached` prevents vacuous evidence for inode stability.
 
 Coverage checks assert enabling states only. None requires the prohibited outcome, such as two successful exclusive holders or a regressed epoch.

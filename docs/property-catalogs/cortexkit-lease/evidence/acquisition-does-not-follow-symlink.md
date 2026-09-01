@@ -1,9 +1,9 @@
 # `acquisition-does-not-follow-symlink`
 
 - **Discovery:** targeted security refinement after portfolio evaluation.
-- **Primary evidence:** exclusive acquisition opens or creates the path before calling `protect_file` (`crates/cortexkit-lease/src/lib.rs:240-254`), as does shared acquisition (`crates/cortexkit-lease/src/lib.rs:278-288`); `protect_file` is a no-op off Unix (`crates/cortexkit-lease/src/lib.rs:80-82`).
-- **Existing evidence:** `protect_file_refuses_a_symlink_and_leaves_its_target_untouched` invokes `protect_file` directly on a static symlink (`crates/cortexkit-lease/src/lib.rs:426-466`), bypassing acquisition's open-before-protect ordering.
-- **Failure scenario:** Unix dangling target is created before refusal; non-Unix target can be locked and epoch-written through the link.
+- **Primary evidence:** `lease_open_options` applies Unix `O_NOFOLLOW`; Windows applies `FILE_FLAG_OPEN_REPARSE_POINT`, and `protect_open_file` rejects reparse-point metadata.
+- **Existing evidence:** `acquisition_refuses_symlink_and_leaves_target_untouched` exercises exclusive and shared acquisition against an existing Unix symlink target. Windows compilation is checked separately.
+- **Failure scenario:** Windows runtime behavior, other non-Unix targets, and dangling Unix symlink coverage remain untested.
 - **Timing window:** symlink exists before open; no race is required.
-- **Instrumentation:** target existence/content/mode snapshots plus syscall or descriptor tracing proving no acquisition-owned descriptor resolves to the target inode.
-- **Open-question log:** Windows deployment support is not declared, though CI and lock-specific code include Windows.
+- **Instrumentation:** existing-target content and mode snapshots exist; dangling-target and Windows runtime coverage do not.
+- **Open-question log:** Windows deployment support is not declared, though lock-specific code compiles for Windows.

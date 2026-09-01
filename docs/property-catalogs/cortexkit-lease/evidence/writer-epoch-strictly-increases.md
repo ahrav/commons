@@ -1,9 +1,9 @@
 # `writer-epoch-strictly-increases`
 
 - **Discovery:** data-integrity, protocol, and wildcard passes.
-- **Primary evidence:** contract at `crates/cortexkit-lease/src/lib.rs:11-16,135-137`; `bump_epoch` implementation at `:326-339`.
-- **Contradictory code evidence:** `parse().unwrap_or(0)` (`crates/cortexkit-lease/src/lib.rs:332`) can reset; `saturating_add(1)` (`:333`) reissues `u64::MAX`; truncate-before-write (`:334-337`) opens a regression window.
-- **Existing evidence:** `acquire_then_second_holder_is_rejected` (`crates/cortexkit-lease/src/lib.rs:490-506`) and `epoch_persists_across_store_instances` (`:693-706`) cover clean acquisitions only.
-- **Failure scenario:** crash, write failure, restore, malformed body, or maximum body causes a non-increasing returned token.
+- **Primary evidence:** contract at `crates/cortexkit-lease/src/lib.rs:2-6`; `read_epoch`, `bump_epoch`, and `persist_epoch` provide bounded parsing, checked increment, and fixed-width update.
+- **Contradictory code evidence:** no stable-storage sync supports a machine-power-loss claim; exact partial-I/O behavior is untested.
+- **Existing evidence:** `invalid_epoch_states_fail_closed` and `interrupted_persist_never_leaves_a_lower_parseable_epoch` cover invalid, exhausted, and ordered prefix-write cases; clean acquisition tests cover process-local persistence.
+- **Failure scenario:** machine power loss or restoration of an older valid file can still cause a non-increasing returned token.
 - **Instrumentation:** missing external maximum-ever-returned witness per physical root and key tuple.
-- **Open-question log:** no code comment or commit explains saturation. No repair protocol exists for regression.
+- **Open-question log:** no repair protocol exists for an older valid file or power-loss regression.

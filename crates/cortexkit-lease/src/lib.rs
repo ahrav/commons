@@ -1,9 +1,10 @@
 //!
 //! At most one live writer may hold a lease per logical store.
 //!
-//! Liveness uses an OS advisory lock. Kernel releases the lock on process death.
-//! Fencing uses persisted, monotonically increasing epochs to distinguish writer
-//! incarnations.
+//! Liveness uses an OS advisory lock, which the kernel releases when a process's
+//! descriptors close. Fencing uses persisted, monotonically increasing epochs to
+//! distinguish writer incarnations. This process-death behavior does not make
+//! epoch writes durable across power loss or storage-cache loss.
 //!
 //! ## Key namespacing
 //!
@@ -19,8 +20,15 @@ use std::{
     path::PathBuf,
 };
 
-/// Protects an existing Unix regular file with mode `0600`. Missing paths succeed;
-/// on non-Unix targets, the function does nothing.
+const EPOCH_WIDTH: usize = 20;
+
+/// Accepts missing sidecars and hardens existing Unix regular-file sidecars.
+///
+/// On non-Unix targets, this function does nothing.
+///
+/// Callers must ensure no untrusted principal can replace names in the parent
+/// directory during metadata or permission operations.
+/// Callers own SQLite databases and other files; this helper must not open them.
 /// # Errors
 ///
 /// Returns filesystem errors or `InvalidInput` for a non-regular Unix path.
@@ -34,13 +42,7 @@ pub fn protect_file(path: &std::path::Path) -> std::io::Result<()> {
             Err(error) => return Err(error),
         };
         if !metadata.is_file() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!(
-                    "{} is not a regular file; refusing to change its permissions",
-                    path.display()
-                ),
-            ));
+            return Err(non_regular_file(path));
         }
         if metadata.permissions().mode() & 0o777 != 0o600 {
             std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
@@ -49,6 +51,95 @@ pub fn protect_file(path: &std::path::Path) -> std::io::Result<()> {
     #[cfg(not(unix))]
     let _ = path;
     Ok(())
+}
+
+fn protect_open_file(file: &File, path: &std::path::Path) -> std::io::Result<()> {
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(non_regular_file(path));
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+        if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(non_regular_file(path));
+        }
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if metadata.permissions().mode() & 0o777 != 0o600 {
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        }
+    }
+    Ok(())
+}
+
+fn non_regular_file(path: &std::path::Path) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::InvalidInput,
+        format!(
+            "{} is not a regular file; refusing permission or lease operations",
+            path.display()
+        ),
+    )
+}
+
+fn lease_open_options() -> OpenOptions {
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    options
+}
+
+fn open_lease_file(path: &std::path::Path) -> std::io::Result<File> {
+    let parent = path.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "lease path has no parent directory",
+        )
+    })?;
+    const OPEN_ATTEMPTS: usize = 3;
+    for _ in 0..OPEN_ATTEMPTS {
+        match lease_open_options().open(path) {
+            Ok(file) => {
+                protect_open_file(&file, path)?;
+                return Ok(file);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+
+        let mut temp = tempfile::NamedTempFile::new_in(parent)?;
+        persist_epoch(temp.as_file_mut(), 0)?;
+        match temp.persist_noclobber(path) {
+            Ok(file) => {
+                protect_open_file(&file, path)?;
+                return Ok(file);
+            }
+            Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error.error),
+        }
+    }
+
+    Err(std::io::Error::new(
+        std::io::ErrorKind::WouldBlock,
+        format!(
+            "lease path {} changed during {OPEN_ATTEMPTS} open attempts",
+            path.display()
+        ),
+    ))
 }
 
 /// Shared lease roots require namespaced keys.
@@ -94,7 +185,7 @@ pub trait LeaseHandle: Send + Sync + std::fmt::Debug {
 
 #[derive(Debug)]
 pub enum LeaseError {
-    /// A live writer already holds the lease for this key.
+    /// A conflicting live holder owns the lease for this key.
     Held {
         key: LeaseKey,
     },
@@ -106,7 +197,7 @@ impl std::fmt::Display for LeaseError {
         match self {
             LeaseError::Held { key } => write!(
                 f,
-                "storage for module '{}' (backend {}, scope '{}') is held by a live writer",
+                "storage for module '{}' (backend {}, scope '{}') is held by a conflicting live lease",
                 key.module_id, key.backend, key.scope_key
             ),
             LeaseError::Io(e) => write!(f, "lease io: {e}"),
@@ -182,20 +273,7 @@ impl LeaseStore for FileLeaseStore {
     fn acquire(&self, key: &LeaseKey) -> Result<Box<dyn LeaseHandle>, LeaseError> {
         std::fs::create_dir_all(&self.base_dir).map_err(LeaseError::Io)?;
         let path = self.lease_path(key);
-        let mut file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&path)
-            .map_err(LeaseError::Io)?;
-        // The lease is the single-writer fence, so a world-WRITABLE lease file is
-        // an integrity question rather than a privacy one: anything able to write
-        // the persisted epoch can forge the fence token that readers use to
-        // detect a stale writer.
-        protect_file(&path).map_err(LeaseError::Io)?;
-
-        // A live holder owns the lock, so try_lock fails with WouldBlock.
+        let mut file = open_lease_file(&path).map_err(LeaseError::Io)?;
         match file.try_lock() {
             Ok(()) => {}
             Err(TryLockError::WouldBlock) => {
@@ -205,9 +283,9 @@ impl LeaseStore for FileLeaseStore {
         }
 
         // We hold the lock: bump the persisted epoch (the CAS fence token).
-        let epoch = bump_epoch(&mut file).map_err(|e| {
+        let epoch = bump_epoch(&mut file).map_err(|error| {
             let _ = file.unlock();
-            LeaseError::Io(e)
+            LeaseError::Io(epoch_path_error(&path, "bump", error))
         })?;
 
         Ok(Box::new(FileLeaseHandle {
@@ -220,18 +298,7 @@ impl LeaseStore for FileLeaseStore {
     fn acquire_shared(&self, key: &LeaseKey) -> Result<Box<dyn LeaseHandle>, LeaseError> {
         std::fs::create_dir_all(&self.base_dir).map_err(LeaseError::Io)?;
         let path = self.lease_path(key);
-        let mut file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&path)
-            .map_err(LeaseError::Io)?;
-        protect_file(&path).map_err(LeaseError::Io)?;
-
-        // Shared liveness gate: only an exclusive holder contends; other shared
-        // holders coexist (flock shared mode on unix, LockFileEx shared mode on
-        // Windows).
+        let mut file = open_lease_file(&path).map_err(LeaseError::Io)?;
         match file.try_lock_shared() {
             Ok(()) => {}
             Err(TryLockError::WouldBlock) => {
@@ -240,11 +307,9 @@ impl LeaseStore for FileLeaseStore {
             Err(TryLockError::Error(e)) => return Err(LeaseError::Io(e)),
         }
 
-        // Read-only peek at the persisted writer epoch: shared holders are not
-        // writers, so the epoch is NOT bumped (it fences durable writes only).
-        let epoch = read_epoch(&mut file).map_err(|e| {
+        let epoch = read_epoch(&mut file).map_err(|error| {
             let _ = file.unlock();
-            LeaseError::Io(e)
+            LeaseError::Io(epoch_path_error(&path, "read", error))
         })?;
 
         Ok(Box::new(FileLeaseHandle {
@@ -255,26 +320,70 @@ impl LeaseStore for FileLeaseStore {
     }
 }
 
+fn invalid_epoch(message: impl Into<String>) -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::InvalidData, message.into())
+}
+
+fn epoch_path_error(
+    path: &std::path::Path,
+    operation: &str,
+    error: std::io::Error,
+) -> std::io::Error {
+    std::io::Error::new(
+        error.kind(),
+        format!(
+            "failed to {operation} lease epoch at {}: {error}",
+            path.display()
+        ),
+    )
+}
+
 /// Shared holders do not modify persisted epoch.
-fn read_epoch(file: &mut File) -> std::io::Result<u64> {
-    let mut buf = String::new();
+fn read_epoch(file: &mut (impl Read + Seek)) -> std::io::Result<u64> {
     file.seek(SeekFrom::Start(0))?;
-    file.read_to_string(&mut buf)?;
-    Ok(buf.trim().parse().unwrap_or(0))
+    let mut bytes = Vec::with_capacity(EPOCH_WIDTH + 1);
+    file.take((EPOCH_WIDTH + 1) as u64)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > EPOCH_WIDTH {
+        return Err(invalid_epoch(format!(
+            "lease epoch exceeds {EPOCH_WIDTH} bytes"
+        )));
+    }
+    if bytes.is_empty() {
+        return Err(invalid_epoch("lease epoch is empty"));
+    }
+    if !bytes.iter().all(u8::is_ascii_digit) {
+        return Err(invalid_epoch(
+            "lease epoch is not an unsigned decimal integer",
+        ));
+    }
+    std::str::from_utf8(&bytes)
+        .map_err(|_| invalid_epoch("lease epoch is not an unsigned decimal integer"))?
+        .parse()
+        .map_err(|_| invalid_epoch("lease epoch is outside the u64 range"))
 }
 
 /// Caller holds an exclusive lock while incrementing persisted epoch.
 fn bump_epoch(file: &mut File) -> std::io::Result<u64> {
-    let mut buf = String::new();
-    file.seek(SeekFrom::Start(0))?;
-    file.read_to_string(&mut buf)?;
-    let prev: u64 = buf.trim().parse().unwrap_or(0);
-    let next = prev.saturating_add(1);
-    file.set_len(0)?;
-    file.seek(SeekFrom::Start(0))?;
-    file.write_all(next.to_string().as_bytes())?;
-    file.flush()?;
+    let prev = read_epoch(file)?;
+    let next = prev
+        .checked_add(1)
+        .ok_or_else(|| invalid_epoch("lease epoch is exhausted"))?;
+    persist_epoch(file, next)?;
     Ok(next)
+}
+
+/// Caller ensures `epoch` exceeds every valid epoch already represented by the
+/// file. With ordered writes, a partial most-significant-first overwrite cannot
+/// leave a lower parseable epoch; it may leave invalid content.
+fn persist_epoch(file: &mut (impl Write + Seek), epoch: u64) -> std::io::Result<()> {
+    let current_len = file.seek(SeekFrom::End(0))?;
+    if (1..EPOCH_WIDTH as u64).contains(&current_len) {
+        file.write_all(&[b'x'; EPOCH_WIDTH][current_len as usize..])?;
+    }
+    file.seek(SeekFrom::Start(0))?;
+    file.write_all(format!("{epoch:0EPOCH_WIDTH$}").as_bytes())?;
+    file.flush()
 }
 
 /// FNV-1a 64-bit hash of a lease identity.
@@ -304,46 +413,325 @@ mod tests {
         LeaseKey::new("test-module", "sqlite", scope)
     }
 
-    fn tmp_store() -> (FileLeaseStore, PathBuf) {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static SEQ: AtomicU64 = AtomicU64::new(0);
-        // A process-wide atomic sequence prevents same-process test calls from
-        // sharing a directory when timestamps collide; a shared dir lets one
-        // test's cleanup delete another's live lease file.
-        let dir = std::env::temp_dir().join(format!(
-            "cortexkit-lease-{}-{}-{}",
-            std::process::id(),
-            fnv1a_hex(&format!("{:?}", std::time::Instant::now())),
-            SEQ.fetch_add(1, Ordering::Relaxed)
-        ));
-        (FileLeaseStore::new(&dir), dir)
+    fn tmp_store() -> (FileLeaseStore, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("create temporary lease directory");
+        (FileLeaseStore::new(dir.path()), dir)
     }
 
-    /// An acquired lease file is owner-only on disk, including one that already
-    /// exists with a permissive mode.
-    ///
-    /// The pre-existing half is the case that bites: every lease already on a
-    /// deployed machine was created at the umask default, so correcting only at
-    /// creation time would protect exactly the installations with no history.
-    ///
-    /// The lease is the single-writer FENCE, so the exposure here is integrity
-    /// rather than privacy — anything able to write the persisted epoch can
-    /// forge the token readers use to detect a stale writer.
-    ///
-    /// Mutation-proved: removing the `protect_file` call from `acquire` fails
-    /// this on the pre-existing case.
+    fn seed_epoch(store: &FileLeaseStore, key: &LeaseKey, bytes: &[u8]) -> PathBuf {
+        let path = store.lease_path(key);
+        std::fs::write(&path, bytes).expect("seed lease epoch");
+        path
+    }
+
+    #[test]
+    fn fresh_exclusive_initializes_to_one() {
+        let (store, _dir) = tmp_store();
+        let guard = store.acquire(&key("fresh")).expect("acquire fresh state");
+        assert_eq!(guard.epoch(), 1);
+        drop(guard);
+
+        let path = store.lease_path(&key("fresh"));
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read initialized epoch"),
+            "00000000000000000001"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(path)
+                    .expect("stat published lease")
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
+    }
+
+    #[test]
+    fn shared_first_initializes_canonical_zero() {
+        let (store, _dir) = tmp_store();
+        let k = key("shared-first");
+
+        let guard = store.acquire_shared(&k).expect("acquire shared first");
+        assert_eq!(guard.epoch(), 0);
+        assert_eq!(
+            std::fs::read_to_string(store.lease_path(&k)).expect("read initialized epoch"),
+            "00000000000000000000"
+        );
+        assert!(matches!(store.acquire(&k), Err(LeaseError::Held { .. })));
+        drop(guard);
+
+        let writer = store.acquire(&k).expect("acquire writer");
+        assert_eq!(writer.epoch(), 1);
+        drop(writer);
+    }
+
+    #[test]
+    fn concurrent_shared_first_acquisitions_coexist() {
+        use std::sync::{mpsc, Arc, Barrier, Condvar, Mutex};
+
+        const HOLDERS: usize = 8;
+        let (store, _dir) = tmp_store();
+        let store = Arc::new(store);
+        let start = Arc::new(Barrier::new(HOLDERS + 1));
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let (tx, rx) = mpsc::channel();
+        let mut threads = Vec::new();
+
+        for _ in 0..HOLDERS {
+            let store = Arc::clone(&store);
+            let start = Arc::clone(&start);
+            let release = Arc::clone(&release);
+            let tx = tx.clone();
+            threads.push(std::thread::spawn(move || {
+                start.wait();
+                let result = store.acquire_shared(&key("concurrent-shared-first"));
+                tx.send(
+                    result
+                        .as_ref()
+                        .map(|guard| guard.epoch())
+                        .map_err(ToString::to_string),
+                )
+                .expect("report acquisition");
+                if result.is_ok() {
+                    let (released, wake) = &*release;
+                    let mut released = released.lock().expect("lock release flag");
+                    while !*released {
+                        released = wake.wait(released).expect("wait for release");
+                    }
+                }
+            }));
+        }
+        drop(tx);
+        start.wait();
+        let results: Vec<_> = rx.iter().take(HOLDERS).collect();
+        {
+            let (released, wake) = &*release;
+            *released.lock().expect("lock release flag") = true;
+            wake.notify_all();
+        }
+        for thread in threads {
+            thread.join().expect("shared holder thread");
+        }
+
+        assert_eq!(results, vec![Ok(0); HOLDERS]);
+        assert_eq!(
+            std::fs::read_to_string(store.lease_path(&key("concurrent-shared-first")))
+                .expect("read initialized epoch"),
+            "00000000000000000000"
+        );
+    }
+
+    #[test]
+    fn legacy_decimal_epoch_is_canonicalized() {
+        let (store, _dir) = tmp_store();
+        let k = key("legacy");
+        let path = seed_epoch(&store, &k, b"41");
+
+        let guard = store.acquire(&k).expect("acquire legacy state");
+        assert_eq!(guard.epoch(), 42);
+        drop(guard);
+        assert_eq!(
+            std::fs::read_to_string(path).expect("read canonical epoch"),
+            "00000000000000000042"
+        );
+    }
+
+    #[test]
+    fn invalid_epoch_states_fail_closed() {
+        fn assert_invalid_data(
+            result: Result<Box<dyn LeaseHandle>, LeaseError>,
+            name: &str,
+            mode: &str,
+            path: &std::path::Path,
+        ) {
+            match result {
+                Err(LeaseError::Io(error)) => {
+                    assert_eq!(
+                        error.kind(),
+                        std::io::ErrorKind::InvalidData,
+                        "wrong {mode} error for {name}: {error}"
+                    );
+                    assert!(
+                        error.to_string().contains(&path.display().to_string()),
+                        "{mode} error omitted lease path {}: {error}",
+                        path.display()
+                    );
+                }
+                other => panic!("{mode} accepted {name}: {other:?}"),
+            }
+        }
+
+        let cases = [
+            ("empty", Vec::new()),
+            ("text", b"not-an-epoch".to_vec()),
+            ("whitespace", b"1\n".to_vec()),
+            ("invalid-utf8", b"\xff".to_vec()),
+            ("too-long", b"000000000000000000001".to_vec()),
+            ("u64-overflow", b"18446744073709551616".to_vec()),
+        ];
+
+        for (name, state) in cases {
+            let (store, _dir) = tmp_store();
+            let k = key(name);
+            let path = seed_epoch(&store, &k, &state);
+
+            assert_invalid_data(store.acquire(&k), name, "exclusive", &path);
+            assert_invalid_data(store.acquire_shared(&k), name, "shared", &path);
+            assert_eq!(std::fs::read(&path).expect("read epoch"), state);
+        }
+    }
+
+    #[test]
+    fn maximum_epoch_is_readable_but_exhausted() {
+        let (store, _dir) = tmp_store();
+        let k = key("maximum");
+        let state = u64::MAX.to_string();
+        let path = seed_epoch(&store, &k, state.as_bytes());
+
+        let shared = store.acquire_shared(&k).expect("read maximum epoch");
+        assert_eq!(shared.epoch(), u64::MAX);
+        drop(shared);
+        match store.acquire(&k) {
+            Err(LeaseError::Io(error)) => {
+                assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+                assert_eq!(
+                    error.to_string(),
+                    format!(
+                        "failed to bump lease epoch at {}: lease epoch is exhausted",
+                        path.display()
+                    )
+                );
+            }
+            other => panic!("exclusive accepted exhausted epoch: {other:?}"),
+        }
+        assert_eq!(std::fs::read_to_string(path).expect("read epoch"), state);
+    }
+
+    #[test]
+    fn interrupted_persist_never_leaves_a_lower_parseable_epoch() {
+        struct ShortWriter {
+            inner: std::io::Cursor<Vec<u8>>,
+            remaining: usize,
+        }
+
+        impl Write for ShortWriter {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                if self.remaining == 0 {
+                    return Err(std::io::Error::other("injected short write"));
+                }
+                let len = self.remaining.min(buf.len());
+                let written = self.inner.write(&buf[..len])?;
+                self.remaining -= written;
+                Ok(written)
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                self.inner.flush()
+            }
+        }
+
+        impl Read for ShortWriter {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                self.inner.read(buf)
+            }
+        }
+
+        impl Seek for ShortWriter {
+            fn seek(&mut self, position: SeekFrom) -> std::io::Result<u64> {
+                self.inner.seek(position)
+            }
+        }
+
+        // This models ordered prefix writes only, not File, device, or power-loss behavior.
+        let total_write_len = (EPOCH_WIDTH - 2) + EPOCH_WIDTH;
+        for limit in 0..total_write_len {
+            let mut writer = ShortWriter {
+                inner: std::io::Cursor::new(b"41".to_vec()),
+                remaining: limit,
+            };
+            persist_epoch(&mut writer, 42).expect_err("short write must fail");
+            if let Ok(parsed) = read_epoch(&mut writer) {
+                assert!(parsed >= 41, "prefix write rolled epoch back");
+            }
+        }
+
+        let mut writer = ShortWriter {
+            inner: std::io::Cursor::new(b"41".to_vec()),
+            remaining: total_write_len,
+        };
+        persist_epoch(&mut writer, 42).expect("complete write");
+        assert_eq!(read_epoch(&mut writer).expect("read complete epoch"), 42);
+        assert_eq!(writer.inner.into_inner(), b"00000000000000000042");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn acquisition_refuses_symlink_and_leaves_target_untouched() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (store, dir) = tmp_store();
+        let k = key("symlink-acquire");
+        let target = dir.path().join("target");
+        let target_bytes = b"00000000000000000041";
+        std::fs::write(&target, target_bytes).expect("write target");
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o644))
+            .expect("set target mode");
+        let link = store.lease_path(&k);
+        std::os::unix::fs::symlink(&target, &link).expect("symlink lease path");
+
+        assert!(store.acquire(&k).is_err());
+        assert!(store.acquire_shared(&k).is_err());
+
+        assert_eq!(std::fs::read(&target).expect("read target"), target_bytes);
+        assert_eq!(
+            std::fs::metadata(&target)
+                .expect("stat target")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o644
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn acquisition_refuses_fifo_without_blocking() {
+        use std::{ffi::CString, os::unix::ffi::OsStrExt};
+
+        let (store, _dir) = tmp_store();
+        let k = key("fifo");
+        let path = store.lease_path(&k);
+        let c_path = CString::new(path.as_os_str().as_bytes()).expect("path has no NUL");
+        // SAFETY: `c_path` is NUL-terminated and points to valid memory for the call.
+        let result = unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) };
+        assert_eq!(
+            result,
+            0,
+            "mkfifo failed: {}",
+            std::io::Error::last_os_error()
+        );
+
+        assert!(store.acquire(&k).is_err());
+        assert!(store.acquire_shared(&k).is_err());
+    }
+
+    /// Acquisition sets a pre-existing permissive lease file to owner-only.
+    /// Write access to the epoch file permits fence-token forgery.
     #[cfg(unix)]
     #[test]
     fn an_acquired_lease_file_is_owner_only() {
         use std::os::unix::fs::PermissionsExt;
 
-        let (store, dir) = tmp_store();
+        let (store, _dir) = tmp_store();
         let k = key("perm");
 
-        // Reproduce a lease left behind by an older build at the umask default.
-        std::fs::create_dir_all(&dir).expect("create lease dir");
+        // Acquisition must normalize existing files, not only create new files safely.
         let path = store.lease_path(&k);
-        std::fs::write(&path, b"").expect("pre-create lease file");
+        std::fs::write(&path, b"0").expect("pre-create lease file");
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
             .expect("set permissive mode");
 
@@ -359,7 +747,6 @@ mod tests {
         );
 
         drop(guard);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// `protect_file` refuses a symlink rather than following it.
@@ -374,22 +761,19 @@ mod tests {
     fn protect_file_refuses_a_symlink_and_leaves_its_target_untouched() {
         use std::os::unix::fs::PermissionsExt;
 
-        let dir = std::env::temp_dir().join(format!(
-            "cortexkit-lease-symlink-{}-{}",
-            std::process::id(),
-            fnv1a_hex(&format!("{:?}", std::time::Instant::now()))
-        ));
-        std::fs::create_dir_all(&dir).expect("create dir");
-        let target = dir.join("target");
+        let dir = tempfile::tempdir().expect("create temporary directory");
+        let target = dir.path().join("target");
         std::fs::write(&target, b"not mine").expect("write target");
         std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o644))
             .expect("set target mode");
-        let link = dir.join("link");
+        let link = dir.path().join("link");
         std::os::unix::fs::symlink(&target, &link).expect("symlink");
 
-        assert!(
-            protect_file(&link).is_err(),
-            "a symlink must be refused rather than followed"
+        assert_eq!(
+            protect_file(&link)
+                .expect_err("a symlink must be refused rather than followed")
+                .kind(),
+            std::io::ErrorKind::InvalidInput
         );
         let mode = std::fs::metadata(&target)
             .expect("stat target")
@@ -400,8 +784,6 @@ mod tests {
             mode, 0o644,
             "the symlink target was chmod-ed through the link"
         );
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A path that does not exist is not an error: callers pass optional
@@ -410,11 +792,8 @@ mod tests {
     /// fresh database would fail on its missing WAL.
     #[test]
     fn protect_file_ignores_a_missing_path() {
-        let missing = std::env::temp_dir().join(format!(
-            "cortexkit-lease-absent-{}-{}",
-            std::process::id(),
-            fnv1a_hex(&format!("{:?}", std::time::Instant::now()))
-        ));
+        let dir = tempfile::tempdir().expect("create temporary directory");
+        let missing = dir.path().join("missing");
         assert!(protect_file(&missing).is_ok());
     }
 
@@ -428,7 +807,7 @@ mod tests {
 
     #[test]
     fn acquire_then_second_holder_is_rejected() {
-        let (store, dir) = tmp_store();
+        let (store, _dir) = tmp_store();
         let k = key("alpha");
 
         let g1 = store.acquire(&k).expect("first acquire");
@@ -441,51 +820,33 @@ mod tests {
         let g2 = store.acquire(&k).expect("re-acquire after release");
         assert!(g2.epoch() > e1, "epoch is monotonic across acquisitions");
         drop(g2);
-        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
-    fn distinct_scopes_do_not_conflict() {
-        let (store, dir) = tmp_store();
-        let a = store.acquire(&key("a")).expect("a");
-        let b = store.acquire(&key("b")).expect("b - different scope");
-        assert_eq!(a.epoch(), 1);
-        assert_eq!(b.epoch(), 1);
-        drop((a, b));
-        let _ = std::fs::remove_dir_all(dir);
-    }
+    fn distinct_identity_axes_do_not_conflict() {
+        let (store, _dir) = tmp_store();
+        let pairs = [
+            (key("scope-a"), key("scope-b")),
+            (
+                LeaseKey::new("module-a", "sqlite", "same-scope"),
+                LeaseKey::new("module-b", "sqlite", "same-scope"),
+            ),
+            (
+                LeaseKey::new("module", "sqlite", "same-scope"),
+                LeaseKey::new("module", "postgres", "same-scope"),
+            ),
+        ];
 
-    #[test]
-    fn distinct_modules_do_not_conflict_on_same_scope() {
-        // The Oracle's must-fix: two modules sharing one lease root must NOT
-        // collide on the same scope_key. The module_id is part of the key.
-        let (store, dir) = tmp_store();
-        let a = store
-            .acquire(&LeaseKey::new("module-a", "sqlite", "same-scope"))
-            .expect("module-a");
-        let b = store
-            .acquire(&LeaseKey::new("module-b", "sqlite", "same-scope"))
-            .expect("module-b - different module, same scope, must not conflict");
-        drop((a, b));
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[test]
-    fn distinct_backends_do_not_conflict_on_same_scope() {
-        let (store, dir) = tmp_store();
-        let a = store
-            .acquire(&LeaseKey::new("m", "sqlite", "s"))
-            .expect("sqlite");
-        let b = store
-            .acquire(&LeaseKey::new("m", "postgres", "s"))
-            .expect("postgres - different backend, same scope");
-        drop((a, b));
-        let _ = std::fs::remove_dir_all(dir);
+        for (first, second) in pairs {
+            let first = store.acquire(&first).expect("acquire first identity");
+            let second = store.acquire(&second).expect("acquire distinct identity");
+            assert_eq!((first.epoch(), second.epoch()), (1, 1));
+        }
     }
 
     #[test]
     fn shared_holders_coexist_but_block_exclusive() {
-        let (store, dir) = tmp_store();
+        let (store, _dir) = tmp_store();
         let k = key("shared");
 
         let s1 = store.acquire_shared(&k).expect("first shared");
@@ -514,12 +875,11 @@ mod tests {
             .acquire(&k)
             .expect("exclusive after all shared holders released");
         drop(g);
-        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
     fn exclusive_holder_blocks_shared() {
-        let (store, dir) = tmp_store();
+        let (store, _dir) = tmp_store();
         let k = key("excl-blocks-shared");
 
         let g = store.acquire(&k).expect("exclusive");
@@ -532,12 +892,11 @@ mod tests {
             .acquire_shared(&k)
             .expect("shared after exclusive released");
         drop(s);
-        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
     fn shared_acquisition_does_not_bump_the_write_epoch() {
-        let (store, dir) = tmp_store();
+        let (store, _dir) = tmp_store();
         let k = key("epoch-neutral");
 
         let g = store.acquire(&k).expect("writer");
@@ -559,7 +918,6 @@ mod tests {
             "writer epoch continues from 1: shared holders did not consume epochs"
         );
         drop(g2);
-        let _ = std::fs::remove_dir_all(dir);
     }
 
     // Unix-only: the child uses fcntl.flock. On Windows, the same-process tests
@@ -582,7 +940,7 @@ mod tests {
         let g = store.acquire(&k).expect("seed");
         drop(g);
         let lock_path = {
-            let mut entries = std::fs::read_dir(&dir).expect("lease dir");
+            let mut entries = std::fs::read_dir(dir.path()).expect("lease dir");
             let entry = entries.next().expect("one lease file").expect("dir entry");
             entry.path()
         };
@@ -626,7 +984,6 @@ mod tests {
         child.wait().expect("child exit");
         let g = store.acquire(&k).expect("exclusive after child released");
         drop(g);
-        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -636,11 +993,10 @@ mod tests {
         let g = store.acquire(&k).expect("acquire");
         assert_eq!(g.epoch(), 1);
         drop(g);
-        // A fresh store over the same dir continues the epoch (survives restart).
-        let store2 = FileLeaseStore::new(&dir);
+        // A fresh store over the same directory continues the persisted epoch.
+        let store2 = FileLeaseStore::new(dir.path());
         let g2 = store2.acquire(&k).expect("re-acquire");
         assert_eq!(g2.epoch(), 2);
         drop(g2);
-        let _ = std::fs::remove_dir_all(dir);
     }
 }
