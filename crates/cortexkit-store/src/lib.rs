@@ -168,17 +168,18 @@ mod sqlite_backend {
         /// transaction, so maintenance statements run here on the
         /// lease-holding connection. Fence-protected durable mutations belong
         /// in [`Self::with_conn_fenced`]; SQLite does not enforce that
-        /// restriction here.
+        /// restriction here. The handle reaches pragmas and statement batches but not the
+        /// authorizer, which only the store installs.
         ///
         /// # Errors
         ///
         /// Returns [`StoreError::Backend`] when the callback fails.
         pub fn with_conn_unfenced<T>(
             &self,
-            f: impl FnOnce(&Connection) -> rusqlite::Result<T>,
+            f: impl FnOnce(&MaintenanceConn<'_>) -> rusqlite::Result<T>,
         ) -> Result<T, StoreError> {
             let guard = self.conn.lock().unwrap_or_else(|p| p.into_inner());
-            f(&guard).map_err(|e| StoreError::Backend(e.to_string()))
+            f(&MaintenanceConn::new(&guard)).map_err(|e| StoreError::Backend(e.to_string()))
         }
 
         /// Run a closure inside an epoch-fenced write transaction. The write is
@@ -252,6 +253,68 @@ mod sqlite_backend {
     /// pragma writes, statement batches, and transaction control.
     pub struct GuardedConn<'a> {
         conn: &'a Connection,
+    }
+
+    /// [`SqliteStore::with_conn_unfenced`] must reach pragmas and statement batches, but
+    /// an authorizer installed through it would be cleared by the next guarded callback's
+    /// scope, silently dropping the caller's access policy. Authorizer control therefore
+    /// stays out of both handles, which leaves the store the only installer.
+    pub struct MaintenanceConn<'a> {
+        conn: &'a Connection,
+    }
+
+    impl<'a> MaintenanceConn<'a> {
+        fn new(conn: &'a Connection) -> Self {
+            Self { conn }
+        }
+
+        /// # Errors
+        ///
+        /// Returns the SQLite error from preparing or running `sql`, or from `f`.
+        pub fn query_row<T, P, F>(&self, sql: &str, params: P, f: F) -> rusqlite::Result<T>
+        where
+            P: rusqlite::Params,
+            F: FnOnce(&rusqlite::Row<'_>) -> rusqlite::Result<T>,
+        {
+            self.conn.query_row(sql, params, f)
+        }
+
+        /// # Errors
+        ///
+        /// Returns the SQLite error from preparing or running `sql`.
+        pub fn execute<P: rusqlite::Params>(
+            &self,
+            sql: &str,
+            params: P,
+        ) -> rusqlite::Result<usize> {
+            self.conn.execute(sql, params)
+        }
+
+        /// # Errors
+        ///
+        /// Returns the SQLite error from running any statement in `sql`.
+        pub fn execute_batch(&self, sql: &str) -> rusqlite::Result<()> {
+            self.conn.execute_batch(sql)
+        }
+
+        /// # Errors
+        ///
+        /// Returns the SQLite error from preparing `sql`.
+        pub fn prepare(&self, sql: &str) -> rusqlite::Result<rusqlite::Statement<'a>> {
+            self.conn.prepare(sql)
+        }
+
+        /// # Errors
+        ///
+        /// Returns the SQLite error from setting the pragma.
+        pub fn pragma_update(
+            &self,
+            schema: Option<&str>,
+            name: &str,
+            value: impl rusqlite::ToSql,
+        ) -> rusqlite::Result<()> {
+            self.conn.pragma_update(schema, name, value)
+        }
     }
 
     impl<'a> GuardedConn<'a> {
@@ -419,7 +482,15 @@ mod sqlite_backend {
             | AuthAction::Reindex {
                 index_name: table_name,
             }
-            | AuthAction::Analyze { table_name } => table_name,
+            | AuthAction::Analyze { table_name }
+            | AuthAction::CreateVtable { table_name, .. }
+            | AuthAction::DropVtable { table_name, .. } => table_name,
+            // A view resolves ahead of the table it shadows on this connection, so a
+            // forged `cortexkit_fence` would let a stale writer read its own epoch.
+            AuthAction::CreateView { view_name }
+            | AuthAction::CreateTempView { view_name }
+            | AuthAction::DropView { view_name }
+            | AuthAction::DropTempView { view_name } => view_name,
             _ => return None,
         };
         is_infrastructure_table(table).then_some(table)
@@ -1338,6 +1409,10 @@ mod tests {
              BEGIN SELECT RAISE(IGNORE); END",
             "DROP TABLE cortexkit_fence",
             "CREATE INDEX fence_idx ON cortexkit_fence (epoch)",
+            // A view resolves ahead of the table it shadows, so a stale connection could
+            // read its own epoch and skip the claim entirely.
+            "CREATE TEMP VIEW cortexkit_fence AS SELECT 0 AS id, 1 AS epoch",
+            "CREATE VIEW cortexkit_schema_version AS SELECT 1",
         ] {
             let r = store.with_conn_fenced(|tx| tx.execute(sql, []).map(|_| ()));
             assert!(
@@ -1350,13 +1425,24 @@ mod tests {
             .with_conn(|c| {
                 c.query_row(
                     "SELECT COUNT(*) FROM sqlite_schema WHERE name IN \
-                     ('freeze_fence', 'fence_idx')",
+                     ('freeze_fence', 'fence_idx', 'cortexkit_schema_version') \
+                     AND type <> 'table'",
                     [],
                     |r| r.get(0),
                 )
             })
             .expect("schema lookup");
         assert_eq!(objects, 0, "no denied schema object was created");
+        let shadow: i64 = store
+            .with_conn(|c| {
+                c.query_row(
+                    "SELECT COUNT(*) FROM temp.sqlite_schema WHERE name = 'cortexkit_fence'",
+                    [],
+                    |r| r.get(0),
+                )
+            })
+            .expect("temp schema lookup");
+        assert_eq!(shadow, 0, "no temporary object shadows the fence table");
 
         let stored: i64 = store
             .with_conn(|c| {

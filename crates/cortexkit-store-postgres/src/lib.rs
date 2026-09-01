@@ -438,6 +438,22 @@ fn bump_epoch(client: &mut Client, lease_id: i64) -> Result<i64, StoreError> {
         .get(0);
     require_nonnegative_epoch(epoch)?;
     require_epoch_advanced(previous, epoch)?;
+    // `RETURNING` yields the tuple the statement produced, which an `AFTER UPDATE` trigger
+    // can still overwrite. Re-reading the committed row is the only value a later
+    // `check_fence` will compare against.
+    let stored: i64 = tx
+        .query_one(
+            "SELECT epoch FROM cortexkit_lease WHERE lease_key = $1 FOR UPDATE",
+            &[&lease_id],
+        )
+        .map_err(migration_error)?
+        .get(0);
+    if stored != epoch {
+        return Err(StoreError::Migration(format!(
+            "lease epoch {epoch} was issued but the row stores {stored}; a rule or trigger \
+             on cortexkit_lease can rewrite the epoch after the increment"
+        )));
+    }
     tx.commit().map_err(migration_error)?;
     Ok(epoch)
 }
@@ -856,6 +872,33 @@ mod tests {
                 "issuing {issued} while the row held {previous} is rejected, got {r:?}"
             );
         }
+    }
+
+    #[test]
+    fn open_verifies_the_stored_epoch_matches_the_issued_one() {
+        let Some(dsn) = test_dsn() else {
+            return;
+        };
+        let ns = unique_ns("stored");
+        let d = descriptor(&dsn, &ns);
+        let store = open_postgres(&d).expect("open");
+        let key = store.lease_key;
+        let issued = store.epoch();
+
+        let stored: i64 = store
+            .with_client_read(|c| {
+                Ok(c.query_one(
+                    "SELECT epoch FROM cortexkit_lease WHERE lease_key = $1",
+                    &[&key],
+                )?
+                .get(0))
+            })
+            .expect("read the row");
+        assert_eq!(
+            stored, issued,
+            "open re-reads the committed row, so an AFTER trigger rewriting the epoch \
+             cannot leave the issued value unbacked"
+        );
     }
 
     #[test]

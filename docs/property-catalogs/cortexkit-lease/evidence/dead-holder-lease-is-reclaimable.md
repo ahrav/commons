@@ -2,7 +2,7 @@
 
 - **Discovery:** claimed-liveness and failure-recovery passes.
 - **Primary evidence:** the file-backend contract says the kernel releases the advisory lock on process death (`crates/cortexkit-lease/src/lib.rs:4`). PostgreSQL instead holds a session advisory lock, which the server releases when the connection drops (`crates/cortexkit-store-postgres/src/lib.rs:7-9,69-75`); normal drop also attempts `pg_advisory_unlock` before closing the connection (`:306-314`).
-- **Existing evidence:** `shared_lease_across_processes_blocks_exclusive` lets the child exit normally after a sleep; every in-process file release runs `Drop`. PostgreSQL reopens only after normal `PostgresStore` drop (`crates/cortexkit-store-postgres/src/lib.rs:976-989`).
+- **Existing evidence:** `shared_lease_across_processes_blocks_exclusive` lets the child exit normally after a sleep; every in-process file release runs `Drop`. PostgreSQL reopens only after normal `PostgresStore` drop (`crates/cortexkit-store-postgres/src/lib.rs:1019-1032`).
 - **Failure scenario:** a killed file-lock holder leaves a lock that a replacement cannot reclaim on the deployed filesystem, or a dead PostgreSQL holder's connection remains live at the server and keeps its session advisory lock.
 - **Timing window:** kill while handle is live; recovery check starts after process exit is confirmed.
 - **Instrumentation:** missing non-unwinding child termination for the file backend, forced holder or connection termination for PostgreSQL, and bounded recovery deadlines for both.
