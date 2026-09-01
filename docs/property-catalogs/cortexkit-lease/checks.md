@@ -52,33 +52,36 @@ These are outside the target crate but explicitly exercise or consume its contra
 
 | Test | Location | Claim | Status |
 |---|---|---|---|
-| `reopening_a_permissive_store_protects_the_database_and_its_wal` | `cortexkit-store/src/lib.rs:542-597` | Database and WAL are `0600` on reopen. | unaudited |
-| `open_claims_fence_before_return` | `cortexkit-store/src/lib.rs:635-648` | Open stamps the lease epoch before exposing the store. | unaudited |
-| `open_claim_rejects_an_epoch_the_database_already_stores` | `cortexkit-store/src/lib.rs:654-691` | The open claim rejects an epoch equal to the stored fence; `claim_fence` still authorizes it. | unaudited |
-| `migrations_seed_once_across_reopen` | `cortexkit-store/src/lib.rs:693-715` | Migrations and seeds run once; clean reopen issues a greater epoch. | unaudited |
-| `database_epoch_survives_repeated_lease_sidecar_loss` | `cortexkit-store/src/lib.rs:717-744` | Two repeated sidecar losses each issue an epoch above the database fence. | unaudited |
-| `second_live_writer_is_rejected` | `cortexkit-store/src/lib.rs:758-768` | Second same-process store open is rejected as a lease error. | unaudited |
-| `distinct_databases_do_not_falsely_contend` | `cortexkit-store/src/lib.rs:770-779` | Distinct database paths coexist. | unaudited |
-| `unfenced_connection_rejects_writes` | `cortexkit-store/src/lib.rs:885-909` | `with_conn` rejects a write with `SQLITE_READONLY`, leaves no row, and still permits a later fenced write. | unaudited |
-| `open_pins_full_synchronous` | `cortexkit-store/src/lib.rs:911-920` | Open pins `synchronous=FULL`, so a committed fence epoch survives power loss in WAL mode. | unaudited |
-| `a_panicking_read_does_not_strand_the_connection_read_only` | `cortexkit-store/src/lib.rs:922-943` | A panicking `with_conn` callback still clears `query_only`, so later fenced writes and maintenance remain authorized. | unaudited |
-| `maintenance_runs_through_the_unfenced_path` | `cortexkit-store/src/lib.rs:945-959` | `VACUUM` fails the read-only guard and succeeds through `with_conn_unfenced`. | unaudited |
-| `fenced_write_rolls_back_on_error` | `cortexkit-store/src/lib.rs:961-995` | Callback failure rolls back both domain mutation and a newer fence claim. | unaudited |
-| `legacy_database_without_fence_table_uses_zero_floor` | `cortexkit-store/src/lib.rs:997-1020` | A pre-fence-table database opens at floor zero and receives epoch 1. | unaudited |
-| `legacy_negative_database_fence_fails_closed` | `cortexkit-store/src/lib.rs:1022-1050` | A pre-constraint negative fence is rejected and remains unchanged. | unaudited |
-| `superseded_writer_is_fenced_out_after_handover` | `cortexkit-store/src/lib.rs:1052-1091` | Synthetic epoch-1 writer cannot overwrite epoch-2 state. | unaudited |
-| `superseded_writer_cannot_migrate` | `cortexkit-store/src/lib.rs:1093-1124` | Synthetic stale migration is fenced before its schema SQL executes. | unaudited |
-| `equal_epoch_writer_is_not_fenced` | `cortexkit-store/src/lib.rs:1126-1147` | Equal epoch can continue writing. | unaudited |
-| `epoch_above_sqlite_integer_range_fails` | `cortexkit-store/src/lib.rs:1149-1165` | Epochs above SQLite's signed integer range fail instead of wrapping. | unaudited |
-| `open_migrate_and_single_writer` | `cortexkit-store-postgres/src/lib.rs:431-463` | Live PostgreSQL covers migration and session exclusion. Requires `CORTEXKIT_TEST_PG_DSN`; CI has a required live job. | unaudited |
-| `read_only_callback_rejects_mutation_without_rows` | `cortexkit-store-postgres/src/lib.rs:487-520` | Read-only mutation reports SQLSTATE `25006` and leaves rows unchanged. | unaudited |
-| `unfenced_callback_runs_statements_a_transaction_forbids` | `cortexkit-store-postgres/src/lib.rs:465-485` | `VACUUM` reports SQLSTATE `25001` inside a fenced transaction and succeeds through the autocommit callback. | unaudited |
-| `fenced_callback_error_rolls_back_rows` | `cortexkit-store-postgres/src/lib.rs:522-556` | Callback failure rolls back domain rows. | unaudited |
-| `repeated_fenced_writes_at_current_epoch_succeed` | `cortexkit-store-postgres/src/lib.rs:558-578` | Repeated writes at the current lease epoch succeed. | unaudited |
-| `superseded_writer_is_rejected_after_reopen` | `cortexkit-store-postgres/src/lib.rs:580-612` | Synthetic stale callback is rejected after reopen. | unaudited |
-| `superseded_writer_cannot_migrate` | `cortexkit-store-postgres/src/lib.rs:614-650` | Synthetic stale migration is fenced before its schema SQL executes. | unaudited |
-| `independent_namespace_chains` | `cortexkit-store-postgres/src/lib.rs:652-682` | Independent migrations both apply. | unaudited |
-| `advisory_key_derivation_is_stable` | `cortexkit-store-postgres/src/lib.rs:686-690` | Pins one advisory bigint derived through public `LeaseKey::identity` and `fnv1a`. | unaudited |
+| `reopening_a_permissive_store_protects_the_database_and_its_wal` | `cortexkit-store/src/lib.rs:577-632` | Database and WAL are `0600` on reopen. | unaudited |
+| `open_claims_fence_before_return` | `cortexkit-store/src/lib.rs:670-683` | Open stamps the lease epoch before exposing the store. | unaudited |
+| `open_claim_rejects_an_epoch_the_database_already_stores` | `cortexkit-store/src/lib.rs:689-726` | The open claim rejects an epoch equal to the stored fence; `claim_fence` still authorizes it. | unaudited |
+| `migrations_seed_once_across_reopen` | `cortexkit-store/src/lib.rs:728-750` | Migrations and seeds run once; clean reopen issues a greater epoch. | unaudited |
+| `database_epoch_survives_repeated_lease_sidecar_loss` | `cortexkit-store/src/lib.rs:752-779` | Two repeated sidecar losses each issue an epoch above the database fence. | unaudited |
+| `second_live_writer_is_rejected` | `cortexkit-store/src/lib.rs:793-803` | Second same-process store open is rejected as a lease error. | unaudited |
+| `distinct_databases_do_not_falsely_contend` | `cortexkit-store/src/lib.rs:805-814` | Distinct database paths coexist. | unaudited |
+| `unfenced_connection_rejects_writes` | `cortexkit-store/src/lib.rs:920-944` | `with_conn` rejects a write with `SQLITE_READONLY`, leaves no row, and still permits a later fenced write. | unaudited |
+| `open_pins_full_synchronous` | `cortexkit-store/src/lib.rs:946-955` | Open pins `synchronous=FULL`, so a committed fence epoch survives power loss in WAL mode. | unaudited |
+| `a_panicking_read_does_not_strand_the_connection_read_only` | `cortexkit-store/src/lib.rs:957-978` | A panicking `with_conn` callback still clears `query_only`, so later fenced writes and maintenance remain authorized. | unaudited |
+| `a_read_callback_cannot_lower_fence_durability` | `cortexkit-store/src/lib.rs:980-1016` | A read callback can lower `synchronous`, and the next fenced write and migration re-pin `FULL`. | unaudited |
+| `a_callback_that_ends_the_transaction_is_rejected` | `cortexkit-store/src/lib.rs:1018-1053` | A callback or migration that sends `COMMIT` is rejected as having ended the fence-checked transaction. | unaudited |
+| `maintenance_runs_through_the_unfenced_path` | `cortexkit-store/src/lib.rs:1055-1069` | `VACUUM` fails the read-only guard and succeeds through `with_conn_unfenced`. | unaudited |
+| `fenced_write_rolls_back_on_error` | `cortexkit-store/src/lib.rs:1071-1105` | Callback failure rolls back both domain mutation and a newer fence claim. | unaudited |
+| `legacy_database_without_fence_table_uses_zero_floor` | `cortexkit-store/src/lib.rs:1107-1130` | A pre-fence-table database opens at floor zero and receives epoch 1. | unaudited |
+| `legacy_negative_database_fence_fails_closed` | `cortexkit-store/src/lib.rs:1132-1160` | A pre-constraint negative fence is rejected and remains unchanged. | unaudited |
+| `superseded_writer_is_fenced_out_after_handover` | `cortexkit-store/src/lib.rs:1162-1201` | Synthetic epoch-1 writer cannot overwrite epoch-2 state. | unaudited |
+| `superseded_writer_cannot_migrate` | `cortexkit-store/src/lib.rs:1203-1234` | Synthetic stale migration is fenced before its schema SQL executes. | unaudited |
+| `equal_epoch_writer_is_not_fenced` | `cortexkit-store/src/lib.rs:1236-1257` | Equal epoch can continue writing. | unaudited |
+| `epoch_above_sqlite_integer_range_fails` | `cortexkit-store/src/lib.rs:1259-1275` | Epochs above SQLite's signed integer range fail instead of wrapping. | unaudited |
+| `open_migrate_and_single_writer` | `cortexkit-store-postgres/src/lib.rs:463-495` | Live PostgreSQL covers migration and session exclusion. Requires `CORTEXKIT_TEST_PG_DSN`; CI has a required live job. | unaudited |
+| `read_only_callback_rejects_mutation_without_rows` | `cortexkit-store-postgres/src/lib.rs:564-597` | Read-only mutation reports SQLSTATE `25006` and leaves rows unchanged. | unaudited |
+| `a_callback_that_ends_the_transaction_is_rejected` | `cortexkit-store-postgres/src/lib.rs:497-540` | A fenced callback or migration that sends `COMMIT` is rejected instead of reporting success. | unaudited |
+| `unfenced_callback_runs_statements_a_transaction_forbids` | `cortexkit-store-postgres/src/lib.rs:542-562` | `VACUUM` reports SQLSTATE `25001` inside a fenced transaction and succeeds through the autocommit callback. | unaudited |
+| `fenced_callback_error_rolls_back_rows` | `cortexkit-store-postgres/src/lib.rs:599-633` | Callback failure rolls back domain rows. | unaudited |
+| `repeated_fenced_writes_at_current_epoch_succeed` | `cortexkit-store-postgres/src/lib.rs:635-655` | Repeated writes at the current lease epoch succeed. | unaudited |
+| `superseded_writer_is_rejected_after_reopen` | `cortexkit-store-postgres/src/lib.rs:657-689` | Synthetic stale callback is rejected after reopen. | unaudited |
+| `superseded_writer_cannot_migrate` | `cortexkit-store-postgres/src/lib.rs:691-727` | Synthetic stale migration is fenced before its schema SQL executes. | unaudited |
+| `independent_namespace_chains` | `cortexkit-store-postgres/src/lib.rs:729-759` | Independent migrations both apply. | unaudited |
+| `advisory_key_derivation_is_stable` | `cortexkit-store-postgres/src/lib.rs:763-767` | Pins one advisory bigint derived through public `LeaseKey::identity` and `fnv1a`. | unaudited |
 
 The handover checks use synthetic stores that bypass real lease acquisition. They check fence logic against real database transactions, not an end-to-end retained-connection handover.
 

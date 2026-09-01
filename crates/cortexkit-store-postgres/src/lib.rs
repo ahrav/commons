@@ -109,18 +109,22 @@ impl PostgresStore {
     /// A newer persisted epoch rejects the callback before domain effects begin.
     /// The epoch check and callback effects share one transaction.
     ///
+    /// Callbacks must not send transaction-control SQL.
+    /// Ending the fence-checked transaction inside the callback fails the store operation.
+    ///
     /// # Errors
     ///
     /// Returns [`StoreError::Fenced`] when a newer writer owns the database.
-    /// Returns [`StoreError::Backend`] when transaction setup, the fence check, the callback, or commit fails.
+    /// Returns [`StoreError::Backend`] when transaction setup, the callback, commit, or a backend fence-check operation fails, or when the callback ended the transaction.
     pub fn with_client_fenced<T>(
         &self,
         f: impl FnOnce(&mut postgres::Transaction<'_>) -> Result<T, postgres::Error>,
     ) -> Result<T, StoreError> {
         let mut guard = self.client.lock().unwrap_or_else(|p| p.into_inner());
         let mut tx = guard.transaction().map_err(backend_error)?;
-        check_fence(&mut tx, self.lease_key, self.epoch)?;
+        let witness = check_fence(&mut tx, self.lease_key, self.epoch)?;
         let out = f(&mut tx).map_err(backend_error)?;
+        require_same_transaction(&mut tx, &witness)?;
         tx.commit().map_err(backend_error)?;
         Ok(out)
     }
@@ -191,21 +195,46 @@ fn check_fence(
     tx: &mut postgres::Transaction<'_>,
     lease_key: i64,
     holder_epoch: i64,
-) -> Result<(), StoreError> {
-    let db_epoch: i64 = tx
+) -> Result<TransactionWitness, StoreError> {
+    let row = tx
         .query_one(
-            "SELECT epoch FROM cortexkit_lease WHERE lease_key = $1 FOR UPDATE",
+            "SELECT epoch, pg_current_xact_id()::text FROM cortexkit_lease \
+             WHERE lease_key = $1 FOR UPDATE",
             &[&lease_key],
         )
-        .map_err(backend_error)?
-        .get(0);
+        .map_err(backend_error)?;
+    let db_epoch: i64 = row.get(0);
     if db_epoch > holder_epoch {
         return Err(StoreError::Fenced {
             holder_epoch,
             db_epoch,
         });
     }
-    Ok(())
+    Ok(TransactionWitness(row.get(1)))
+}
+
+/// The transaction id assigned when the fence row was locked.
+struct TransactionWitness(String);
+
+/// Transaction-control SQL sent by the callback ends the fence-checked transaction.
+/// Later statements commit in autocommit without a fence, and `Transaction::commit`
+/// still reports success because `COMMIT` outside a transaction block is a warning.
+fn require_same_transaction(
+    tx: &mut postgres::Transaction<'_>,
+    witness: &TransactionWitness,
+) -> Result<(), StoreError> {
+    let current: Option<String> = tx
+        .query_one("SELECT pg_current_xact_id_if_assigned()::text", &[])
+        .map_err(backend_error)?
+        .get(0);
+    if current.as_deref() == Some(witness.0.as_str()) {
+        return Ok(());
+    }
+    Err(StoreError::Backend(
+        "the callback ended the fence-checked transaction; effects after that commit ran \
+         unfenced"
+            .to_string(),
+    ))
 }
 
 impl Drop for PostgresStore {
@@ -330,7 +359,7 @@ fn run_migrations(
     // The schema-version table is bootstrapped race-safely in ensure_infra_tables
     // at open, so migrate() does not (re-)create it here.
     let mut tx = client.transaction().map_err(migration_error)?;
-    check_fence(&mut tx, lease_key, holder_epoch)?;
+    let _witness = check_fence(&mut tx, lease_key, holder_epoch)?;
     let current: i32 = tx
         .query_one(
             "SELECT COALESCE(MAX(version), 0) FROM cortexkit_schema_version WHERE namespace = $1",
@@ -349,12 +378,18 @@ fn run_migrations(
             continue;
         }
         let mut tx = client.transaction().map_err(migration_error)?;
-        check_fence(&mut tx, lease_key, holder_epoch)?;
+        let witness = check_fence(&mut tx, lease_key, holder_epoch)?;
         tx.batch_execute(m.statements).map_err(|e| {
             StoreError::Migration(format!(
                 "namespace '{namespace}' migration {}: {}",
                 m.version,
                 db_message(&e)
+            ))
+        })?;
+        require_same_transaction(&mut tx, &witness).map_err(|e| {
+            StoreError::Migration(format!(
+                "namespace '{namespace}' migration {}: {e}",
+                m.version
             ))
         })?;
         tx.execute(
@@ -460,6 +495,51 @@ mod tests {
             applied, 1,
             "exactly one migration recorded for the namespace"
         );
+    }
+
+    #[test]
+    fn a_callback_that_ends_the_transaction_is_rejected() {
+        let Some(dsn) = test_dsn() else {
+            return;
+        };
+        let ns = unique_ns("endtx");
+        let d = descriptor(&dsn, &ns);
+        let store = open_postgres(&d).expect("open");
+        let table = format!("endtx_{ns}");
+        store
+            .with_client_unfenced(|c| c.batch_execute(&format!("CREATE TABLE {table} (v int)")))
+            .expect("create");
+
+        let escaped = store.with_client_fenced(|tx| {
+            tx.batch_execute(&format!("COMMIT; INSERT INTO {table} (v) VALUES (1)"))?;
+            Ok(())
+        });
+        assert!(
+            matches!(&escaped, Err(StoreError::Backend(m)) if m.contains("ended the fence-checked transaction")),
+            "ending the transaction is reported instead of a successful fenced write, got {escaped:?}"
+        );
+
+        let migration = &[Migration {
+            version: 1,
+            statements: "COMMIT; SELECT 1;",
+        }];
+        let migrated = store.migrate(&ns, migration);
+        assert!(
+            matches!(&migrated, Err(StoreError::Migration(m)) if m.contains("ended the fence-checked transaction")),
+            "a migration that ends its transaction is rejected, got {migrated:?}"
+        );
+        let recorded: i64 = store
+            .with_client_read(|c| {
+                Ok(c.query_one(
+                    "SELECT COUNT(*) FROM cortexkit_schema_version WHERE namespace = $1",
+                    &[&ns],
+                )?
+                .get(0))
+            })
+            .expect("count");
+        assert_eq!(recorded, 0, "the rejected migration recorded no version");
+
+        let _ = store.with_client_unfenced(|c| c.batch_execute(&format!("DROP TABLE {table}")));
     }
 
     #[test]
