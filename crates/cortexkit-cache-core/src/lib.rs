@@ -81,7 +81,7 @@ pub struct FrozenUnit {
 
 /// The core's durable per-pass state. One atomic value: the harness CAS-writes it back
 /// whole (units + boundary + version), never per-field.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CoreState {
     pub version: u64,
     /// The coverage descriptor: the id the covered prefix is spliced out at. A CAS-retry
@@ -100,9 +100,9 @@ pub struct CoreState {
 /// One pass into the core. `proposed` is the harness's classification; `boundary_present`
 /// is the opaque live-boundary token; `rendered_units` are the byte-complete units the
 /// harness rendered for a bust (empty on `SoftPlus`).
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct PassInput {
-    pub proposed: Option<Action>,
+    pub proposed: Action,
     pub boundary_present: String,
     /// Byte-complete units the harness rendered on a `Soft`/`Hard` bust. Frozen into state.
     pub rendered_units: Vec<FrozenUnit>,
@@ -121,9 +121,12 @@ impl PassInput {
     /// Construct a pass input with an explicit action and boundary token.
     pub fn new(proposed: Action, boundary_present: impl Into<String>) -> Self {
         PassInput {
-            proposed: Some(proposed),
+            proposed,
             boundary_present: boundary_present.into(),
-            ..Default::default()
+            rendered_units: Vec::new(),
+            queued: Vec::new(),
+            new_boundary_id: None,
+            run_started: false,
         }
     }
 }
@@ -136,6 +139,18 @@ pub struct StepResult {
 }
 
 impl CoreState {
+    /// An empty boundary ID is the never-minted sentinel for the first durable write.
+    /// `CoreState` deliberately omits [`Default`] so initialization intent remains explicit.
+    pub fn empty() -> Self {
+        Self {
+            version: 0,
+            boundary_id: String::new(),
+            frozen_units: Vec::new(),
+            pending_changes: Vec::new(),
+            reconcile_pending: false,
+        }
+    }
+
     /// The cached-prefix bytes: the in-order concatenation of every frozen unit's payload.
     /// Two consecutive `SoftPlus` passes MUST produce an identical value (the byte-stability
     /// invariant) — the core proves it structurally by not mutating frozen units on a defer.
@@ -148,17 +163,10 @@ impl CoreState {
 
     /// Apply one pass. Returns the executed [`StepResult`] and mutates `self` in place
     /// (the harness then CAS-writes the whole value back).
-    ///
-    /// # Panics
-    /// Panics if `input.proposed` is `None` (the harness MUST classify the signal before
-    /// stepping — trigger causes are harness-provided).
     pub fn step(&mut self, input: PassInput) -> StepResult {
-        let proposed = input
-            .proposed
-            .expect("harness must classify the signal into an Action before stepping");
         let boundary_match = input.boundary_present == self.boundary_id;
 
-        match proposed {
+        match input.proposed {
             Action::SoftPlus => self.step_defer(input, boundary_match),
             Action::Soft => self.step_soft(input, boundary_match),
             Action::Hard => self.step_hard(input),
@@ -346,12 +354,9 @@ mod tests {
         assert_eq!(state.cached_prefix_bytes(), before);
         // The first real boundary mint exits the vacuous state: a revert AFTER a real
         // boundary exists still reconciles (the non-vacuous arm below is unaffected).
-        state.step(PassInput {
-            proposed: Some(Action::Hard),
-            boundary_present: "-".into(),
-            new_boundary_id: Some("b1".into()),
-            ..Default::default()
-        });
+        let mut hard = PassInput::new(Action::Hard, "-");
+        hard.new_boundary_id = Some("b1".into());
+        state.step(hard);
         let r = state.step(PassInput::new(Action::SoftPlus, "-"));
         assert!(
             r.reconcile_pending,
@@ -580,15 +585,5 @@ mod tests {
             state.frozen_units[0].frozen_payload, "<h>BASE</h>",
             "lineage byte-identical"
         );
-    }
-
-    #[test]
-    #[should_panic(expected = "must classify")]
-    fn step_panics_if_signal_unclassified() {
-        let mut state = state_with(vec![unit("m0", "x", DurabilityClass::Lineage)], "b0");
-        state.step(PassInput {
-            boundary_present: "b0".into(),
-            ..Default::default()
-        });
     }
 }

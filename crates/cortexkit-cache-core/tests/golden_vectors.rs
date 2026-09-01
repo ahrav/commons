@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use cortexkit_cache_core::{Action, CoreState, FrozenUnit, PassInput};
+use cortexkit_cache_core::{Action, CoreState, DurabilityClass, FrozenUnit, PassInput};
 use serde::Deserialize;
 use serde_json::Value;
 
@@ -54,13 +54,9 @@ fn pass_to_input(pass: &Pass, pending_keys: &[String]) -> PassInput {
             .and_then(Value::as_str)
             .is_some_and(|k| k == "run-started");
 
-    let mut input = PassInput {
-        proposed: Some(pass.expect_action),
-        boundary_present: pass.boundary_present.clone(),
-        new_boundary_id: pass.new_boundary_id.clone(),
-        run_started,
-        ..Default::default()
-    };
+    let mut input = PassInput::new(pass.expect_action, pass.boundary_present.clone());
+    input.new_boundary_id = pass.new_boundary_id.clone();
+    input.run_started = run_started;
 
     match pass.expect_action {
         Action::SoftPlus => {
@@ -109,6 +105,58 @@ fn golden_fixture_is_schema_v3_with_eleven_vectors() {
 }
 
 #[test]
+fn core_state_schema_v3_empty_wire_format_is_stable() {
+    let empty = CoreState::empty();
+    assert_eq!(
+        serde_json::to_value(&empty).expect("empty state serializes"),
+        serde_json::json!({
+            "version": 0,
+            "boundary_id": "",
+            "frozen_units": [],
+            "pending_changes": [],
+            "reconcile_pending": false
+        })
+    );
+    let schema_v3_minimal: CoreState = serde_json::from_value(serde_json::json!({
+        "version": 0,
+        "boundary_id": "",
+        "frozen_units": []
+    }))
+    .expect("minimal schema-v3 state deserializes");
+    assert_eq!(schema_v3_minimal, empty);
+
+    let populated = CoreState {
+        version: 7,
+        boundary_id: "boundary-7".into(),
+        frozen_units: vec![FrozenUnit {
+            key: "unit-1".into(),
+            kind: "summary".into(),
+            frozen_payload: "frozen bytes".into(),
+            durability_class: DurabilityClass::Episode,
+            reset_rule: "reset on next episode".into(),
+        }],
+        pending_changes: vec![],
+        reconcile_pending: true,
+    };
+    assert_eq!(
+        serde_json::to_value(&populated).expect("populated state serializes"),
+        serde_json::json!({
+            "version": 7,
+            "boundary_id": "boundary-7",
+            "frozen_units": [{
+                "key": "unit-1",
+                "kind": "summary",
+                "frozen_payload": "frozen bytes",
+                "durability_class": "episode",
+                "reset_rule": "reset on next episode"
+            }],
+            "pending_changes": [],
+            "reconcile_pending": true
+        })
+    );
+}
+
+#[test]
 fn all_golden_vectors_pass() {
     let file: GoldenFile = serde_json::from_str(GOLDEN).expect("golden fixture parses");
 
@@ -132,8 +180,6 @@ fn run_vector(vector: &Vector) {
         .iter()
         .map(|u| (u.key.clone(), u.frozen_payload.clone()))
         .collect();
-
-    let mut prev_bytes = state.cached_prefix_bytes();
 
     for (i, pass) in vector.passes.iter().enumerate() {
         let pending_keys: Vec<String> = state
@@ -210,11 +256,7 @@ fn run_vector(vector: &Vector) {
                 }
             }
         }
-
-        prev_bytes = after_bytes;
     }
-
-    let _ = prev_bytes;
 }
 
 #[test]
