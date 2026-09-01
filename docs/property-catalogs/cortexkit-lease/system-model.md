@@ -1,20 +1,20 @@
 # System model
 
-System path: `crates/cortexkit-lease` at parent revision `610cd07b84f9d0d0f3e01afee0ee04c33420acb5`, plus the U4 working-tree changes documented here.
+System path: `crates/cortexkit-lease` at revision `01865dc6f99a45dd531faf330c853203434ab9c8`, plus the U5 working-tree changes documented here.
 
 ## Architecture and data flow
 
 `LeaseKey` contains `(module_id, backend, scope_key)` (`LeaseKey`). The fields are joined with `U+001F`, hashed with FNV-1a-64, and mapped to `<base_dir>/<16hex>.lease` (`LeaseKey::identity`, `fnv1a`, `fnv1a_hex`, and `FileLeaseStore::lease_path`).
 
-`open_lease_file` first opens an existing final path with Unix `O_NOFOLLOW | O_NONBLOCK` or Windows `FILE_FLAG_OPEN_REPARSE_POINT`. On `NotFound`, it creates a same-directory `NamedTempFile`, writes canonical epoch zero, and calls `persist_noclobber`; an `AlreadyExists` race reopens the winner within three attempts. A successful publication returns the already-open temporary-file inode. Descriptor metadata rejects nonregular files and Windows reparse points (`src/lib.rs:56-143`). Exclusive and shared acquisition then use only `File::try_lock` or `File::try_lock_shared`. Both methods classify `TryLockError::WouldBlock` as `LeaseError::Held` and unwrap `TryLockError::Error` into `LeaseError::Io` (`src/lib.rs:280-327`).
+`open_lease_file` first opens an existing final path with Unix `O_NOFOLLOW | O_NONBLOCK` or Windows `FILE_FLAG_OPEN_REPARSE_POINT`. On `NotFound`, it creates a same-directory `NamedTempFile`, writes canonical epoch zero, and calls `persist_noclobber`; an `AlreadyExists` race reopens the winner within three attempts. A successful publication returns the already-open temporary-file inode. Descriptor metadata rejects nonregular files and Windows reparse points (`src/lib.rs:56-77,89-104,106-143`). Exclusive and shared acquisition then use only `File::try_lock` or `File::try_lock_shared`. Both methods classify `TryLockError::WouldBlock` as `LeaseError::Held` and unwrap `TryLockError::Error` into `LeaseError::Io` (`src/lib.rs:252-286,320-342`).
 
-The crate has no network or database boundary. Its authority boundaries are the filesystem path and kernel lock table. `cortexkit-store` consumes the exclusive handle and uses its epoch at a SQLite write fence (`cortexkit-store/src/lib.rs:144-205,245-284`).
+The crate has no network or database boundary. Its authority boundaries are the filesystem path and kernel lock table. `cortexkit-store` reads the SQLite fence as a resource floor, acquires above it, claims a strictly greater epoch before exposure, and rechecks it in fenced writes and migrations (`cortexkit-store/src/lib.rs:172-187,234-282,284-301,306-312,324-344,346-361,390-454`).
 
 ## State and persistence
 
-One file per derived key stores a decimal `u64`. Published files start with canonical epoch zero; existing empty files fail closed. Existing content must contain 1-20 ASCII decimal digits; any longer, non-decimal, or out-of-range state fails closed (`read_epoch`, `src/lib.rs:384-413`). Existing variable-width decimal files remain readable. Successful updates write exactly 20 decimal digits and use checked increment, so `u64::MAX` is terminal (`bump_epoch` and `persist_epoch`, `src/lib.rs:415-436`). There is no magic, key binding, checksum, format version, or generation.
+One file per derived key stores a decimal `u64`. Published files start with canonical epoch zero; existing empty files fail closed. Existing content must contain 1-20 ASCII decimal digits; any longer, non-decimal, or out-of-range state fails closed (`read_epoch`, `src/lib.rs:399-428`). Existing variable-width decimal files remain readable. Successful updates write exactly 20 decimal digits and use checked increment above the persisted epoch and optional resource floor, so `u64::MAX` is terminal (`bump_epoch_above` and `persist_epoch`, `src/lib.rs:430-439,441-452`). There is no magic, key binding, checksum, format version, or generation.
 
-The update does not truncate. A 1-19 byte legacy input is extended to 20 bytes with non-decimal markers before the canonical overwrite. For canonical 20-byte values, every prefix splice from the next epoch is either equal to or greater than the prior value. `interrupted_persist_never_leaves_a_lower_parseable_epoch` injects ordered prefix-write failures through `persist_epoch` for both widths and parses aftermath through production `read_epoch`; the canonical case is where every prefix stays parseable, so the count of parseable aftermaths is asserted to keep the monotonicity oracle non-vacuous. It does not prove `File`, device, process-interruption, or power-loss behavior (`src/lib.rs:384-436,700-812`).
+The update does not truncate. A 1-19 byte legacy input is extended to 20 bytes with non-decimal markers before the canonical overwrite. For canonical 20-byte values, every prefix splice from the next epoch is either equal to or greater than the prior value. `interrupted_persist_never_leaves_a_lower_parseable_epoch` injects ordered prefix-write failures through `persist_epoch` for both widths and parses aftermath through production `read_epoch`; the canonical case is where every prefix stays parseable, so the count of parseable aftermaths is asserted to keep the monotonicity oracle non-vacuous. It does not prove `File`, device, process-interruption, or power-loss behavior (`src/lib.rs:399-428,430-439,441-452,730-842`).
 
 `flush` is not `sync_data` or `sync_all`. The crate makes no claim about exact partial-`File` I/O outcomes, process interruption, machine power loss, storage-cache loss, torn sectors, or filesystem reordering.
 
@@ -29,11 +29,11 @@ The epoch read-modify-write runs only after the exclusive lock succeeds. Shared 
 ## Claimed safety guarantees
 
 - No two live writers for one logical store (`src/lib.rs:2`).
-- Persisted, monotonically increasing writer epochs; stale writes are rejected (`src/lib.rs:4-6`, `bump_epoch`).
+- Persisted, monotonically increasing writer epochs; stale writes are rejected (`src/lib.rs:4-6`, `bump_epoch_above`).
 - Distinct module/backend/scope keys do not collide on a shared root (`LeaseKey::identity`, `FileLeaseStore::lease_path`).
 - Shared and exclusive holder modes exclude each other (`LeaseStore::acquire`, `LeaseStore::acquire_shared`).
-- Unix existing-file opens use `O_NOFOLLOW | O_NONBLOCK`, and permission changes apply through the opened descriptor. Windows existing-file opens use `FILE_FLAG_OPEN_REPARSE_POINT` and reject reparse-point metadata. New files are private `NamedTempFile` inodes initialized before no-clobber publication (`src/lib.rs:56-143`). Public `protect_file` remains path-based and Unix-only (`src/lib.rs:25-54`).
-- Genuine contention maps to `LeaseError::Held` through `TryLockError::WouldBlock` (`src/lib.rs:273-320`).
+- Unix existing-file opens use `O_NOFOLLOW | O_NONBLOCK`, and permission changes apply through the opened descriptor. Windows existing-file opens use `FILE_FLAG_OPEN_REPARSE_POINT` and reject reparse-point metadata. New files are private `NamedTempFile` inodes initialized before no-clobber publication (`src/lib.rs:56-77,89-104,106-143`). Public `protect_file` remains path-based and Unix-only (`src/lib.rs:35-54`).
+- Genuine contention maps to `LeaseError::Held` through `TryLockError::WouldBlock` (`src/lib.rs:252-286,320-342`).
 
 These remain claims under test. Code disagreements are retained in the catalog.
 
@@ -58,7 +58,7 @@ No issue or incident tracker was supplied, so history cannot establish additiona
 
 ## Existing test strategy
 
-Twenty inline unit tests cover ordinary exclusivity, synchronized concurrent shared-first acquisition, shared/exclusive behavior, simple key separation, new and legacy epoch initialization, fail-closed epoch states, injected ordered prefix-write failure, Unix symlink/FIFO refusal, permissions, one identity/hash stability vector, and one cross-process shared-lock case. There are no crash-image tests, fuzz targets, model checkers, or situation-coverage assertions. See [checks.md](checks.md).
+Twenty-one inline unit tests cover ordinary exclusivity, resource-floor issuance, synchronized concurrent shared-first acquisition, shared/exclusive behavior, simple key separation, new and legacy epoch initialization, fail-closed epoch states, injected ordered prefix-write failure, Unix symlink/FIFO refusal, permissions, one identity/hash stability vector, and one cross-process shared-lock case. There are no crash-image tests, fuzz targets, model checkers, or situation-coverage assertions. See [checks.md](checks.md).
 
 ## Failure and degradation
 
@@ -96,8 +96,7 @@ Targeted portfolio follow-up found two additional boundary assumptions: every lo
 - The trait abstraction promises interchangeable future cloud leases, but the actual PostgreSQL backend does not implement `LeaseStore` and has no shared mode.
 - `LeaseHandle::epoch` documents a writer fence, while shared handles expose an observability-only value through the same method and trait object.
 - Rust 1.89 is declared as the MSRV, but CI does not compile or test with 1.89.
-- Claustrum's real-daemon two-process review is an unresolved merge gate; its
-  repository is unavailable locally and no review receipt was supplied.
+- External blocker and draft status are tracked in the [durable consumer inventory](durable-consumer-inventory.md).
 
 ## Property-lens coverage
 

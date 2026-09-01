@@ -4,46 +4,47 @@ All statuses are **unaudited**. Test adequacy belongs to `/testing:invariant-tes
 
 ## Production checks and guards
 
-No production `assert!`, `debug_assert!`, `panic!`, or equivalent invariant battery exists in `src/lib.rs:1-407`.
+No production `assert!`, `debug_assert!`, `panic!`, or equivalent invariant battery exists in `src/lib.rs:1-471`.
 
 | Location | Check or branch | Semantics/message | Linked claims |
 |---|---|---|---|
-| `protect_file` (`src/lib.rs:25-54`) | Public path hardening | Unix `symlink_metadata` rejects non-regular paths; missing paths return `Ok`; `set_permissions` is path-based and does not open caller-owned files. | Static symlinks are not followed on Unix; trusted parent-directory ownership is a caller precondition. |
+| `protect_file` (`src/lib.rs:35-54`) | Public path hardening | Unix `symlink_metadata` rejects non-regular paths; missing paths return `Ok`; `set_permissions` is path-based and does not open caller-owned files. | Static symlinks are not followed on Unix; trusted parent-directory ownership is a caller precondition. |
 | `protect_open_file` (`src/lib.rs:56-77`) | Descriptor-relative lease-file checks | Non-regular descriptors return `InvalidInput`; Unix regular files are set to `0600`; Windows reparse points are rejected. | Lease acquisition validates and hardens its owned descriptor. |
-| `lease_open_options`, `open_lease_file` (`src/lib.rs:89-143`) | Lease-file publication/open | Opens an existing final path first. On `NotFound`, it initializes a same-directory temporary inode to epoch zero and publishes with `persist_noclobber`; an `AlreadyExists` race reopens the winner within three attempts. | No empty final pathname is published; links, FIFOs, and reparse points fail closed. |
-| `LeaseStore::acquire` (`src/lib.rs:280-303`) | Exclusive acquisition | Uses `try_lock`, classifies contention, and increments a validated epoch. | Exclusive liveness gate and error taxonomy. |
-| `LeaseStore::acquire_shared` (`src/lib.rs:305-327`) | Shared acquisition | Uses `try_lock_shared` and reads without mutation. | Concurrent shared-first acquisition and exclusion matrix. |
-| `FileLeaseHandle::drop` (`src/lib.rs:274-276`) | Handle `Drop` | Best-effort `File::unlock`; error discarded; descriptor then closes. | Drop releases lease. |
-| `read_epoch` (`src/lib.rs:384-413`) | Bounded epoch parse | Reads at most 21 bytes into a bounded vector; existing empty state and anything except 1-20 ASCII digits in `u64` range are rejected. | Malformed, empty, oversized, and overflowing state fails closed. |
-| `bump_epoch`, `persist_epoch` (`src/lib.rs:415-436`) | Epoch update | Checked increment; no truncate; fixed-width decimal overwrite with invalid-marker conversion only for 1-19 byte legacy states. | Exhaustion errors; ordered prefix writes cannot leave a lower parseable value in the injected model. |
+| `lease_open_options`, `open_lease_file` (`src/lib.rs:89-104,106-143`) | Lease-file publication/open | Opens an existing final path first. On `NotFound`, it initializes a same-directory temporary inode to epoch zero and publishes with `persist_noclobber`; an `AlreadyExists` race reopens the winner within three attempts. | No empty final pathname is published; links, FIFOs, and reparse points fail closed. |
+| `FileLeaseStore::acquire_above`, `LeaseStore::acquire` (`src/lib.rs:260-286,316-318`) | Exclusive acquisition | Uses `try_lock`, classifies contention, and issues an epoch above the persisted value and a caller-supplied floor. Trait acquisition reuses floor zero. | Exclusive liveness gate, error taxonomy, and durable-resource epoch recovery. |
+| `LeaseStore::acquire_shared` (`src/lib.rs:320-342`) | Shared acquisition | Uses `try_lock_shared` and reads without mutation. | Concurrent shared-first acquisition and exclusion matrix. |
+| `FileLeaseHandle::drop` (`src/lib.rs:310-312`) | Handle `Drop` | Best-effort `File::unlock`; error discarded; descriptor then closes. | Drop releases lease. |
+| `read_epoch` (`src/lib.rs:399-428`) | Bounded epoch parse | Reads at most 21 bytes into a bounded vector; existing empty state and anything except 1-20 ASCII digits in `u64` range are rejected. | Malformed, empty, oversized, and overflowing state fails closed. |
+| `bump_epoch_above`, `persist_epoch` (`src/lib.rs:431-439,444-452`) | Epoch update | Checked increment above both persisted state and floor; no truncate; fixed-width decimal overwrite with invalid-marker conversion only for 1-19 byte legacy states. | Exhaustion errors; ordered prefix writes cannot leave a lower parseable value in the injected model. |
 | `LeaseKey::identity`, `FileLeaseStore::lease_path`, `fnv1a`, `fnv1a_hex` | Identity/path derivation | Public separator-joined identity and FNV functions feed the private `.lease` path helper. | Stable namespaced identity. |
 | `LeaseHandle`, `LeaseStore` | Trait bounds | Handles and stores are `Send + Sync`. | Cross-thread use compiles. |
 
-## In-crate claim-bearing tests (21)
+## In-crate claim-bearing tests (22)
 
 | Test | Location | Claim and exact oracle | Platform | Status |
 |---|---|---|---|---|
-| `fresh_exclusive_initializes_to_one` | `src/lib.rs:476-500` | A fresh key returns epoch 1, writes exactly 20 decimal digits, and the published Unix file is `0600`. | All | unaudited |
-| `shared_first_initializes_canonical_zero` | `src/lib.rs:502-519` | Shared-first creation observes canonical zero, blocks exclusive, then permits writer epoch 1 after drop. | All | unaudited |
-| `concurrent_shared_first_acquisitions_coexist` | `src/lib.rs:521-584` | Eight synchronized fresh-key shared acquisitions all coexist at epoch zero. Report collection and holder release are both deadline-bounded, so a holder that dies before reporting fails the check instead of hanging the suite. | All | unaudited |
-| `legacy_decimal_epoch_is_canonicalized` | `src/lib.rs:586-599` | Variable-width decimal 41 becomes epoch 42 in fixed-width form. | All | unaudited |
-| `invalid_epoch_states_fail_closed` | `src/lib.rs:601-644` | Empty, malformed, oversized, and overflowing states return `LeaseError::Io(InvalidData)` through both acquisition modes and preserve bytes. | All | unaudited |
-| `epoch_errors_keep_the_underlying_os_error` | `src/lib.rs:646-672` | Epoch read and persist failures expose the originating OS error through `Error::source`, so an errno is not flattened into the lease error's message. | All | unaudited |
-| `maximum_epoch_is_readable_but_exhausted` | `src/lib.rs:674-698` | Shared acquisition reads `u64::MAX`; exclusive acquisition reports exhaustion and preserves bytes. | All | unaudited |
-| `interrupted_persist_never_leaves_a_lower_parseable_epoch` | `src/lib.rs:700-812` | Injected ordered prefix-write failures exercise production `persist_epoch` and `read_epoch` for legacy-width and canonical-width prior states, including a carry; any parseable aftermath is not lower, completion is fixed-width, and the count of parseable aftermaths is asserted per case. | All, in-memory `Read + Write + Seek` seam | unaudited |
-| `acquisition_refuses_symlink_and_leaves_target_untouched` | `src/lib.rs:815-841` | Exclusive and shared acquisition fail; target content and mode remain unchanged. | Unix | unaudited |
-| `acquisition_refuses_fifo_without_blocking` | `src/lib.rs:844-863` | Both modes reject a Unix FIFO opened with `O_NONBLOCK`. | Unix | unaudited |
-| `an_acquired_lease_file_is_owner_only` | `src/lib.rs:868-893` | `mode == 0600`; message: lease stayed group/world writable. | Unix | unaudited |
-| `protect_file_refuses_a_symlink_and_leaves_its_target_untouched` | `src/lib.rs:903-930` | `protect_file` returns `InvalidInput` and target remains `0644`. | Unix | unaudited |
-| `protect_file_ignores_a_missing_path` | `src/lib.rs:936-941` | Missing path returns `Ok`. | All; trivial on non-Unix | unaudited |
-| `identity_hash_derivation_is_stable` | `src/lib.rs:945-949` | Pins one public identity string and exact filename digest. | All | unaudited |
-| `acquire_then_second_holder_is_rejected` | `src/lib.rs:951-966` | Second live exclusive is `Held`; re-acquired epoch is greater. | All | unaudited |
-| `distinct_identity_axes_do_not_conflict` | `src/lib.rs:968-988` | Distinct scopes, modules, and backends acquire independently at epoch 1. | All | unaudited |
-| `shared_holders_coexist_but_block_exclusive` | `src/lib.rs:990-1021` | Two shared holders coexist; exclusive remains `Held` until last drop. | All | unaudited |
-| `exclusive_holder_blocks_shared` | `src/lib.rs:1023-1038` | Shared is `Held` under exclusive, then succeeds after drop. | All | unaudited |
-| `shared_acquisition_does_not_bump_the_write_epoch` | `src/lib.rs:1040-1064` | Writer 1, shared 1/1, writer 2. | All | unaudited |
-| `shared_lease_across_processes_blocks_exclusive` | `src/lib.rs:1071-1130` | Python child holds shared lock; parent exclusive is `Held`, shared succeeds, exclusive succeeds after child exits. | Unix | unaudited |
-| `epoch_persists_across_store_instances` | `src/lib.rs:1132-1144` | Fresh store instance observes epochs 1 then 2. | All | unaudited |
+| `fresh_exclusive_initializes_to_one` | `src/lib.rs:492-516` | A fresh key returns epoch 1, writes exactly 20 decimal digits, and the published Unix file is `0600`. | All | unaudited |
+| `exclusive_epoch_exceeds_resource_floor` | `src/lib.rs:518-530` | Persisted epoch 41 with floor 100 issues 101; ordinary reacquisition then issues 102. | All | unaudited |
+| `shared_first_initializes_canonical_zero` | `src/lib.rs:532-549` | Shared-first creation observes canonical zero, blocks exclusive, then permits writer epoch 1 after drop. | All | unaudited |
+| `concurrent_shared_first_acquisitions_coexist` | `src/lib.rs:551-614` | Eight synchronized fresh-key shared acquisitions all coexist at epoch zero. Report collection and holder release are both deadline-bounded, so a holder that dies before reporting fails the check instead of hanging the suite. | All | unaudited |
+| `legacy_decimal_epoch_is_canonicalized` | `src/lib.rs:616-629` | Variable-width decimal 41 becomes epoch 42 in fixed-width form. | All | unaudited |
+| `invalid_epoch_states_fail_closed` | `src/lib.rs:631-674` | Empty, malformed, oversized, and overflowing states return `LeaseError::Io(InvalidData)` through both acquisition modes and preserve bytes. | All | unaudited |
+| `epoch_errors_keep_the_underlying_os_error` | `src/lib.rs:676-702` | Epoch error context preserves the original `io::Error` and raw OS error through the source chain. | All | unaudited |
+| `maximum_epoch_is_readable_but_exhausted` | `src/lib.rs:704-728` | Shared acquisition reads `u64::MAX`; exclusive acquisition reports exhaustion and preserves bytes. | All | unaudited |
+| `interrupted_persist_never_leaves_a_lower_parseable_epoch` | `src/lib.rs:730-842` | Injected ordered prefix-write failures exercise production `persist_epoch` and `read_epoch` for legacy-width and canonical-width prior states, including a carry; any parseable aftermath is not lower, completion is fixed-width, and the count of parseable aftermaths is asserted per case. | All, in-memory `Read + Write + Seek` seam | unaudited |
+| `acquisition_refuses_symlink_and_leaves_target_untouched` | `src/lib.rs:845-871` | Exclusive and shared acquisition fail; target content and mode remain unchanged. | Unix | unaudited |
+| `acquisition_refuses_fifo_without_blocking` | `src/lib.rs:874-893` | Both modes reject a Unix FIFO opened with `O_NONBLOCK`. | Unix | unaudited |
+| `an_acquired_lease_file_is_owner_only` | `src/lib.rs:898-923` | `mode == 0600`; message: lease stayed group/world writable. | Unix | unaudited |
+| `protect_file_refuses_a_symlink_and_leaves_its_target_untouched` | `src/lib.rs:933-960` | `protect_file` returns `InvalidInput` and target remains `0644`. | Unix | unaudited |
+| `protect_file_ignores_a_missing_path` | `src/lib.rs:966-971` | Missing path returns `Ok`. | All; trivial on non-Unix | unaudited |
+| `identity_hash_derivation_is_stable` | `src/lib.rs:975-979` | Pins one public identity string and exact filename digest. | All | unaudited |
+| `acquire_then_second_holder_is_rejected` | `src/lib.rs:981-996` | Second live exclusive is `Held`; re-acquired epoch is greater. | All | unaudited |
+| `distinct_identity_axes_do_not_conflict` | `src/lib.rs:998-1018` | Distinct scopes, modules, and backends acquire independently at epoch 1. | All | unaudited |
+| `shared_holders_coexist_but_block_exclusive` | `src/lib.rs:1020-1051` | Two shared holders coexist; exclusive remains `Held` until last drop. | All | unaudited |
+| `exclusive_holder_blocks_shared` | `src/lib.rs:1053-1068` | Shared is `Held` under exclusive, then succeeds after drop. | All | unaudited |
+| `shared_acquisition_does_not_bump_the_write_epoch` | `src/lib.rs:1070-1094` | Writer 1, shared 1/1, writer 2. | All | unaudited |
+| `shared_lease_across_processes_blocks_exclusive` | `src/lib.rs:1101-1160` | Python child holds shared lock; parent exclusive is `Held`, shared succeeds, exclusive succeeds after child exits. | Unix | unaudited |
+| `epoch_persists_across_store_instances` | `src/lib.rs:1162-1174` | Fresh store instance observes epochs 1 then 2. | All | unaudited |
 
 ## Adjacent in-repo checks
 
@@ -51,16 +52,46 @@ These are outside the target crate but explicitly exercise or consume its contra
 
 | Test | Location | Claim | Status |
 |---|---|---|---|
-| `reopening_a_permissive_store_protects_the_database_and_its_wal` | `cortexkit-store/src/lib.rs:364-418` | Database and WAL are `0600` on reopen. | unaudited |
-| `open_runs_migrations_and_seeds_once` | `cortexkit-store/src/lib.rs:457-478` | Store epochs are 1 then 2 across clean opens. | unaudited |
-| `second_live_writer_is_rejected` | `cortexkit-store/src/lib.rs:481-490` | Second same-process store open is rejected as a lease error. | unaudited |
-| `distinct_databases_do_not_falsely_contend` | `cortexkit-store/src/lib.rs:493-501` | Distinct database paths coexist. | unaudited |
-| `superseded_writer_is_fenced_out_after_handover` | `cortexkit-store/src/lib.rs:629-667` | Synthetic epoch-1 writer cannot overwrite epoch-2 state. | unaudited |
-| `equal_epoch_writer_is_not_fenced` | `cortexkit-store/src/lib.rs:670-689` | Equal epoch can continue writing. | unaudited |
-| `open_migrate_and_single_writer` | `cortexkit-store-postgres/src/lib.rs:305-341` | Live PostgreSQL session lock rejects a second open; first epoch is `>= 1` and reopened epoch is `>= 2` after clean release. It does not compare the values directly. Skips locally unless `CORTEXKIT_TEST_PG_DSN` is set; CI has a required live job. | unaudited |
-| `advisory_key_derivation_is_stable` | `cortexkit-store-postgres/src/lib.rs:375-381` | Pins one advisory bigint derived through public `LeaseKey::identity` and `fnv1a`. | unaudited |
+| `reopening_a_permissive_store_protects_the_database_and_its_wal` | `cortexkit-store/src/lib.rs:839-894` | Database and WAL are `0600` on reopen. | unaudited |
+| `open_claims_fence_before_return` | `cortexkit-store/src/lib.rs:932-945` | Open stamps the lease epoch before exposing the store. | unaudited |
+| `open_claim_rejects_an_epoch_the_database_already_stores` | `cortexkit-store/src/lib.rs:951-988` | The open claim rejects an epoch equal to the stored fence; `claim_fence` still authorizes it. | unaudited |
+| `migrations_seed_once_across_reopen` | `cortexkit-store/src/lib.rs:990-1012` | Migrations and seeds run once; clean reopen issues a greater epoch. | unaudited |
+| `database_epoch_survives_repeated_lease_sidecar_loss` | `cortexkit-store/src/lib.rs:1014-1041` | Two repeated sidecar losses each issue an epoch above the database fence. | unaudited |
+| `second_live_writer_is_rejected` | `cortexkit-store/src/lib.rs:1055-1065` | Second same-process store open is rejected as a lease error. | unaudited |
+| `distinct_databases_do_not_falsely_contend` | `cortexkit-store/src/lib.rs:1067-1076` | Distinct database paths coexist. | unaudited |
+| `unfenced_connection_rejects_writes` | `cortexkit-store/src/lib.rs:1182-1206` | `with_conn` rejects a write with `SQLITE_READONLY`, leaves no row, and still permits a later fenced write. | unaudited |
+| `open_pins_full_synchronous` | `cortexkit-store/src/lib.rs:1208-1217` | Open pins `synchronous=FULL`, so a committed fence epoch survives power loss in WAL mode. | unaudited |
+| `a_panicking_read_does_not_strand_the_connection_read_only` | `cortexkit-store/src/lib.rs:1219-1240` | A panicking `with_conn` callback still clears `query_only`, so later fenced writes and maintenance remain authorized. | unaudited |
+| `a_read_callback_cannot_lower_fence_durability` | `cortexkit-store/src/lib.rs:1242-1307` | A read callback is denied lowering `synchronous`, and a fenced write and a migration re-pin `FULL` and a WAL journal after the maintenance path changes them. | unaudited |
+| `a_read_callback_cannot_clear_the_read_only_guard` | `cortexkit-store/src/lib.rs:1309-1363` | A read callback is denied every pragma write, in any letter case, and writes nothing. | unaudited |
+| `a_callback_cannot_damage_the_fence_row_it_is_checked_against` | `cortexkit-store/src/lib.rs:1424-1533` | A fenced callback or migration that lowers, deletes, or forges the fence and version rows is denied, and the row keeps its epoch. | unaudited |
+| `a_callback_cannot_end_the_fence_checked_transaction` | `cortexkit-store/src/lib.rs:1365-1422` | `COMMIT`, `ROLLBACK`, `SAVEPOINT`, and `BEGIN` are denied inside a fenced callback and a migration, and nothing commits or is created unfenced. | unaudited |
+| `maintenance_runs_through_the_unfenced_path` | `cortexkit-store/src/lib.rs:1535-1549` | `VACUUM` fails the read-only guard and succeeds through `with_conn_unfenced`. | unaudited |
+| `fenced_write_rolls_back_on_error` | `cortexkit-store/src/lib.rs:1551-1585` | Callback failure rolls back both domain mutation and a newer fence claim. | unaudited |
+| `legacy_database_without_fence_table_uses_zero_floor` | `cortexkit-store/src/lib.rs:1587-1610` | A pre-fence-table database opens at floor zero and receives epoch 1. | unaudited |
+| `legacy_negative_database_fence_fails_closed` | `cortexkit-store/src/lib.rs:1612-1640` | A pre-constraint negative fence is rejected and remains unchanged. | unaudited |
+| `superseded_writer_is_fenced_out_after_handover` | `cortexkit-store/src/lib.rs:1642-1681` | Synthetic epoch-1 writer cannot overwrite epoch-2 state. | unaudited |
+| `superseded_writer_cannot_migrate` | `cortexkit-store/src/lib.rs:1683-1714` | Synthetic stale migration is fenced before its schema SQL executes. | unaudited |
+| `equal_epoch_writer_is_not_fenced` | `cortexkit-store/src/lib.rs:1716-1737` | Equal epoch can continue writing. | unaudited |
+| `epoch_above_sqlite_integer_range_fails` | `cortexkit-store/src/lib.rs:1739-1755` | Epochs above SQLite's signed integer range fail instead of wrapping. | unaudited |
+| `open_migrate_and_single_writer` | `cortexkit-store-postgres/src/lib.rs:591-623` | Live PostgreSQL covers migration and session exclusion. Requires `CORTEXKIT_TEST_PG_DSN`; CI has a required live job. | unaudited |
+| `read_only_callback_rejects_mutation_without_rows` | `cortexkit-store-postgres/src/lib.rs:926-959` | Read-only mutation reports SQLSTATE `25006` and leaves rows unchanged. | unaudited |
+| `open_verifies_the_stored_epoch_matches_the_issued_one` | `cortexkit-store-postgres/src/lib.rs:877-902` | Open re-reads the committed lease row and requires it to carry the epoch it issued. | unaudited |
+| `a_suppressed_epoch_increment_is_rejected` | `cortexkit-store-postgres/src/lib.rs:857-875` | Issuing an epoch that did not advance past the stored row is rejected. | unaudited |
+| `a_callback_cannot_damage_the_lease_row_it_is_fenced_against` | `cortexkit-store-postgres/src/lib.rs:810-855` | A fenced callback that deletes or lowers its own lease row is rejected and rolled back. | unaudited |
+| `a_callback_that_ends_the_transaction_is_rejected` | `cortexkit-store-postgres/src/lib.rs:625-668` | A fenced callback or migration that sends `COMMIT` is rejected instead of reporting success. | unaudited |
+| `a_read_callback_cannot_escape_read_only_mode` | `cortexkit-store-postgres/src/lib.rs:670-730` | A read callback that sends `COMMIT` or `SET TRANSACTION READ WRITE` is rejected; only the autocommitted write survives. | unaudited |
+| `a_regressed_positive_epoch_fails_closed` | `cortexkit-store-postgres/src/lib.rs:765-808` | A stored epoch below the one stamped at open fails closed for the holder and for a superseded writer above it. | unaudited |
+| `a_negative_epoch_fails_closed` | `cortexkit-store-postgres/src/lib.rs:732-763` | The lease table rejects a negative epoch, and a negative epoch reaching the fence returns `FenceCorrupt`. | unaudited |
+| `unfenced_callback_runs_statements_a_transaction_forbids` | `cortexkit-store-postgres/src/lib.rs:904-924` | `VACUUM` reports SQLSTATE `25001` inside a fenced transaction and succeeds through the autocommit callback. | unaudited |
+| `fenced_callback_error_rolls_back_rows` | `cortexkit-store-postgres/src/lib.rs:961-995` | Callback failure rolls back domain rows. | unaudited |
+| `repeated_fenced_writes_at_current_epoch_succeed` | `cortexkit-store-postgres/src/lib.rs:997-1017` | Repeated writes at the current lease epoch succeed. | unaudited |
+| `superseded_writer_is_rejected_after_reopen` | `cortexkit-store-postgres/src/lib.rs:1019-1051` | Synthetic stale callback is rejected after reopen. | unaudited |
+| `superseded_writer_cannot_migrate` | `cortexkit-store-postgres/src/lib.rs:1053-1089` | Synthetic stale migration is fenced before its schema SQL executes. | unaudited |
+| `independent_namespace_chains` | `cortexkit-store-postgres/src/lib.rs:1091-1121` | Independent migrations both apply. | unaudited |
+| `advisory_key_derivation_is_stable` | `cortexkit-store-postgres/src/lib.rs:1125-1129` | Pins one advisory bigint derived through public `LeaseKey::identity` and `fnv1a`. | unaudited |
 
-The handover checks use `SqliteStore::for_test` (`cortexkit-store/src/lib.rs:105-128`), which bypasses real lease acquisition. They check fence logic, not an end-to-end handover.
+The handover checks use synthetic stores that bypass real lease acquisition. They check fence logic against real database transactions, not an end-to-end retained-connection handover.
 
 ## Explicitly absent checks
 

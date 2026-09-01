@@ -13,7 +13,7 @@ Safety checks apply while faults are active. Liveness checks run after the state
 | `ENOSPC`, `EDQUOT`, or returned `EIO` during rewrite | `failed-acquire-preserves-prior-epoch`, `writer-epoch-strictly-increases` | A positive write prefix is followed by an error and acquisition returns `Err`. | no; byte-prefix properties do not inject `File` errors |
 | Valid-UTF-8 malformed or invalid-UTF-8 epoch | `invalid-epoch-fails-closed`, `writer-epoch-strictly-increases` | File is non-empty and existed before acquisition. | yes, local unit tests through both acquisition modes |
 | Persisted epoch is `u64::MAX` | `writer-epoch-strictly-increases` | Parser observes the exact maximum, then two consecutive exclusive acquisitions return `Err`. | yes, local unit test |
-| Older lease file restored | `writer-epoch-strictly-increases`, `returned-epoch-is-crash-durable` | A previously acknowledged higher epoch exists before restore, then the same key is acquired. | no |
+| Older lease file restored | `writer-epoch-strictly-increases`, `returned-epoch-is-crash-durable` | A previously acknowledged higher epoch exists before restore, then the same key is acquired. | partial; SQLite sidecar deletion is recovered from the database floor, but arbitrary lease-only consumers and power-loss restore remain untested |
 | Key contains `U+001F` | `distinct-lease-keys-do-not-alias` | Two structurally distinct keys produce the same joined identity. | no |
 | FNV-1a collision | `distinct-lease-keys-do-not-alias` | Two distinct identities produce one digest; practical adversarial cost remains open. | no |
 | Lease file unlinked/replaced while held | `lease-inode-remains-stable-while-held`, `at-most-one-exclusive-holder-per-key` | `live-lease-file-replacement-is-reached` fires. | no |

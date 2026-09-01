@@ -1,9 +1,10 @@
 # `replacement-fence-is-claimed-before-old-writer-writes`
 
 - **Discovery:** targeted SQLite handover pass after portfolio evaluation.
-- **Primary evidence:** `open_sqlite` acquires epoch but does not claim the database fence (`cortexkit-store/src/lib.rs:245-284`); claim is lazy inside `with_conn_fenced` (`:162-205`).
-- **Existing evidence:** synthetic handover test claims epoch 2 before stale epoch 1 attempts a write (`:629-667`); equal epoch is permitted (`:670-689`).
-- **Failure scenario:** on a declared fence-protected path, old epoch 1 connection survives; replacement acquires epoch 2 but does not write; an old transaction commits after replacement acquisition while the database still stores epoch 1.
-- **Timing window:** replacement acquisition through first replacement fenced write.
-- **Instrumentation:** lease acquisition event, database fence value, and old-writer effect event.
-- **Open-question log:** no design text accepts this window; owner must decide whether claim belongs at open.
+- **Primary evidence:** `open_sqlite` reads the existing database fence, acquires a file epoch above that floor, and claims the epoch through `claim_fence_strict` in an `IMMEDIATE` transaction before constructing the returned store (`cortexkit-store/src/lib.rs:555-633,635-654,667-675,699-714`). `with_conn_fenced` uses the equality-tolerant `claim_fence` instead (`:185-228,677-697`).
+- **Discriminating fact:** the floor is derived before the lease is held, so the stored fence can advance in between and leave the issued epoch merely equal to it. `claim_fence` authorizes an equal epoch, which would place two holders on one epoch, so the open path requires a strict advance and returns `StoreError::Fenced` otherwise.
+- **Existing evidence:** `open_claims_fence_before_return` (`:932-945`) observes the claimed epoch before domain setup; `open_claim_rejects_an_epoch_the_database_already_stores` (`:951-988`) rejects an epoch equal to the stored fence while `claim_fence` (`:677-697`) still accepts it; `database_epoch_survives_repeated_lease_sidecar_loss` (`:1014-1041`) issues greater epochs after repeated sidecar loss; `superseded_writer_is_fenced_out_after_handover` (`:1642-1681`) rejects stale epoch 1 after epoch 2 claims; and `equal_epoch_writer_is_not_fenced` (`:1716-1737`) permits an equal epoch on the write path.
+- **Failure scenario:** an old epoch 1 connection survives and races a transaction after replacement file-lease acquisition but before replacement obtains the `IMMEDIATE` database transaction. No replacement store is exposed during this interval, and a racing fence advance now fails the open instead of duplicating an epoch.
+- **Timing window:** internal file-lease acquisition through committed database claim.
+- **Instrumentation:** lease acquisition event, database fence value, and old-writer effect event. A concurrent opener racing the `IMMEDIATE` claim is still not exercised; the equal-epoch rejection is checked at the helper, not through two racing `open_sqlite` calls.
+- **Open-question log:** owner must define whether authority transfers at internal file-lease acquisition or successful `open_sqlite` return.

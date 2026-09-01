@@ -56,7 +56,7 @@ The steady-state mode property does not dominate path-target stability. A test c
 
 ### Lease-root topology (unresolved shared dependency)
 
-`distinct-lease-keys-do-not-alias`, `lease-file-growth-trigger-is-observed`, `filesystem-lock-scope-matches-deployment`, and `logical-store-has-single-lease-identity` depend on whether a consumer places many logical stores under one root. The lease crate describes a shared root (`src/lib.rs:10-14`); the in-repo SQLite consumer derives one root per database parent (`cortexkit-store/src/lib.rs:245-260`); the density measurement implies at least one external consumer uses a high-cardinality shared root (`docs/lease-store-density.md:7-11`). Impact remains conditional until deployment topology is supplied.
+`distinct-lease-keys-do-not-alias`, `lease-file-growth-trigger-is-observed`, `filesystem-lock-scope-matches-deployment`, and `logical-store-has-single-lease-identity` depend on whether a consumer places many logical stores under one root. The lease crate describes a shared root (`src/lib.rs:10-14`); the in-repo SQLite consumer derives one root per database parent (`cortexkit-store/src/lib.rs:234-250`); the density measurement implies at least one external consumer uses a high-cardinality shared root (`docs/lease-store-density.md:7-11`). Impact remains conditional until deployment topology is supplied.
 
 ### Resource mechanism
 

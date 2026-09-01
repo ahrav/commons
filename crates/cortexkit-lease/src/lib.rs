@@ -248,6 +248,42 @@ impl FileLeaseStore {
         self.base_dir
             .join(format!("{}.lease", fnv1a_hex(&key.identity())))
     }
+
+    /// Acquires an exclusive lease with an epoch greater than the persisted epoch and `epoch_floor`.
+    ///
+    /// The floor preserves monotonic fencing when a durable resource outlives its lease sidecar or is restored independently.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LeaseError::Held`] when another holder has the lease, or
+    /// [`LeaseError::Io`] when the lease file cannot be opened, read, or updated.
+    pub fn acquire_above(
+        &self,
+        key: &LeaseKey,
+        epoch_floor: u64,
+    ) -> Result<Box<dyn LeaseHandle>, LeaseError> {
+        std::fs::create_dir_all(&self.base_dir).map_err(LeaseError::Io)?;
+        let path = self.lease_path(key);
+        let mut file = open_lease_file(&path).map_err(LeaseError::Io)?;
+        match file.try_lock() {
+            Ok(()) => {}
+            Err(TryLockError::WouldBlock) => {
+                return Err(LeaseError::Held { key: key.clone() });
+            }
+            Err(TryLockError::Error(e)) => return Err(LeaseError::Io(e)),
+        }
+
+        let epoch = bump_epoch_above(&mut file, epoch_floor).map_err(|error| {
+            let _ = file.unlock();
+            LeaseError::Io(epoch_path_error(&path, "bump", error))
+        })?;
+
+        Ok(Box::new(FileLeaseHandle {
+            epoch,
+            file,
+            key: key.clone(),
+        }))
+    }
 }
 
 /// A file-backed held lease: holds the OS advisory lock (exclusive or shared)
@@ -278,28 +314,7 @@ impl Drop for FileLeaseHandle {
 
 impl LeaseStore for FileLeaseStore {
     fn acquire(&self, key: &LeaseKey) -> Result<Box<dyn LeaseHandle>, LeaseError> {
-        std::fs::create_dir_all(&self.base_dir).map_err(LeaseError::Io)?;
-        let path = self.lease_path(key);
-        let mut file = open_lease_file(&path).map_err(LeaseError::Io)?;
-        match file.try_lock() {
-            Ok(()) => {}
-            Err(TryLockError::WouldBlock) => {
-                return Err(LeaseError::Held { key: key.clone() });
-            }
-            Err(TryLockError::Error(e)) => return Err(LeaseError::Io(e)),
-        }
-
-        // We hold the lock: bump the persisted epoch (the CAS fence token).
-        let epoch = bump_epoch(&mut file).map_err(|error| {
-            let _ = file.unlock();
-            LeaseError::Io(epoch_path_error(&path, "bump", error))
-        })?;
-
-        Ok(Box::new(FileLeaseHandle {
-            epoch,
-            file,
-            key: key.clone(),
-        }))
+        self.acquire_above(key, 0)
     }
 
     fn acquire_shared(&self, key: &LeaseKey) -> Result<Box<dyn LeaseHandle>, LeaseError> {
@@ -412,10 +427,11 @@ fn read_epoch(file: &mut (impl Read + Seek)) -> std::io::Result<u64> {
         .ok_or_else(|| invalid_epoch("lease epoch is outside the u64 range"))
 }
 
-/// Caller holds an exclusive lock while incrementing persisted epoch.
-fn bump_epoch(file: &mut File) -> std::io::Result<u64> {
+/// The caller holds the exclusive lock while this function updates the epoch above persisted state and `epoch_floor`.
+fn bump_epoch_above(file: &mut File, epoch_floor: u64) -> std::io::Result<u64> {
     let prev = read_epoch(file)?;
     let next = prev
+        .max(epoch_floor)
         .checked_add(1)
         .ok_or_else(|| invalid_epoch("lease epoch is exhausted"))?;
     persist_epoch(file, next)?;
@@ -497,6 +513,20 @@ mod tests {
                 0o600
             );
         }
+    }
+
+    #[test]
+    fn exclusive_epoch_exceeds_resource_floor() {
+        let (store, _dir) = tmp_store();
+        let k = key("resource-floor");
+        seed_epoch(&store, &k, b"41");
+
+        let guard = store.acquire_above(&k, 100).expect("acquire above floor");
+        assert_eq!(guard.epoch(), 101);
+        drop(guard);
+
+        let guard = store.acquire(&k).expect("ordinary reacquire");
+        assert_eq!(guard.epoch(), 102);
     }
 
     #[test]
