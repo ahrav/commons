@@ -81,7 +81,7 @@ impl PostgresStore {
         self.epoch
     }
 
-    /// A read-only transaction gives the callback a consistent multi-statement snapshot while rejecting writes.
+    /// The transaction rejects writes but otherwise uses the server's configured isolation level.
     ///
     /// # Errors
     ///
