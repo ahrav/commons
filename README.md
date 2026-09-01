@@ -116,7 +116,13 @@ input cannot leave a truncated file behind:
 ```sh
 #!/bin/sh
 set -eu
-printf '%s' "$epoch" | grep -Eq '^[0-9]{1,20}$' || {
+case "${epoch:-}" in
+  '' | *[!0-9]*)
+    echo "epoch must be 1-20 decimal digits" >&2
+    exit 1
+    ;;
+esac
+[ "${#epoch}" -le 20 ] || {
   echo "epoch must be 1-20 decimal digits" >&2
   exit 1
 }
@@ -136,7 +142,10 @@ signed integer and silently truncates any epoch above `i64::MAX`. `printf '%020s
 leaves the `0` flag undefined; coreutils `printf` rejects it and writes nothing,
 which empties the target under direct redirection. An unvalidated `$epoch` writes
 a valid epoch zero when it is unset, which is the rollback this procedure exists
-to avoid. The digit pattern alone admits 20-digit values above `u64::MAX`, which
+to avoid. `case` matches the variable as one value; `grep` would accept a
+multi-line `$epoch` whose individual lines are digits, and the padded result then
+carries a newline that `read_epoch` rejects, leaving the store unusable until
+another repair. The digit check alone admits 20-digit values above `u64::MAX`, which
 `read_epoch` rejects, so the procedure would replace a lease no consumer can
 acquire with another one; both operands are padded to 20 bytes, which makes the
 `sort` comparison numeric without involving any shell integer type. Writing to
