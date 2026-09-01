@@ -119,6 +119,7 @@ impl PostgresStore {
             .map_err(backend_error)?;
         let out = f(&mut tx).map_err(backend_error)?;
         require_read_only_transaction(&mut tx)?;
+        require_lease_held(&mut tx, self.lease_key)?;
         tx.commit().map_err(backend_error)?;
         Ok(out)
     }
@@ -143,6 +144,7 @@ impl PostgresStore {
         let witness = check_fence(&mut tx, self.lease_key, self.epoch)?;
         let out = f(&mut tx).map_err(backend_error)?;
         require_same_transaction(&mut tx, &witness)?;
+        require_lease_held(&mut tx, self.lease_key)?;
         tx.commit().map_err(backend_error)?;
         Ok(out)
     }
@@ -307,6 +309,33 @@ fn require_read_only_transaction(tx: &mut postgres::Transaction<'_>) -> Result<(
     Err(StoreError::Backend(
         "the read-only transaction is no longer read-only; the callback ended it or set \
          READ WRITE, so its statements ran unfenced"
+            .to_string(),
+    ))
+}
+
+/// A callback can release this session's lease with `pg_advisory_unlock_all`, after which a
+/// second `open_postgres` acquires the same key while this store is still live. Unlike a
+/// transaction property, re-acquiring the lock restores the invariant rather than hiding
+/// its loss, so checking possession after the callback is sound.
+fn require_lease_held(
+    tx: &mut postgres::Transaction<'_>,
+    lease_key: i64,
+) -> Result<(), StoreError> {
+    let held: bool = tx
+        .query_one(
+            "SELECT EXISTS(SELECT 1 FROM pg_locks WHERE locktype = 'advisory' \
+             AND pid = pg_backend_pid() AND granted \
+             AND ((classid::bigint << 32) | objid::bigint) = $1)",
+            &[&lease_key],
+        )
+        .map_err(backend_error)?
+        .get(0);
+    if held {
+        return Ok(());
+    }
+    Err(StoreError::Backend(
+        "this session no longer holds the advisory lease; the callback released it, so a \
+         second writer can open the same store"
             .to_string(),
     ))
 }
@@ -512,6 +541,12 @@ fn run_migrations(
             ))
         })?;
         require_same_transaction(&mut tx, &witness).map_err(|e| {
+            StoreError::Migration(format!(
+                "namespace '{namespace}' migration {}: {e}",
+                m.version
+            ))
+        })?;
+        require_lease_held(&mut tx, lease_key).map_err(|e| {
             StoreError::Migration(format!(
                 "namespace '{namespace}' migration {}: {e}",
                 m.version
@@ -899,6 +934,44 @@ mod tests {
             "open re-reads the committed row, so an AFTER trigger rewriting the epoch \
              cannot leave the issued value unbacked"
         );
+    }
+
+    #[test]
+    fn a_callback_cannot_release_the_lease_it_holds() {
+        let Some(dsn) = test_dsn() else {
+            return;
+        };
+        let ns = unique_ns("unlock");
+        let d = descriptor(&dsn, &ns);
+        let store = open_postgres(&d).expect("open");
+
+        let fenced = store.with_client_fenced(|tx| {
+            tx.execute("SELECT pg_advisory_unlock_all()", &[])?;
+            Ok(())
+        });
+        assert!(
+            matches!(&fenced, Err(StoreError::Backend(m)) if m.contains("no longer holds the advisory lease")),
+            "releasing the lease inside a fenced callback is rejected, got {fenced:?}"
+        );
+
+        let read = store.with_client_read(|tx| {
+            tx.execute("SELECT pg_advisory_unlock_all()", &[])?;
+            Ok(())
+        });
+        assert!(
+            matches!(&read, Err(StoreError::Backend(m)) if m.contains("no longer holds the advisory lease")),
+            "releasing the lease inside a read callback is rejected, got {read:?}"
+        );
+
+        // Re-acquiring restores the invariant rather than hiding its loss, so a callback
+        // that puts the lease back is accepted.
+        store
+            .with_client_fenced(|tx| {
+                tx.execute("SELECT pg_advisory_unlock_all()", &[])?;
+                tx.execute("SELECT pg_advisory_lock($1)", &[&store.lease_key])?;
+                Ok(())
+            })
+            .expect("a callback that restores the lease is accepted");
     }
 
     #[test]

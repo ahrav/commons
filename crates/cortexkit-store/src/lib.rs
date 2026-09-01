@@ -401,7 +401,36 @@ mod sqlite_backend {
         /// Reports a failed release to the caller, which `Drop` cannot do.
         fn release(mut self) -> Result<(), StoreError> {
             match self.conn.take() {
-                Some(conn) => Self::restore(conn, self.read_only),
+                Some(conn) => {
+                    let shadowed = Self::require_no_shadow(conn);
+                    Self::restore(conn, self.read_only).and(shadowed)
+                }
+                None => Ok(()),
+            }
+        }
+
+        /// `AuthAction::AlterTable` reports the source name, so a rename cannot be judged
+        /// when it is authorized: a benign temporary table renamed to an infrastructure
+        /// name shadows the real one on this connection, and a later fence claim would
+        /// read the callback's own epoch. The name is checked once the callback returns,
+        /// before its transaction commits.
+        fn require_no_shadow(conn: &Connection) -> Result<(), StoreError> {
+            let shadow: Option<String> = conn
+                .query_row(
+                    "SELECT name FROM temp.sqlite_schema \
+                     WHERE name IN ('cortexkit_fence', 'cortexkit_schema_version') LIMIT 1",
+                    [],
+                    |row| row.get(0),
+                )
+                .or_else(|e| match e {
+                    rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                    other => Err(other),
+                })
+                .map_err(|e| StoreError::Backend(e.to_string()))?;
+            match shadow {
+                Some(name) => Err(StoreError::Backend(format!(
+                    "a temporary `{name}` shadows the infrastructure table of the same name"
+                ))),
                 None => Ok(()),
             }
         }
@@ -1465,6 +1494,37 @@ mod tests {
             matches!(&m, Err(StoreError::Migration(msg)) if msg.contains("not authorized")),
             "a migration that lowers the fence row is denied, got {m:?}"
         );
+
+        // `AuthAction::AlterTable` reports the source name, so the rename is authorized
+        // and has to be caught by name once the callback returns.
+        let renamed = store.with_conn_fenced(|tx| {
+            tx.execute("CREATE TEMP TABLE benign (id INTEGER, epoch INTEGER)", [])?;
+            tx.execute("ALTER TABLE benign RENAME TO cortexkit_fence", [])
+                .map(|_| ())
+        });
+        assert!(
+            matches!(&renamed, Err(StoreError::Backend(m)) if m.contains("shadows the infrastructure table")),
+            "a temporary table renamed onto the fence table is rejected, got {renamed:?}"
+        );
+        let shadow_after: i64 = store
+            .with_conn(|c| {
+                c.query_row(
+                    "SELECT COUNT(*) FROM temp.sqlite_schema WHERE name = 'cortexkit_fence'",
+                    [],
+                    |r| r.get(0),
+                )
+            })
+            .expect("temp schema lookup");
+        assert_eq!(
+            shadow_after, 0,
+            "rejecting before commit rolls the temporary object back with the transaction"
+        );
+        store
+            .with_conn_fenced(|tx| {
+                tx.execute("INSERT INTO kv (k, v) VALUES ('after-shadow', '1')", [])
+                    .map(|_| ())
+            })
+            .expect("the fenced path still works after a rejected shadow");
         let _ = std::fs::remove_dir_all(&root);
     }
 
