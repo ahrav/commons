@@ -418,7 +418,8 @@ mod sqlite_backend {
             let shadow: Option<String> = conn
                 .query_row(
                     "SELECT name FROM temp.sqlite_schema \
-                     WHERE name IN ('cortexkit_fence', 'cortexkit_schema_version') LIMIT 1",
+                     WHERE lower(name) IN ('cortexkit_fence', 'cortexkit_schema_version') \
+                     LIMIT 1",
                     [],
                     |row| row.get(0),
                 )
@@ -1497,15 +1498,18 @@ mod tests {
 
         // `AuthAction::AlterTable` reports the source name, so the rename is authorized
         // and has to be caught by name once the callback returns.
-        let renamed = store.with_conn_fenced(|tx| {
-            tx.execute("CREATE TEMP TABLE benign (id INTEGER, epoch INTEGER)", [])?;
-            tx.execute("ALTER TABLE benign RENAME TO cortexkit_fence", [])
-                .map(|_| ())
-        });
-        assert!(
-            matches!(&renamed, Err(StoreError::Backend(m)) if m.contains("shadows the infrastructure table")),
-            "a temporary table renamed onto the fence table is rejected, got {renamed:?}"
-        );
+        // SQLite resolves identifiers case-insensitively, so the check must too.
+        for target in ["cortexkit_fence", "CORTEXKIT_FENCE", "CortexKit_Fence"] {
+            let renamed = store.with_conn_fenced(|tx| {
+                tx.execute("CREATE TEMP TABLE benign (id INTEGER, epoch INTEGER)", [])?;
+                tx.execute(&format!("ALTER TABLE benign RENAME TO {target}"), [])
+                    .map(|_| ())
+            });
+            assert!(
+                matches!(&renamed, Err(StoreError::Backend(m)) if m.contains("shadows the infrastructure table")),
+                "a temporary table renamed to `{target}` is rejected, got {renamed:?}"
+            );
+        }
         let shadow_after: i64 = store
             .with_conn(|c| {
                 c.query_row(
