@@ -138,18 +138,31 @@ mod sqlite_backend {
         }
 
         /// `with_conn` permits read-only queries and connection-local configuration.
-        /// Callers must keep callbacks read-only; SQLite does not enforce that
-        /// restriction. Durable writes must use [`Self::with_conn_fenced`].
+        /// `PRAGMA query_only` makes database writes fail with `SQLITE_READONLY`,
+        /// which keeps every durable write on the fenced path
+        /// ([`Self::with_conn_fenced`]).
         ///
         /// # Errors
         ///
-        /// Returns [`StoreError::Backend`] when the closure returns a SQLite error.
+        /// Returns [`StoreError::Backend`] if the callback returns an error,
+        /// attempts a write, or enabling or clearing `query_only` fails.
         pub fn with_conn<T>(
             &self,
             f: impl FnOnce(&Connection) -> rusqlite::Result<T>,
         ) -> Result<T, StoreError> {
             let guard = self.conn.lock().unwrap_or_else(|p| p.into_inner());
-            f(&guard).map_err(|e| StoreError::Backend(e.to_string()))
+            guard
+                .pragma_update(None, "query_only", "ON")
+                .map_err(|e| StoreError::Backend(e.to_string()))?;
+            let out = f(&guard);
+            // Always clear `query_only` after the callback; later fenced writes
+            // share this connection.
+            let restored = guard.pragma_update(None, "query_only", "OFF");
+            let out = out.map_err(|e| StoreError::Backend(e.to_string()))?;
+            restored.map_err(|e| {
+                StoreError::Backend(format!("failed to clear read-only guard: {e}"))
+            })?;
+            Ok(out)
         }
 
         /// Run a closure inside an epoch-fenced write transaction. The write is
@@ -254,6 +267,10 @@ mod sqlite_backend {
         // wait rather than fail, and foreign-key enforcement is enabled.
         conn.pragma_update(None, "journal_mode", "WAL")
             .map_err(|e| StoreError::Backend(e.to_string()))?;
+        // In WAL mode, `synchronous=NORMAL` may lose the most recent commits
+        // after power loss, which would roll the persisted fence epoch backward.
+        conn.pragma_update(None, "synchronous", "FULL")
+            .map_err(|e| StoreError::Backend(e.to_string()))?;
         conn.busy_timeout(Duration::from_secs(5))
             .map_err(|e| StoreError::Backend(e.to_string()))?;
         conn.pragma_update(None, "foreign_keys", "ON")
@@ -286,6 +303,8 @@ mod sqlite_backend {
             return Ok(0);
         }
         let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .map_err(|e| StoreError::Backend(e.to_string()))?;
+        conn.busy_timeout(Duration::from_secs(5))
             .map_err(|e| StoreError::Backend(e.to_string()))?;
         let has_fence: bool = conn
             .query_row(
@@ -813,6 +832,43 @@ mod tests {
             .with_conn(|c| c.query_row("SELECT v FROM kv WHERE k = 'a'", [], |r| r.get(0)))
             .expect("read back");
         assert_eq!(v, "1");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn unfenced_connection_rejects_writes() {
+        let (root, d) = tmp();
+        let store = open_sqlite(&d).expect("open");
+        store.migrate("kv", FENCE_SCHEMA).expect("migrate");
+        let r = store.with_conn(|c| {
+            c.execute("INSERT INTO kv (k, v) VALUES ('sneak', '1')", [])
+                .map(|_| ())
+        });
+        assert!(
+            matches!(&r, Err(StoreError::Backend(m)) if m.contains("readonly")),
+            "unfenced write must fail with SQLITE_READONLY, got {r:?}"
+        );
+        let n: i64 = store
+            .with_conn(|c| c.query_row("SELECT COUNT(*) FROM kv", [], |r| r.get(0)))
+            .expect("count");
+        assert_eq!(n, 0, "the rejected write left no row");
+        store
+            .with_conn_fenced(|tx| {
+                tx.execute("INSERT INTO kv (k, v) VALUES ('a', '1')", [])
+                    .map(|_| ())
+            })
+            .expect("fenced writes still work after the read-only guard clears");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn open_pins_full_synchronous() {
+        let (root, d) = tmp();
+        let store = open_sqlite(&d).expect("open");
+        let sync: i64 = store
+            .with_conn(|c| c.query_row("PRAGMA synchronous", [], |r| r.get(0)))
+            .expect("read synchronous");
+        assert_eq!(sync, 2, "fence durability requires synchronous=FULL");
         let _ = std::fs::remove_dir_all(&root);
     }
 
