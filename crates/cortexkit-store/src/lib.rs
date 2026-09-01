@@ -140,12 +140,15 @@ mod sqlite_backend {
         /// `with_conn` permits read-only queries and connection-local configuration.
         /// `PRAGMA query_only` makes database writes fail with `SQLITE_READONLY`,
         /// which keeps every durable write on the fenced path
-        /// ([`Self::with_conn_fenced`]).
+        /// ([`Self::with_conn_fenced`]). An authorizer denies setting `query_only`,
+        /// `synchronous`, and `journal_mode`, so the callback cannot lift the guard or
+        /// weaken fence durability; reading those pragmas stays allowed.
         ///
         /// # Errors
         ///
         /// Returns [`StoreError::Backend`] if the callback returns an error,
-        /// attempts a write, or enabling or clearing `query_only` fails.
+        /// attempts a write, sets a denied pragma, or if installing or clearing the
+        /// guard fails.
         pub fn with_conn<T>(
             &self,
             f: impl FnOnce(&Connection) -> rusqlite::Result<T>,
@@ -249,17 +252,45 @@ mod sqlite_backend {
         fn enable(conn: &'c Connection) -> Result<Self, StoreError> {
             conn.pragma_update(None, "query_only", "ON")
                 .map_err(|e| StoreError::Backend(e.to_string()))?;
+            conn.authorizer(Some(deny_guard_pragmas))
+                .map_err(|e| StoreError::Backend(e.to_string()))?;
             Ok(Self { conn: Some(conn) })
         }
 
         /// Reports a failed clear to the caller, which `Drop` cannot do.
         fn restore(mut self) -> Result<(), StoreError> {
             match self.conn.take() {
-                Some(conn) => conn.pragma_update(None, "query_only", "OFF").map_err(|e| {
-                    StoreError::Backend(format!("failed to clear read-only guard: {e}"))
-                }),
+                Some(conn) => Self::clear(conn),
                 None => Ok(()),
             }
+        }
+
+        fn clear(conn: &Connection) -> Result<(), StoreError> {
+            conn.authorizer(NO_AUTHORIZER).map_err(|e| {
+                StoreError::Backend(format!("failed to clear read-only guard: {e}"))
+            })?;
+            conn.pragma_update(None, "query_only", "OFF")
+                .map_err(|e| StoreError::Backend(format!("failed to clear read-only guard: {e}")))
+        }
+    }
+
+    /// Specifies callback type so `None` removes the authorizer.
+    const NO_AUTHORIZER: Option<
+        fn(rusqlite::hooks::AuthContext<'_>) -> rusqlite::hooks::Authorization,
+    > = None;
+
+    /// `query_only` permits PRAGMA changes, including its own.
+    /// A PRAGMA read has no value and remains allowed.
+    fn deny_guard_pragmas(
+        context: rusqlite::hooks::AuthContext<'_>,
+    ) -> rusqlite::hooks::Authorization {
+        use rusqlite::hooks::{AuthAction, Authorization};
+        match context.action {
+            AuthAction::Pragma {
+                pragma_name: "query_only" | "synchronous" | "journal_mode",
+                pragma_value: Some(_),
+            } => Authorization::Deny,
+            _ => Authorization::Allow,
         }
     }
 
@@ -267,7 +298,7 @@ mod sqlite_backend {
         fn drop(&mut self) {
             if let Some(conn) = self.conn.take() {
                 // Drop ignores cleanup errors because it cannot return them.
-                let _ = conn.pragma_update(None, "query_only", "OFF");
+                let _ = Self::clear(conn);
             }
         }
     }
@@ -982,10 +1013,22 @@ mod tests {
         let (root, d) = tmp();
         let store = open_sqlite(&d).expect("open");
         store.migrate("kv", FENCE_SCHEMA).expect("migrate");
-        store
-            .with_conn(|c| c.pragma_update(None, "synchronous", "OFF"))
-            .expect("synchronous is connection-local, so the read guard permits it");
 
+        let lowered = store.with_conn(|c| c.pragma_update(None, "synchronous", "OFF"));
+        assert!(
+            matches!(&lowered, Err(StoreError::Backend(m)) if m.contains("not authorized")),
+            "the read guard denies lowering synchronous, got {lowered:?}"
+        );
+        let unchanged: i64 = store
+            .with_conn(|c| c.query_row("PRAGMA synchronous", [], |r| r.get(0)))
+            .expect("reading a pragma stays allowed");
+        assert_eq!(unchanged, 2, "the denied pragma left synchronous=FULL");
+
+        // The fenced write restores `synchronous=FULL` after unrestricted maintenance
+        // changes it.
+        store
+            .with_conn_unfenced(|c| c.pragma_update(None, "synchronous", "OFF"))
+            .expect("maintenance may lower it");
         store
             .with_conn_fenced(|tx| {
                 tx.execute("INSERT INTO kv (k, v) VALUES ('durable', '1')", [])
@@ -1001,7 +1044,7 @@ mod tests {
         );
 
         store
-            .with_conn(|c| c.pragma_update(None, "synchronous", "NORMAL"))
+            .with_conn_unfenced(|c| c.pragma_update(None, "synchronous", "NORMAL"))
             .expect("lower again");
         let second = &[Migration {
             version: 1,
@@ -1012,6 +1055,35 @@ mod tests {
             .with_conn(|c| c.query_row("PRAGMA synchronous", [], |r| r.get(0)))
             .expect("read synchronous");
         assert_eq!(after_migrate, 2, "migration re-pinned synchronous=FULL");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_read_callback_cannot_clear_the_read_only_guard() {
+        let (root, d) = tmp();
+        let store = open_sqlite(&d).expect("open");
+        store.migrate("kv", FENCE_SCHEMA).expect("migrate");
+
+        let bypass = store.with_conn(|c| {
+            c.pragma_update(None, "query_only", "OFF")?;
+            c.execute("INSERT INTO kv (k, v) VALUES ('bypass', '1')", [])
+                .map(|_| ())
+        });
+        assert!(
+            matches!(&bypass, Err(StoreError::Backend(m)) if m.contains("not authorized")),
+            "clearing the guard is denied before any write runs, got {bypass:?}"
+        );
+        let n: i64 = store
+            .with_conn(|c| c.query_row("SELECT COUNT(*) FROM kv", [], |r| r.get(0)))
+            .expect("count");
+        assert_eq!(n, 0, "the denied callback wrote nothing");
+
+        store
+            .with_conn_fenced(|tx| {
+                tx.execute("INSERT INTO kv (k, v) VALUES ('fenced', '1')", [])
+                    .map(|_| ())
+            })
+            .expect("the fenced path still works after a denied callback");
         let _ = std::fs::remove_dir_all(&root);
     }
 

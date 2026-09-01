@@ -277,8 +277,8 @@ fn require_read_only_transaction(tx: &mut postgres::Transaction<'_>) -> Result<(
         return Ok(());
     }
     Err(StoreError::Backend(
-        "the callback ended the read-only transaction; statements after that commit ran \
-         read-write and unfenced"
+        "the read-only transaction is no longer read-only; the callback ended it or set \
+         READ WRITE, so its statements ran unfenced"
             .to_string(),
     ))
 }
@@ -600,7 +600,7 @@ mod tests {
     }
 
     #[test]
-    fn a_read_callback_that_ends_the_transaction_is_rejected() {
+    fn a_read_callback_cannot_escape_read_only_mode() {
         let Some(dsn) = test_dsn() else {
             return;
         };
@@ -617,8 +617,45 @@ mod tests {
             Ok(())
         });
         assert!(
-            matches!(&escaped, Err(StoreError::Backend(m)) if m.contains("ended the read-only transaction")),
+            matches!(&escaped, Err(StoreError::Backend(m)) if m.contains("no longer read-only")),
             "the read API reports the escape instead of succeeding, got {escaped:?}"
+        );
+
+        let switched = store.with_client_read(|tx| {
+            tx.batch_execute("SET TRANSACTION READ WRITE")?;
+            tx.batch_execute(&format!("INSERT INTO {table} (v) VALUES (2)"))?;
+            Ok(())
+        });
+        assert!(
+            matches!(&switched, Err(StoreError::Backend(m)) if m.contains("no longer read-only")),
+            "switching the access mode without ending the transaction is rejected, got {switched:?}"
+        );
+
+        let escaped_rows: i64 = store
+            .with_client_unfenced(|c| {
+                Ok(
+                    c.query_one(&format!("SELECT COUNT(*) FROM {table} WHERE v = 1"), &[])?
+                        .get(0),
+                )
+            })
+            .expect("count");
+        assert_eq!(
+            escaped_rows, 1,
+            "ending the transaction autocommits the write before the check runs, so \
+             rejection reports it rather than undoing it"
+        );
+        let switched_rows: i64 = store
+            .with_client_unfenced(|c| {
+                Ok(
+                    c.query_one(&format!("SELECT COUNT(*) FROM {table} WHERE v = 2"), &[])?
+                        .get(0),
+                )
+            })
+            .expect("count");
+        assert_eq!(
+            switched_rows, 0,
+            "switching the access mode leaves the transaction open, so refusing to commit \
+             rolls the write back"
         );
 
         let _ = store.with_client_unfenced(|c| c.batch_execute(&format!("DROP TABLE {table}")));
