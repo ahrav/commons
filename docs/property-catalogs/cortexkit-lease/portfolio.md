@@ -40,7 +40,7 @@ Fresh-context evaluation ran after the initial 22-record catalog was written. It
 
 ### Shared-root topology
 
-The lease crate requires a shared root (`src/lib.rs:26-28`), the in-repo SQLite consumer derives a root from each database parent (`cortexkit-store/src/lib.rs:240-262`), and the density measurement implies an external high-cardinality shared root (`docs/lease-store-density.md:7-11`). This unresolved topology changes the impact of key aliasing, density, and filesystem-scope properties.
+The lease crate requires a shared root (`src/lib.rs:26-28`), the in-repo SQLite consumer derives a root from each database parent (`cortexkit-store/src/lib.rs:245-260`), and the density measurement implies an external high-cardinality shared root (`docs/lease-store-density.md:7-11`). This unresolved topology changes the impact of key aliasing, density, and filesystem-scope properties.
 
 ### Contract catalog versus current implementation
 

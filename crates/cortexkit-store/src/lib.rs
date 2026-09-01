@@ -13,19 +13,11 @@
 //! epoch-checked writes.
 
 pub use cortexkit_store_types::{
-    postgres_database_name, sqlite_store_path, Isolation, StorageBackend, StorageDescriptor,
+    postgres_database_name, sqlite_store_path, Isolation, Migration, StorageBackend,
+    StorageDescriptor,
 };
 
 use cortexkit_lease::{LeaseError, LeaseKey, LeaseStore};
-
-/// Migration statements and their version record commit together.
-#[derive(Debug, Clone, Copy)]
-pub struct Migration {
-    /// Must be unique within a namespace and greater than its recorded maximum.
-    pub version: u32,
-    /// SQL executed as a batch (multiple statements allowed): DDL and/or seed rows.
-    pub statements: &'static str,
-}
 
 #[derive(Debug)]
 pub enum StoreError {
@@ -212,14 +204,11 @@ mod sqlite_backend {
             Ok(out)
         }
 
-        /// Apply a `namespace`'s migration chain to this store's database, once.
+        /// Applies a `namespace`'s migration chain using its recorded maximum as a
+        /// watermark.
         ///
-        /// Applied migrations are tracked per `(namespace, version)`, so a module
-        /// that owns several domains in one database registers an independent chain
-        /// per domain (`migrate("work_graph", ..)`, `migrate("hires", ..)`): each
-        /// domain's history is separate, and adding a domain later never re-runs or
-        /// entangles another's migrations. A single-domain module just calls this
-        /// once. Idempotent: only un-applied versions in this namespace run.
+        /// Each namespace has an independent migration history. Versions at or
+        /// below its watermark are silently skipped.
         ///
         /// # Errors
         ///

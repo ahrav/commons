@@ -1,5 +1,4 @@
-//! Dependency-light storage descriptor types: the wire/config contract for
-//! CortexKit module storage.
+//! Shared storage descriptor and migration types for CortexKit.
 //!
 //! There is one central storage config. subc resolves it into a
 //! [`StorageDescriptor`] per module and delivers that descriptor to the module.
@@ -22,6 +21,17 @@
 //!   reaches only the module's own database.
 
 use serde::{Deserialize, Serialize};
+
+/// Stores backend-independent migration metadata.
+#[derive(Debug, Clone, Copy)]
+pub struct Migration {
+    /// Must be unique within a namespace and greater than its recorded maximum.
+    /// Stores silently skip versions at or below that watermark.
+    pub version: u32,
+    /// The store executes SQL as one batch, allowing multiple DDL and seed statements.
+    /// The batch and its version record commit in the same transaction.
+    pub statements: &'static str,
+}
 
 /// How many physical databases a module's storage spans.
 ///

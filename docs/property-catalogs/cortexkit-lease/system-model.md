@@ -8,7 +8,7 @@ System path: `crates/cortexkit-lease` at `fa975843afd4b3122288149968ea5d6ff46322
 
 Exclusive acquisition creates the directory, opens or creates the file, calls `protect_file`, calls the standard-library `File::try_lock`, increments the epoch, and returns a handle that owns the file descriptor (`src/lib.rs:239-276`). Shared acquisition follows the same path but calls `File::try_lock_shared` and only reads the epoch (`src/lib.rs:278-313`). Both methods classify `TryLockError::WouldBlock` as `LeaseError::Held` and unwrap `TryLockError::Error` into `LeaseError::Io`.
 
-The crate has no network or database boundary. Its authority boundaries are the filesystem path and kernel lock table. `cortexkit-store` consumes the exclusive handle and uses its epoch at a SQLite write fence (`cortexkit-store/src/lib.rs:155-215,248-286`).
+The crate has no network or database boundary. Its authority boundaries are the filesystem path and kernel lock table. `cortexkit-store` consumes the exclusive handle and uses its epoch at a SQLite write fence (`cortexkit-store/src/lib.rs:144-205,245-284`).
 
 ## State and persistence
 

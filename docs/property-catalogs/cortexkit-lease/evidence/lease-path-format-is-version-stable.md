@@ -2,8 +2,8 @@
 
 - **Discovery:** version-compatibility and protocol passes.
 - **Primary evidence:** public identity and compatibility contract at `src/lib.rs:112-123`; file paths derive from the shared FNV-1a hash at `:204-210,341-358`.
-- **Cross-crate evidence:** PostgreSQL imports public `fnv1a` and hashes public `LeaseKey::identity` at `cortexkit-store-postgres/src/lib.rs:24,62-67`.
-- **Existing evidence:** golden identity/hash coverage exists at `src/lib.rs:482-488`, and PostgreSQL pins the resulting advisory key at `cortexkit-store-postgres/src/lib.rs:396-402`.
+- **Cross-crate evidence:** PostgreSQL imports public `fnv1a` and hashes public `LeaseKey::identity` at `cortexkit-store-postgres/src/lib.rs:11,41-46`.
+- **Existing evidence:** golden identity/hash coverage exists at `src/lib.rs:482-488`, and PostgreSQL pins the resulting advisory key at `cortexkit-store-postgres/src/lib.rs:375-381`.
 - **Residual gaps:** no automated SemVer gate, mixed-version overlap test, full-filename golden, or adversarial vectors.
 - **Failure scenario:** rolling restart or rollback overlaps binaries using different separators, field order, normalization, hash, or suffix.
 - **Timing window:** from first new-version acquisition until every old process is gone.
