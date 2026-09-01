@@ -143,7 +143,8 @@ mod sqlite_backend {
         /// ([`Self::with_conn_fenced`]). An authorizer denies setting `query_only`,
         /// `synchronous`, `journal_mode`, `locking_mode`, and `writable_schema`, so the
         /// callback cannot lift the guard, weaken fence durability, or take a lock that
-        /// blocks a replacement's fence-floor read; reading those pragmas stays allowed.
+        /// blocks a replacement's fence-floor read. Matching ignores case, and reading
+        /// those pragmas stays allowed.
         ///
         /// # Errors
         ///
@@ -275,6 +276,16 @@ mod sqlite_backend {
         }
     }
 
+    /// SQLite pragma names are case-insensitive, and the authorizer receives the
+    /// caller's spelling.
+    const GUARDED_PRAGMAS: [&str; 5] = [
+        "query_only",
+        "synchronous",
+        "journal_mode",
+        "locking_mode",
+        "writable_schema",
+    ];
+
     /// Specifies callback type so `None` removes the authorizer.
     const NO_AUTHORIZER: Option<
         fn(rusqlite::hooks::AuthContext<'_>) -> rusqlite::hooks::Authorization,
@@ -288,10 +299,14 @@ mod sqlite_backend {
         use rusqlite::hooks::{AuthAction, Authorization};
         match context.action {
             AuthAction::Pragma {
-                pragma_name:
-                    "query_only" | "synchronous" | "journal_mode" | "locking_mode" | "writable_schema",
+                pragma_name,
                 pragma_value: Some(_),
-            } => Authorization::Deny,
+            } if GUARDED_PRAGMAS
+                .iter()
+                .any(|guarded| pragma_name.eq_ignore_ascii_case(guarded)) =>
+            {
+                Authorization::Deny
+            }
             _ => Authorization::Allow,
         }
     }
@@ -310,7 +325,16 @@ mod sqlite_backend {
     /// transactions, so a protected transaction cannot trust the mode set at open.
     fn pin_fence_durability(conn: &Connection) -> Result<(), StoreError> {
         conn.pragma_update(None, "synchronous", "FULL")
-            .map_err(|e| StoreError::Backend(e.to_string()))
+            .map_err(|e| StoreError::Backend(e.to_string()))?;
+        let mode: String = conn
+            .query_row("PRAGMA journal_mode = WAL", [], |row| row.get(0))
+            .map_err(|e| StoreError::Backend(e.to_string()))?;
+        if !mode.eq_ignore_ascii_case("wal") {
+            return Err(StoreError::Backend(format!(
+                "fenced writes require a crash-safe journal, but journal_mode is {mode}"
+            )));
+        }
+        Ok(())
     }
 
     /// Transaction-control SQL sent by the callback ends the fence-checked transaction.
@@ -1057,6 +1081,23 @@ mod tests {
             .with_conn(|c| c.query_row("PRAGMA synchronous", [], |r| r.get(0)))
             .expect("read synchronous");
         assert_eq!(after_migrate, 2, "migration re-pinned synchronous=FULL");
+
+        store
+            .with_conn_unfenced(|c| c.pragma_update(None, "journal_mode", "MEMORY"))
+            .expect("maintenance may drop the journal");
+        store
+            .with_conn_fenced(|tx| {
+                tx.execute("INSERT INTO kv (k, v) VALUES ('journal', '1')", [])
+                    .map(|_| ())
+            })
+            .expect("fenced write");
+        let journal: String = store
+            .with_conn(|c| c.query_row("PRAGMA journal_mode", [], |r| r.get(0)))
+            .expect("read journal_mode");
+        assert!(
+            journal.eq_ignore_ascii_case("wal"),
+            "the fenced write restored a crash-safe journal, got {journal}"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -1082,6 +1123,25 @@ mod tests {
                 "setting {pragma} from a read callback is denied, got {denied:?}"
             );
         }
+        // SQLite pragma names are case-insensitive.
+        for spelling in ["QUERY_ONLY", "Query_Only", "qUeRy_OnLy"] {
+            let denied = store.with_conn(|c| {
+                c.execute_batch(&format!("PRAGMA {spelling}=OFF"))?;
+                c.execute("INSERT INTO kv (k, v) VALUES ('cased', '1')", [])
+                    .map(|_| ())
+            });
+            assert!(
+                matches!(&denied, Err(StoreError::Backend(m)) if m.contains("not authorized")),
+                "`PRAGMA {spelling}` is denied like the lowercase spelling, got {denied:?}"
+            );
+        }
+        let rows: i64 = store
+            .with_conn(|c| c.query_row("SELECT COUNT(*) FROM kv", [], |r| r.get(0)))
+            .expect("count");
+        assert_eq!(
+            rows, 0,
+            "no spelling of the guard pragma let a write through"
+        );
         let n: i64 = store
             .with_conn(|c| c.query_row("SELECT COUNT(*) FROM kv", [], |r| r.get(0)))
             .expect("count");
