@@ -72,16 +72,39 @@ not roll a single consumer back afterwards. A durable format discriminator, or a
 0.1.2 whose reader fails closed, would make the ordering enforceable; neither
 ships here.
 
-Version 0.1.x also leaves empty lease files behind. Its shared acquisition
-creates the file and never writes it, so any key first touched by a 0.1.x reader
-has a 0-byte file, and a 0.1.x writer killed between truncate and write leaves
-one too. Version 0.2 refuses those keys, nothing heals them, and deletion is
-unsafe. Audit every lease root and repair each hit with the procedure below
-before the first 0.2 consumer starts:
+Version 0.1.x leaves two kinds of damaged lease file behind, and only one of
+them fails loudly. Audit every lease root for both and repair each hit with the
+procedure below before the first 0.2 consumer starts.
+
+Empty files are the visible class. Shared acquisition creates the file and never
+writes it, so any key first touched by a 0.1.x reader has a 0-byte file. Version
+0.2 refuses those keys, and nothing heals them:
 
 ```sh
 find "$lease_root" -name '*.lease' -size 0c -print
 ```
+
+Truncated files that still parse are the silent class, and they are the one that
+loses fence tokens. Version 0.1.x `bump_epoch` truncates to zero length and then
+writes a variable-width decimal, so a writer killed part-way through leaves a
+prefix of the epoch it meant to publish. An interrupted write of `1000` can
+leave `1`: nonempty, 1-20 ASCII digits, inside `u64` range, and below the `999`
+already issued. Version 0.2 accepts that value and increments from it, reissuing
+tokens a database or a peer still holds. A size filter cannot see this, because
+a short file is exactly what a healthy 0.1.x epoch also looks like.
+
+Nothing on disk separates a truncated epoch from a legitimately low one, so the
+audit has to compare values against state 0.2 cannot read. List every lease file
+0.2 has not yet rewritten — a 0.2 write is always exactly 20 bytes — and check
+each value against the fence its consumer persisted:
+
+```sh
+find "$lease_root" -name '*.lease' ! -size 20c -exec sh -c \
+  'for f; do printf "%s\t%s\n" "$(cat "$f")" "$f"; done' sh {} +
+```
+
+Repair every value that does not exceed its consumer's persisted fence, not only
+the ones 0.2 rejects.
 
 Do not recover an invalid epoch by deleting its lease file. Deletion resets the
 counter and is unsafe when a database or another consumer retains a fence. Stop
@@ -97,7 +120,13 @@ printf '%s' "$epoch" | grep -Eq '^[0-9]{1,20}$' || {
   echo "epoch must be 1-20 decimal digits" >&2
   exit 1
 }
-printf '00000000000000000000%s' "$epoch" | tail -c 20 > "$lease_file.new"
+padded=$(printf '00000000000000000000%s' "$epoch" | tail -c 20)
+[ "$(printf '%s\n18446744073709551615\n' "$padded" | LC_ALL=C sort | tail -n 1)" \
+  = 18446744073709551615 ] || {
+  echo "epoch must not exceed u64::MAX (18446744073709551615)" >&2
+  exit 1
+}
+printf '%s' "$padded" > "$lease_file.new"
 chmod 600 "$lease_file.new"
 mv "$lease_file.new" "$lease_file"
 ```
@@ -107,8 +136,12 @@ signed integer and silently truncates any epoch above `i64::MAX`. `printf '%020s
 leaves the `0` flag undefined; coreutils `printf` rejects it and writes nothing,
 which empties the target under direct redirection. An unvalidated `$epoch` writes
 a valid epoch zero when it is unset, which is the rollback this procedure exists
-to avoid. Writing to `$lease_file.new` and renaming keeps the live file intact
-until a full 20 digits exist. Restart only upgraded consumers.
+to avoid. The digit pattern alone admits 20-digit values above `u64::MAX`, which
+`read_epoch` rejects, so the procedure would replace a lease no consumer can
+acquire with another one; both operands are padded to 20 bytes, which makes the
+`sort` comparison numeric without involving any shell integer type. Writing to
+`$lease_file.new` and renaming keeps the live file intact until a full 20 digits
+exist. Restart only upgraded consumers.
 
 ## Crates
 

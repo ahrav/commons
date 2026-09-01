@@ -205,7 +205,14 @@ impl std::fmt::Display for LeaseError {
     }
 }
 
-impl std::error::Error for LeaseError {}
+impl std::error::Error for LeaseError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            LeaseError::Held { .. } => None,
+            LeaseError::Io(e) => Some(e),
+        }
+    }
+}
 
 pub trait LeaseStore: Send + Sync {
     /// Dropping [`LeaseHandle`] releases exclusive ownership.
@@ -324,17 +331,53 @@ fn invalid_epoch(message: impl Into<String>) -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::InvalidData, message.into())
 }
 
+/// Adds path and operation context to an epoch failure without erasing it.
+///
+/// `std::io::Error::new(kind, String)` discards the original error payload.
+/// `raw_os_error()` then returns `None` and the source chain ends there.
+/// Holding the original error and reporting it through
+/// [`std::error::Error::source`] keeps the errno reachable, which lets a caller
+/// separate `ENOSPC` from `EDQUOT` and apply fault-specific handling.
+#[derive(Debug)]
+struct EpochError {
+    path: PathBuf,
+    operation: &'static str,
+    source: std::io::Error,
+}
+
+impl std::fmt::Display for EpochError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "failed to {} lease epoch at {}: {}",
+            self.operation,
+            self.path.display(),
+            self.source
+        )
+    }
+}
+
+impl std::error::Error for EpochError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
 fn epoch_path_error(
     path: &std::path::Path,
-    operation: &str,
+    operation: &'static str,
     error: std::io::Error,
 ) -> std::io::Error {
+    // `std::io::Error`'s own `source` forwards to the payload's `source`. The
+    // original error is reachable only because `EpochError` reports it.
+    let kind = error.kind();
     std::io::Error::new(
-        error.kind(),
-        format!(
-            "failed to {operation} lease epoch at {}: {error}",
-            path.display()
-        ),
+        kind,
+        EpochError {
+            path: path.to_path_buf(),
+            operation,
+            source: error,
+        },
     )
 }
 
@@ -598,6 +641,34 @@ mod tests {
             assert_invalid_data(store.acquire_shared(&k), name, "shared", &path);
             assert_eq!(std::fs::read(&path).expect("read epoch"), state);
         }
+    }
+
+    #[test]
+    fn epoch_errors_keep_the_underlying_os_error() {
+        let errno = 28;
+        let path = std::path::Path::new("/leases/scope.lease");
+        let source = std::io::Error::from_raw_os_error(errno);
+        let kind = source.kind();
+        let message = source.to_string();
+
+        let wrapped = epoch_path_error(path, "bump", source);
+
+        assert_eq!(wrapped.kind(), kind);
+        assert_eq!(
+            wrapped.to_string(),
+            format!("failed to bump lease epoch at /leases/scope.lease: {message}")
+        );
+
+        // A caller that reads only the outer error sees no errno. The original
+        // error has to stay reachable through `source`.
+        assert_eq!(wrapped.raw_os_error(), None);
+
+        let error = LeaseError::Io(wrapped);
+        let underlying = std::error::Error::source(&error)
+            .and_then(std::error::Error::source)
+            .and_then(|source| source.downcast_ref::<std::io::Error>())
+            .expect("original io::Error reachable from LeaseError");
+        assert_eq!(underlying.raw_os_error(), Some(errno));
     }
 
     #[test]
