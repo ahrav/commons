@@ -4,7 +4,7 @@ All statuses are **unaudited**. Test adequacy belongs to `/testing:invariant-tes
 
 ## Production checks and guards
 
-No production `assert!`, `debug_assert!`, `panic!`, or equivalent invariant battery exists in `src/lib.rs:1-476`.
+No production `assert!`, `debug_assert!`, `panic!`, or equivalent invariant battery exists in `src/lib.rs:1-471`.
 
 | Location | Check or branch | Semantics/message | Linked claims |
 |---|---|---|---|
