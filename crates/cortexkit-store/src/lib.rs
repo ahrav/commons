@@ -94,7 +94,7 @@ mod sqlite_backend {
         time::{Duration, SystemTime, UNIX_EPOCH},
     };
 
-    use cortexkit_lease::{protect_file, FileLeaseStore, LeaseHandle};
+    use cortexkit_lease::{protect_file, FileLeaseStore, HeldFileLease};
     use rusqlite::{Connection, OpenFlags};
 
     /// A lease-guarded SQLite store. The lease remains held for the store's lifetime.
@@ -103,8 +103,9 @@ mod sqlite_backend {
     pub struct SqliteStore {
         conn: Mutex<Connection>,
         epoch: u64,
-        // The held lease releases on drop; kept alive for the store's lifetime.
-        _lease: Box<dyn LeaseHandle>,
+        // Declared after `conn` so the connection closes before the lease unlocks;
+        // `None` is reserved for `for_test`.
+        _lease: Option<HeldFileLease>,
     }
 
     impl SqliteStore {
@@ -118,22 +119,10 @@ mod sqlite_backend {
         /// epochs, a state the OS lock prevents constructing through `open_sqlite`.
         #[cfg(test)]
         pub(crate) fn for_test(conn: Connection, epoch: u64) -> Self {
-            #[derive(Debug)]
-            struct NoLease(cortexkit_lease::LeaseKey);
-            impl LeaseHandle for NoLease {
-                fn epoch(&self) -> u64 {
-                    0
-                }
-                fn key(&self) -> &cortexkit_lease::LeaseKey {
-                    &self.0
-                }
-            }
             SqliteStore {
                 conn: Mutex::new(conn),
                 epoch,
-                _lease: Box::new(NoLease(cortexkit_lease::LeaseKey::new(
-                    "test", "sqlite", "test",
-                ))),
+                _lease: None,
             }
         }
 
@@ -628,7 +617,7 @@ mod sqlite_backend {
         Ok(SqliteStore {
             conn: Mutex::new(conn),
             epoch,
-            _lease: lease,
+            _lease: Some(lease),
         })
     }
 

@@ -174,15 +174,6 @@ impl LeaseKey {
     }
 }
 
-/// A held lease keeps its backend-specific lock or ownership record alive.
-///
-/// Exclusive handles expose writer epochs. Shared handles expose the last persisted writer epoch for observation; shared epochs are not write fences.
-pub trait LeaseHandle: Send + Sync + std::fmt::Debug {
-    fn epoch(&self) -> u64;
-
-    fn key(&self) -> &LeaseKey;
-}
-
 #[derive(Debug)]
 pub enum LeaseError {
     /// A conflicting live holder owns the lease for this key.
@@ -214,25 +205,6 @@ impl std::error::Error for LeaseError {
     }
 }
 
-pub trait LeaseStore: Send + Sync {
-    /// Dropping [`LeaseHandle`] releases exclusive ownership.
-    fn acquire(&self, key: &LeaseKey) -> Result<Box<dyn LeaseHandle>, LeaseError>;
-
-    /// A shared holder blocks [`LeaseStore::acquire`] (exclusive).
-    ///
-    /// Use for reader-side protection of shared resources: e.g. a model-cache
-    /// consumer takes a shared lease on a blob's digest while validating or
-    /// mmap-ing it, so a GC (exclusive holder) can never delete the file out
-    /// from under a live reader, while concurrent readers never serialize each
-    /// other.
-    ///
-    /// Shared handles do NOT bump the fence epoch (they are not writers; the
-    /// epoch fences durable writes). [`LeaseHandle::epoch`] on a shared handle
-    /// returns the last persisted writer epoch at acquisition time, for
-    /// observability only — never use it as a write fence.
-    fn acquire_shared(&self, key: &LeaseKey) -> Result<Box<dyn LeaseHandle>, LeaseError>;
-}
-
 pub struct FileLeaseStore {
     base_dir: PathBuf,
 }
@@ -249,9 +221,19 @@ impl FileLeaseStore {
             .join(format!("{}.lease", fnv1a_hex(&key.identity())))
     }
 
+    /// Acquires an exclusive lease and increments its persisted writer epoch.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LeaseError::Held`] when another holder has the lease, or
+    /// [`LeaseError::Io`] when the lease file cannot be opened, read, or updated.
+    pub fn acquire(&self, key: &LeaseKey) -> Result<HeldFileLease, LeaseError> {
+        self.acquire_exclusive(key, None)
+    }
+
     /// Acquires an exclusive lease with an epoch greater than the persisted epoch and `epoch_floor`.
     ///
-    /// The floor preserves monotonic fencing when a durable resource outlives its lease sidecar or is restored independently.
+    /// Empty sidecar recovery uses `epoch_floor` as its sole lower bound, which must cover every epoch previously authorized for the key; malformed nonempty state fails closed.
     ///
     /// # Errors
     ///
@@ -261,7 +243,15 @@ impl FileLeaseStore {
         &self,
         key: &LeaseKey,
         epoch_floor: u64,
-    ) -> Result<Box<dyn LeaseHandle>, LeaseError> {
+    ) -> Result<HeldFileLease, LeaseError> {
+        self.acquire_exclusive(key, Some(epoch_floor))
+    }
+
+    fn acquire_exclusive(
+        &self,
+        key: &LeaseKey,
+        recovery_floor: Option<u64>,
+    ) -> Result<HeldFileLease, LeaseError> {
         std::fs::create_dir_all(&self.base_dir).map_err(LeaseError::Io)?;
         let path = self.lease_path(key);
         let mut file = open_lease_file(&path).map_err(LeaseError::Io)?;
@@ -273,51 +263,29 @@ impl FileLeaseStore {
             Err(TryLockError::Error(e)) => return Err(LeaseError::Io(e)),
         }
 
-        let epoch = bump_epoch_above(&mut file, epoch_floor).map_err(|error| {
+        let epoch = bump_epoch_above(&mut file, recovery_floor).map_err(|error| {
             let _ = file.unlock();
             LeaseError::Io(epoch_path_error(&path, "bump", error))
         })?;
 
-        Ok(Box::new(FileLeaseHandle {
+        Ok(HeldFileLease {
             epoch,
             file,
             key: key.clone(),
-        }))
-    }
-}
-
-/// A file-backed held lease: holds the OS advisory lock (exclusive or shared)
-/// for its lifetime.
-#[derive(Debug)]
-struct FileLeaseHandle {
-    epoch: u64,
-    /// Holds the OS advisory lock until dropped.
-    file: File,
-    key: LeaseKey,
-}
-
-impl LeaseHandle for FileLeaseHandle {
-    fn epoch(&self) -> u64 {
-        self.epoch
+        })
     }
 
-    fn key(&self) -> &LeaseKey {
-        &self.key
-    }
-}
-
-impl Drop for FileLeaseHandle {
-    fn drop(&mut self) {
-        let _ = self.file.unlock();
-    }
-}
-
-impl LeaseStore for FileLeaseStore {
-    fn acquire(&self, key: &LeaseKey) -> Result<Box<dyn LeaseHandle>, LeaseError> {
-        self.acquire_above(key, 0)
-    }
-
-    fn acquire_shared(&self, key: &LeaseKey) -> Result<Box<dyn LeaseHandle>, LeaseError> {
+    /// Acquires a shared lease without changing the persisted writer epoch.
+    ///
+    /// Shared holders coexist and block exclusive acquisition. Use this to protect a
+    /// shared resource from exclusive mutation without serializing readers. Its epoch
+    /// is the last persisted writer epoch at acquisition, not a write fence.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LeaseError::Held`] when an exclusive holder has the lease, or
+    /// [`LeaseError::Io`] when the lease file cannot be opened or read.
+    pub fn acquire_shared(&self, key: &LeaseKey) -> Result<HeldFileLease, LeaseError> {
         std::fs::create_dir_all(&self.base_dir).map_err(LeaseError::Io)?;
         let path = self.lease_path(key);
         let mut file = open_lease_file(&path).map_err(LeaseError::Io)?;
@@ -334,11 +302,38 @@ impl LeaseStore for FileLeaseStore {
             LeaseError::Io(epoch_path_error(&path, "read", error))
         })?;
 
-        Ok(Box::new(FileLeaseHandle {
+        Ok(HeldFileLease {
             epoch,
             file,
             key: key.clone(),
-        }))
+        })
+    }
+}
+
+/// A file-backed lease that keeps its OS advisory lock held until drop.
+#[derive(Debug)]
+#[must_use = "bind the guard for as long as the file lease must remain held"]
+pub struct HeldFileLease {
+    epoch: u64,
+    file: File,
+    key: LeaseKey,
+}
+
+impl HeldFileLease {
+    /// Shared acquisition returns an observation-only epoch, not a write fence.
+    pub fn epoch(&self) -> u64 {
+        self.epoch
+    }
+
+    /// These fields determine the persisted lock-path identity.
+    pub fn key(&self) -> &LeaseKey {
+        &self.key
+    }
+}
+
+impl Drop for HeldFileLease {
+    fn drop(&mut self) {
+        let _ = self.file.unlock();
     }
 }
 
@@ -427,9 +422,13 @@ fn read_epoch(file: &mut (impl Read + Seek)) -> std::io::Result<u64> {
         .ok_or_else(|| invalid_epoch("lease epoch is outside the u64 range"))
 }
 
-/// The caller holds the exclusive lock while this function updates the epoch above persisted state and `epoch_floor`.
-fn bump_epoch_above(file: &mut File, epoch_floor: u64) -> std::io::Result<u64> {
-    let prev = read_epoch(file)?;
+/// Caller holds the exclusive lock; recovery derives the epoch from persisted state or `recovery_floor`.
+fn bump_epoch_above(file: &mut File, recovery_floor: Option<u64>) -> std::io::Result<u64> {
+    let epoch_floor = recovery_floor.unwrap_or(0);
+    let prev = match recovery_floor {
+        Some(floor) if file.metadata()?.len() == 0 => floor,
+        _ => read_epoch(file)?,
+    };
     let next = prev
         .max(epoch_floor)
         .checked_add(1)
@@ -443,7 +442,7 @@ fn bump_epoch_above(file: &mut File, epoch_floor: u64) -> std::io::Result<u64> {
 /// leave a lower parseable epoch; it may leave invalid content.
 fn persist_epoch(file: &mut (impl Write + Seek), epoch: u64) -> std::io::Result<()> {
     let current_len = file.seek(SeekFrom::End(0))?;
-    if (1..EPOCH_WIDTH as u64).contains(&current_len) {
+    if current_len < EPOCH_WIDTH as u64 {
         file.write_all(&[b'x'; EPOCH_WIDTH][current_len as usize..])?;
     }
     file.seek(SeekFrom::Start(0))?;
@@ -474,6 +473,8 @@ pub fn fnv1a_hex(s: &str) -> String {
 mod tests {
     use super::*;
 
+    fn assert_send_sync<T: Send + Sync>() {}
+
     fn key(scope: &str) -> LeaseKey {
         LeaseKey::new("test-module", "sqlite", scope)
     }
@@ -491,9 +492,11 @@ mod tests {
 
     #[test]
     fn fresh_exclusive_initializes_to_one() {
+        assert_send_sync::<FileLeaseStore>();
+        assert_send_sync::<HeldFileLease>();
         let (store, _dir) = tmp_store();
         let guard = store.acquire(&key("fresh")).expect("acquire fresh state");
-        assert_eq!(guard.epoch(), 1);
+        assert_eq!((guard.epoch(), guard.key()), (1, &key("fresh")));
         drop(guard);
 
         let path = store.lease_path(&key("fresh"));
@@ -527,6 +530,13 @@ mod tests {
 
         let guard = store.acquire(&k).expect("ordinary reacquire");
         assert_eq!(guard.epoch(), 102);
+
+        let path = seed_epoch(&store, &key("empty-recovery"), b"");
+        let recovered = store
+            .acquire_above(&key("empty-recovery"), 41)
+            .expect("recover empty epoch");
+        assert_eq!(recovered.epoch(), 42);
+        assert_eq!(std::fs::metadata(path).unwrap().len(), EPOCH_WIDTH as u64);
     }
 
     #[test]
@@ -631,7 +641,7 @@ mod tests {
     #[test]
     fn invalid_epoch_states_fail_closed() {
         fn assert_invalid_data(
-            result: Result<Box<dyn LeaseHandle>, LeaseError>,
+            result: Result<HeldFileLease, LeaseError>,
             name: &str,
             mode: &str,
             path: &std::path::Path,
@@ -669,6 +679,9 @@ mod tests {
 
             assert_invalid_data(store.acquire(&k), name, "exclusive", &path);
             assert_invalid_data(store.acquire_shared(&k), name, "shared", &path);
+            if !state.is_empty() {
+                assert_invalid_data(store.acquire_above(&k, 100), name, "floor", &path);
+            }
             assert_eq!(std::fs::read(&path).expect("read epoch"), state);
         }
     }
@@ -774,6 +787,13 @@ mod tests {
         }
 
         let cases = [
+            Case {
+                seed: b"",
+                previous: 41,
+                next: 42,
+                expected_bytes: b"00000000000000000042",
+                expected_parseable: 0,
+            },
             Case {
                 seed: b"41",
                 previous: 41,

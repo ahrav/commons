@@ -9,4 +9,4 @@
 - **Timing window:** from first new-version acquisition until every old process is gone.
 - **Instrumentation:** artifact-version and derived-path observations remain missing.
 - **Residual risk:** one edit to the shared identity or FNV-1a derivation can remap both file and PostgreSQL lock domains.
-- **Open-question log:** mixed-version overlap policy is not documented. The versioning rule remains at `README.md:42-51`; `cortexkit-lease/Cargo.toml:2-3` records version `0.2.1`, with no path-derivation change since `0.2.0`.
+- **Open-question log:** mixed-version overlap policy is not documented. The versioning rule remains at `README.md:43-52`; `cortexkit-lease/Cargo.toml:2-3` records version `0.3.0`, with no path-derivation change since `0.2.0`.

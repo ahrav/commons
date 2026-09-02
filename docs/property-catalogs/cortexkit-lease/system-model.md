@@ -1,20 +1,20 @@
 # System model
 
-System path: `crates/cortexkit-lease` at revision `01865dc6f99a45dd531faf330c853203434ab9c8`, plus the U5 working-tree changes documented here.
+System path: `crates/cortexkit-lease` at revision `9e871ce`, plus the U8 working-tree changes documented here.
 
 ## Architecture and data flow
 
 `LeaseKey` contains `(module_id, backend, scope_key)` (`LeaseKey`). The fields are joined with `U+001F`, hashed with FNV-1a-64, and mapped to `<base_dir>/<16hex>.lease` (`LeaseKey::identity`, `fnv1a`, `fnv1a_hex`, and `FileLeaseStore::lease_path`).
 
-`open_lease_file` first opens an existing final path with Unix `O_NOFOLLOW | O_NONBLOCK` or Windows `FILE_FLAG_OPEN_REPARSE_POINT`. On `NotFound`, it creates a same-directory `NamedTempFile`, writes canonical epoch zero, and calls `persist_noclobber`; an `AlreadyExists` race reopens the winner within three attempts. A successful publication returns the already-open temporary-file inode. Descriptor metadata rejects nonregular files and Windows reparse points (`src/lib.rs:56-77,89-104,106-143`). Exclusive and shared acquisition then use only `File::try_lock` or `File::try_lock_shared`. Both methods classify `TryLockError::WouldBlock` as `LeaseError::Held` and unwrap `TryLockError::Error` into `LeaseError::Io` (`src/lib.rs:252-286,320-342`).
+`open_lease_file` first opens an existing final path with Unix `O_NOFOLLOW | O_NONBLOCK` or Windows `FILE_FLAG_OPEN_REPARSE_POINT`. On `NotFound`, it creates a same-directory `NamedTempFile`, writes canonical epoch zero, and calls `persist_noclobber`; an `AlreadyExists` race reopens the winner within three attempts. A successful publication returns the already-open temporary-file inode. Descriptor metadata rejects nonregular files and Windows reparse points (`src/lib.rs:56-77,89-104,106-143`). Exclusive and shared acquisition then use only `File::try_lock` or `File::try_lock_shared`. Both methods classify `TryLockError::WouldBlock` as `LeaseError::Held` and unwrap `TryLockError::Error` into `LeaseError::Io` (`src/lib.rs:230-310`).
 
-The crate has no network or database boundary. Its authority boundaries are the filesystem path and kernel lock table. `cortexkit-store` reads the SQLite fence as a resource floor, acquires above it, claims a strictly greater epoch before exposure, and rechecks it in fenced writes and migrations (`cortexkit-store/src/lib.rs:172-187,234-282,284-301,306-312,324-344,346-361,390-454`).
+The crate has no network or database boundary. Its authority boundaries are the filesystem path and kernel lock table. `cortexkit-store` reads the SQLite fence as a resource floor, acquires above it, claims a strictly greater epoch before exposure, and rechecks it in fenced writes and migrations (`cortexkit-store/src/lib.rs:198-217,570-622,669-703,739-806`).
 
 ## State and persistence
 
-One file per derived key stores a decimal `u64`. Published files start with canonical epoch zero; existing empty files fail closed. Existing content must contain 1-20 ASCII decimal digits; any longer, non-decimal, or out-of-range state fails closed (`read_epoch`, `src/lib.rs:399-428`). Existing variable-width decimal files remain readable. Successful updates write exactly 20 decimal digits and use checked increment above the persisted epoch and optional resource floor, so `u64::MAX` is terminal (`bump_epoch_above` and `persist_epoch`, `src/lib.rs:430-439,441-452`). There is no magic, key binding, checksum, format version, or generation.
+One file per derived key stores a decimal `u64`. Published files start with canonical epoch zero; ordinary acquisition rejects existing empty files. `acquire_above` treats an empty sidecar as its caller-supplied resource floor, which must cover every durable epoch previously authorized for the key. Existing nonempty content must contain 1-20 ASCII decimal digits; any longer, non-decimal, or out-of-range state fails closed (`read_epoch`, `src/lib.rs:395-423`). Existing variable-width decimal files remain readable. Successful updates write exactly 20 decimal digits and use checked increment above the persisted epoch and optional resource floor, so `u64::MAX` is terminal (`bump_epoch_above` and `persist_epoch`, `src/lib.rs:426-451`). There is no magic, key binding, checksum, format version, or generation.
 
-The update does not truncate. A 1-19 byte legacy input is extended to 20 bytes with non-decimal markers before the canonical overwrite. For canonical 20-byte values, every prefix splice from the next epoch is either equal to or greater than the prior value. `interrupted_persist_never_leaves_a_lower_parseable_epoch` injects ordered prefix-write failures through `persist_epoch` for both widths and parses aftermath through production `read_epoch`; the canonical case is where every prefix stays parseable, so the count of parseable aftermaths is asserted to keep the monotonicity oracle non-vacuous. It does not prove `File`, device, process-interruption, or power-loss behavior (`src/lib.rs:399-428,430-439,441-452,730-842`).
+The update does not truncate. An empty or 1-19 byte legacy input is extended to 20 bytes with non-decimal markers before the canonical overwrite. For canonical 20-byte values, every prefix splice from the next epoch is either equal to or greater than the prior value. `interrupted_persist_never_leaves_a_lower_parseable_epoch` injects ordered prefix-write failures through `persist_epoch` for all three widths and parses aftermath through production `read_epoch`; the canonical case is where every prefix stays parseable, so the count of parseable aftermaths is asserted to keep the monotonicity oracle non-vacuous. It does not prove `File`, device, process-interruption, or power-loss behavior (`src/lib.rs:395-451,744-862`).
 
 `flush` is not `sync_data` or `sync_all`. The crate makes no claim about exact partial-`File` I/O outcomes, process interruption, machine power loss, storage-cache loss, torn sectors, or filesystem reordering.
 
@@ -22,7 +22,7 @@ Lease files are not removed by production code. `docs/lease-store-density.md:22-
 
 ## Concurrency model
 
-There is no internal shared mutable state. Inter-process coordination is entirely the OS advisory lock held by `FileLeaseHandle.file` (`FileLeaseHandle`). The crate uses standard-library `File::try_lock`, `File::try_lock_shared`, and `File::unlock`; lock semantics still depend on the target OS and backing filesystem.
+There is no internal shared mutable state. Inter-process coordination is entirely the OS advisory lock held by `HeldFileLease.file`. The crate uses standard-library `File::try_lock`, `File::try_lock_shared`, and `File::unlock`; lock semantics still depend on the target OS and backing filesystem.
 
 The epoch read-modify-write runs only after the exclusive lock succeeds. Shared readers each use a separate file descriptor and perform no epoch write.
 
@@ -31,16 +31,16 @@ The epoch read-modify-write runs only after the exclusive lock succeeds. Shared 
 - No two live writers for one logical store (`src/lib.rs:2`).
 - Persisted, monotonically increasing writer epochs; stale writes are rejected (`src/lib.rs:4-6`, `bump_epoch_above`).
 - Distinct module/backend/scope keys do not collide on a shared root (`LeaseKey::identity`, `FileLeaseStore::lease_path`).
-- Shared and exclusive holder modes exclude each other (`LeaseStore::acquire`, `LeaseStore::acquire_shared`).
+- Shared and exclusive holder modes exclude each other (`FileLeaseStore::acquire`, `FileLeaseStore::acquire_shared`).
 - Unix existing-file opens use `O_NOFOLLOW | O_NONBLOCK`, and permission changes apply through the opened descriptor. Windows existing-file opens use `FILE_FLAG_OPEN_REPARSE_POINT` and reject reparse-point metadata. New files are private `NamedTempFile` inodes initialized before no-clobber publication (`src/lib.rs:56-77,89-104,106-143`). Public `protect_file` remains path-based and Unix-only (`src/lib.rs:35-54`).
-- Genuine contention maps to `LeaseError::Held` through `TryLockError::WouldBlock` (`src/lib.rs:252-286,320-342`).
+- Genuine contention maps to `LeaseError::Held` through `TryLockError::WouldBlock` (`src/lib.rs:242-310`).
 
 These remain claims under test. Code disagreements are retained in the catalog.
 
 ## Claimed liveness guarantees
 
 - Process death releases the advisory lock and permits reclaim without stale-PID cleanup (`src/lib.rs:4`).
-- Dropping a handle releases its lease (`FileLeaseHandle::drop`).
+- Dropping a guard releases its lease (`HeldFileLease::drop`).
 - The parked density watcher is claimed to trigger when physical size crosses 1 GiB (`docs/lease-store-density.md:39-51`).
 
 ## Bug history and density
@@ -58,7 +58,7 @@ No issue or incident tracker was supplied, so history cannot establish additiona
 
 ## Existing test strategy
 
-Twenty-one inline unit tests cover ordinary exclusivity, resource-floor issuance, synchronized concurrent shared-first acquisition, shared/exclusive behavior, simple key separation, new and legacy epoch initialization, fail-closed epoch states, injected ordered prefix-write failure, Unix symlink/FIFO refusal, permissions, one identity/hash stability vector, and one cross-process shared-lock case. There are no crash-image tests, fuzz targets, model checkers, or situation-coverage assertions. See [checks.md](checks.md).
+Twenty-two inline unit tests cover ordinary exclusivity, resource-floor issuance, synchronized concurrent shared-first acquisition, shared/exclusive behavior, simple key separation, new and legacy epoch initialization, fail-closed epoch states, injected ordered prefix-write failure, Unix symlink/FIFO refusal, permissions, one identity/hash stability vector, and one cross-process shared-lock case. There are no crash-image tests, fuzz targets, model checkers, or situation-coverage assertions. See [checks.md](checks.md).
 
 ## Failure and degradation
 
@@ -93,8 +93,8 @@ Targeted portfolio follow-up found two additional boundary assumptions: every lo
 
 ## Wildcard findings
 
-- The trait abstraction promises interchangeable future cloud leases, but the actual PostgreSQL backend does not implement `LeaseStore` and has no shared mode.
-- `LeaseHandle::epoch` documents a writer fence, while shared handles expose an observability-only value through the same method and trait object.
+- File-backed acquisition returns the concrete `HeldFileLease`; PostgreSQL remains a separate native session-lock implementation with no shared mode.
+- `HeldFileLease::epoch` serves both modes, so shared guards still expose an observability-only value through the same concrete type.
 - Rust 1.89 is declared as the MSRV, but CI does not compile or test with 1.89.
 - External blocker and draft status are tracked in the [durable consumer inventory](durable-consumer-inventory.md).
 
@@ -112,4 +112,4 @@ Targeted portfolio follow-up found two additional boundary assumptions: every lo
 | Lifecycle transitions | Acquire, held, drop, process death, restart, and rolling-version overlap represented. |
 | Idempotency and replay | No request/replay protocol exists. Failed-attempt state preservation is cataloged. |
 | Version compatibility | Lease-path persistence and shared cross-crate identity/FNV-1a derivation represented. |
-| Wildcard | Trait-mode ambiguity, external backend divergence, untested MSRV, and stale README claim retained as leads. |
+| Wildcard | Guard-mode ambiguity, external backend divergence, untested MSRV, and stale README claim retained as leads. |
