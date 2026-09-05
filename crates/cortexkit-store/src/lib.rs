@@ -346,7 +346,10 @@ mod sqlite_backend {
         }
 
         /// Sizes the connection's prepared-statement cache that
-        /// [`GuardedConn::prepare_cached`] draws from.
+        /// [`GuardedConn::prepare_cached`] draws from. Installing a callback scope
+        /// expires every cached statement, so the cache amortizes preparation only
+        /// within one callback; size it to the distinct statements a single callback
+        /// issues, not to the store's whole hot-query set.
         pub fn set_prepared_statement_cache_capacity(&self, capacity: usize) {
             self.conn.set_prepared_statement_cache_capacity(capacity);
         }
@@ -389,6 +392,11 @@ mod sqlite_backend {
         /// Prepares `sql` through the connection's statement cache. A cached
         /// statement still runs under the callback's authorizer scope, so the
         /// cache changes only preparation cost, never what a statement may do.
+        ///
+        /// Installing the scope expires every prepared statement on the connection
+        /// (SQLite does this whenever an authorizer is set), so a cached statement is
+        /// re-prepared on its first use in each callback. The cache saves work only
+        /// when one callback runs the same `sql` more than once.
         ///
         /// # Errors
         ///
@@ -510,11 +518,6 @@ mod sqlite_backend {
         }
     }
 
-    /// Enumerating individual pragma names cannot be complete: `ignore_check_constraints`
-    /// disables the fence table's constraint, `defer_foreign_keys` and `writable_schema`
-    /// reach schema invariants, and pragma names are case-insensitive. Denying the whole
-    /// capability class avoids that race. A pragma read carries no value and stays
-    /// allowed, as do the ordinary statements a callback exists to run.
     /// Pragmas whose argument names a schema object to describe rather than a value to
     /// set. Every other pragma carrying an argument is treated as a write.
     const SCHEMA_INTROSPECTION_PRAGMAS: &[&str] = &[
@@ -527,18 +530,32 @@ mod sqlite_backend {
         "foreign_key_list",
     ];
 
+    /// SQLite pragma names are case-insensitive, so the allowlist compares them
+    /// case-insensitively.
+    fn is_schema_introspection_pragma(pragma_name: &str) -> bool {
+        SCHEMA_INTROSPECTION_PRAGMAS
+            .iter()
+            .any(|allowed| pragma_name.eq_ignore_ascii_case(allowed))
+    }
+
+    /// Denies value-carrying pragmas except the introspection allowlist. A denylist of
+    /// pragma names cannot be complete: `ignore_check_constraints` disables the fence
+    /// table's constraint, `defer_foreign_keys` defers foreign-key enforcement,
+    /// `writable_schema` permits direct schema-table writes, and pragma names are
+    /// case-insensitive. Pragma reads (no value) and non-pragma statements that do not
+    /// target an infrastructure table remain allowed.
     fn deny_scope_escapes(
         context: rusqlite::hooks::AuthContext<'_>,
     ) -> rusqlite::hooks::Authorization {
         use rusqlite::hooks::{AuthAction, Authorization};
         match context.action {
             // `PRAGMA table_info(t)` and its table-valued form `pragma_table_info('t')`
-            // both report the table name as the pragma value; they describe the schema
-            // and change nothing, so a callback may read them.
+            // both report the table name as the pragma value; both are read-only.
+            // The statement form reports the pragma name as the caller spelled it.
             AuthAction::Pragma {
                 pragma_name,
                 pragma_value: Some(_),
-            } if SCHEMA_INTROSPECTION_PRAGMAS.contains(&pragma_name) => Authorization::Allow,
+            } if is_schema_introspection_pragma(pragma_name) => Authorization::Allow,
             AuthAction::Pragma {
                 pragma_value: Some(_),
                 ..
@@ -1618,6 +1635,35 @@ mod tests {
     }
 
     #[test]
+    fn guarded_callbacks_cannot_attach_or_detach_databases() {
+        let (root, d) = tmp();
+        let store = open_sqlite(&d).expect("open");
+        store.migrate("kv", FENCE_SCHEMA).expect("migrate");
+        let r = store.with_conn(|c| c.execute("ATTACH DATABASE ':memory:' AS side", []));
+        assert!(
+            matches!(&r, Err(StoreError::Backend(m)) if m.contains("not authorized")),
+            "ATTACH must be denied by the read callback scope, got {r:?}"
+        );
+        let r = store.with_conn_fenced(|tx| tx.execute("ATTACH DATABASE ':memory:' AS side", []));
+        assert!(
+            matches!(&r, Err(StoreError::Backend(m)) if m.contains("not authorized")),
+            "ATTACH must be denied by the fenced callback scope, got {r:?}"
+        );
+        store
+            .with_conn_unfenced(|c| c.execute_batch("ATTACH DATABASE ':memory:' AS side"))
+            .expect("attach through the maintenance path");
+        let r = store.with_conn(|c| c.execute("DETACH DATABASE side", []));
+        assert!(
+            matches!(&r, Err(StoreError::Backend(m)) if m.contains("not authorized")),
+            "DETACH must be denied by the read callback scope, got {r:?}"
+        );
+        store
+            .with_conn_unfenced(|c| c.execute_batch("DETACH DATABASE side"))
+            .expect("detach through the maintenance path");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn a_maintenance_registered_scalar_function_serves_reads_writes_and_triggers() {
         let (root, d) = tmp();
         let store = open_sqlite(&d).expect("open");
@@ -1749,6 +1795,17 @@ mod tests {
             })
             .expect("statement-form introspection inside a fenced write");
         assert_eq!(columns, 2);
+        // The statement form hands the authorizer the caller's spelling.
+        for spelling in ["PRAGMA TABLE_INFO(kv)", "PRAGMA Table_Info(kv)"] {
+            let columns: i64 = store
+                .with_conn(|c| {
+                    let mut statement = c.prepare(spelling)?;
+                    let rows = statement.query_map([], |_| Ok(()))?;
+                    Ok(rows.count() as i64)
+                })
+                .unwrap_or_else(|e| panic!("{spelling} must pass the read scope: {e:?}"));
+            assert_eq!(columns, 2, "{spelling}");
+        }
         let r = store.with_conn(|c| c.execute("PRAGMA journal_size_limit = 1", []));
         assert!(
             matches!(&r, Err(StoreError::Backend(m)) if m.contains("not authorized")),
